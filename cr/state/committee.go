@@ -10,9 +10,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -485,6 +488,39 @@ func (c *Committee) ProcessBlock(block *types.Block, confirm *payload.Confirm) {
 	if needChg {
 		events.Notify(events.ETCRCChangeCommittee, block)
 	}
+
+	if block.Height%10000 == 0 || block.Height == c.Params.RecordDPoSAndCRHeight {
+		// write state.ReigsterCrs map to a txt file line by line
+		file, err := os.Create("RegisteredCrs.txt")
+		if err != nil {
+			log.Error("create file failed:", err.Error())
+			return
+		}
+		file.WriteString("Addr Code RegisterHeight DepositAmount NickNames Elected Session\n")
+		// change state.RegisteredCrs to slice and sort from low to heigh register height
+		dpSlice := make([]CRInfo, 0)
+		for _, v := range c.state.RegisteredCrs {
+			dpSlice = append(dpSlice, v)
+		}
+		sort.Slice(dpSlice, func(i, j int) bool {
+			return dpSlice[i].RegisterHeight < dpSlice[j].RegisterHeight
+		})
+		for _, v := range dpSlice {
+			// print nickname and session split with ',', session is []uint64
+			sessionStringList := make([]string, 0)
+			for _, s := range v.Session {
+				sessionStringList = append(sessionStringList, fmt.Sprintf("%d", s))
+			}
+			_, err := file.WriteString(fmt.Sprintf("%s %s %d %d %s %t %s\n", v.Addr, v.Code, v.RegisterHeight, v.DepositAmount,
+				strings.Join(v.NickName, ","), v.Elected, strings.Join(sessionStringList, ",")))
+			if err != nil {
+				log.Error("write file failed:", err.Error())
+				return
+			}
+		}
+		file.Close()
+	}
+
 }
 
 func (c *Committee) updateInactiveCountPenalty(history *utils.History, height uint32) {
@@ -1561,6 +1597,12 @@ func (c *Committee) processNextMembers(height uint32,
 	for i := 0; i < int(c.Params.CRConfiguration.MemberCount); i++ {
 		newMembers[activeCandidates[i].Info.DID] =
 			c.generateMember(activeCandidates[i])
+
+		// update Elected state of c.state.RegisteredCrs
+		candidateCode := hex.EncodeToString(activeCandidates[i].Info.Code)
+		candidateInfo := c.state.RegisteredCrs[candidateCode]
+		candidateInfo.Elected = true
+		c.state.RegisteredCrs[candidateCode] = candidateInfo
 	}
 	oriUsedCRVotes := copyProgramHashVotesInfoSet(c.state.UsedCRVotes)
 	oriMembers := copyMembersMap(c.NextMembers)
@@ -1689,6 +1731,12 @@ func (c *Committee) processCurrentMembersHistory(height uint32,
 	for i := 0; i < int(c.Params.CRConfiguration.MemberCount); i++ {
 		newMembers[activeCandidates[i].Info.DID] =
 			c.generateMember(activeCandidates[i])
+
+			// update Elected state of c.state.RegisteredCrs
+		candidateCode := hex.EncodeToString(activeCandidates[i].Info.Code)
+		candidateInfo := c.state.RegisteredCrs[candidateCode]
+		candidateInfo.Elected = true
+		c.state.RegisteredCrs[candidateCode] = candidateInfo
 	}
 
 	oriNicknames := utils.CopyStringSet(c.state.Nicknames)

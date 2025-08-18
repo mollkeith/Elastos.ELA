@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -606,6 +608,18 @@ type State struct {
 
 	// temp use
 	LastRenewalDPoSV2Votes map[common.Uint256]struct{}
+
+	RegisteredProducers       map[string]PInfo //ownerKey->PInfo
+	DPoSV2RegisteredProducers map[string]PInfo //ownerKey->PInfo
+}
+
+type PInfo struct {
+	NickName       []string
+	RegisterHeight uint32
+	OwnerKey       string
+	Addr           string
+	DepositAmount  common.Fixed64
+	EnoughVotes    bool
 }
 
 func (s *State) DPoSV2Started() bool {
@@ -1320,6 +1334,57 @@ func (s *State) ProcessBlock(block *types.Block, sponsor []byte, dutyIndex int) 
 		len(s.VotesWithdrawableTxInfo) != 0 {
 		s.createRealWithdrawTransaction(block.Height)
 	}
+
+	if block.Height%10000 == 0 || block.Height == s.ChainParams.RecordDPoSAndCRHeight {
+		// write RegisteredProducers map to a txt file line by line
+		file, err := os.Create("DPoSV1RegisteredProducers.txt")
+		if err != nil {
+			log.Error("create file failed:", err.Error())
+			return
+		}
+		file.WriteString("Addr OwnerKey RegisterHeight DepositAmount NickNames \n")
+		// change s.RegisteredProducers to slice and sort from low to heigh register height
+		rpSlice := make([]PInfo, 0)
+		for _, v := range s.RegisteredProducers {
+			rpSlice = append(rpSlice, v)
+		}
+		sort.Slice(rpSlice, func(i, j int) bool {
+			return rpSlice[i].RegisterHeight < rpSlice[j].RegisterHeight
+		})
+		for _, v := range rpSlice {
+			// print nickname split with ','
+			_, err := file.WriteString(fmt.Sprintf("%s %s %d %d %s\n", v.Addr, v.OwnerKey, v.RegisterHeight, v.DepositAmount, strings.Join(v.NickName, ",")))
+			if err != nil {
+				log.Error("write file failed:", err.Error())
+				return
+			}
+		}
+		file.Close()
+
+		// write DPoSV2RegisteredProducers map to a txt file line by line
+		file, err = os.Create("DPoSV2RegisteredProducers.txt")
+		if err != nil {
+			log.Error("create file failed:", err.Error())
+			return
+		}
+		file.WriteString("Addr OwnerKey RegisterHeight DepositAmount NickNames EnoughVotes\n")
+		// change s.DPoSV2RegisteredProducers to slice and sort from low to heigh register height
+		dpSlice := make([]PInfo, 0)
+		for _, v := range s.DPoSV2RegisteredProducers {
+			dpSlice = append(dpSlice, v)
+		}
+		sort.Slice(dpSlice, func(i, j int) bool {
+			return dpSlice[i].RegisterHeight < dpSlice[j].RegisterHeight
+		})
+		for _, v := range dpSlice {
+			_, err := file.WriteString(fmt.Sprintf("%s %s %d %d %s %t\n", v.Addr, v.OwnerKey, v.RegisterHeight, v.DepositAmount, strings.Join(v.NickName, ","), v.EnoughVotes))
+			if err != nil {
+				log.Error("write file failed:", err.Error())
+				return
+			}
+		}
+		file.Close()
+	}
 }
 
 func (s *State) createRealWithdrawTransaction(height uint32) {
@@ -1878,9 +1943,33 @@ func (s *State) registerProducer(tx interfaces.Transaction, height uint32) {
 	if info.StakeUntil != 0 {
 		depositAmount = state.MinDPoSV2DepositAmount
 		identity = DPoSV2
+		programHash, err := GetOwnerKeyStandardProgramHash(info.OwnerKey)
+		if err == nil {
+			addr1, _ := programHash.ToAddress()
+			info := PInfo{
+				NickName:       []string{info.NickName},
+				RegisterHeight: height,
+				OwnerKey:       ownerKey,
+				Addr:           addr1,
+				DepositAmount:  depositAmount,
+			}
+			s.DPoSV2RegisteredProducers[ownerKey] = info
+		}
 	} else {
 		depositAmount = state.MinDepositAmount
 		identity = DPoSV1
+		programHash, err := GetOwnerKeyStandardProgramHash(info.OwnerKey)
+		if err == nil {
+			addr1, _ := programHash.ToAddress()
+			info := PInfo{
+				NickName:       []string{info.NickName},
+				RegisterHeight: height,
+				OwnerKey:       ownerKey,
+				Addr:           addr1,
+				DepositAmount:  depositAmount,
+			}
+			s.RegisteredProducers[ownerKey] = info
+		}
 	}
 
 	producer := Producer{
@@ -1924,6 +2013,22 @@ func (s *State) updateProducer(info *payload.ProducerInfo, height uint32) {
 	producer := s.getProducer(info.OwnerKey)
 	originProducerIdentity := producer.identity
 	producerInfo := producer.info
+
+	if pinfo, ok := s.DPoSV2RegisteredProducers[hex.EncodeToString(info.OwnerKey)]; ok {
+		// if DPoSV2RegisteredProducers has this ownerKey and check is nickname is updated, if updated put new nickname into DPoSV2RegisteredProducers with new nickname and pinfo nicknames
+		if producerInfo.NickName != info.NickName {
+			pinfo.NickName = append(pinfo.NickName, info.NickName)
+			s.DPoSV2RegisteredProducers[hex.EncodeToString(info.OwnerKey)] = pinfo
+		}
+	}
+	if pinfo, ok := s.RegisteredProducers[hex.EncodeToString(info.OwnerKey)]; ok {
+		// if RegisteredProducers has this ownerKey and check is nickname is updated, if updated put new nickname into RegisteredProducers with new nickname and pinfo nicknames
+		if producerInfo.NickName != info.NickName {
+			pinfo.NickName = append(pinfo.NickName, info.NickName)
+			s.RegisteredProducers[hex.EncodeToString(info.OwnerKey)] = pinfo
+		}
+	}
+
 	s.History.Append(height, func() {
 		s.updateProducerInfo(&producerInfo, info)
 
@@ -2190,6 +2295,12 @@ func (s *State) processVotingContent(tx interfaces.Transaction, height uint32) {
 					voteRights := producer.GetTotalDPoSV2VoteRights()
 					if voteRights >= float64(s.ChainParams.DPoSV2EffectiveVotes) {
 						s.DposV2EffectedProducers[hex.EncodeToString(producer.OwnerPublicKey())] = producer
+
+						// check if ownerkey in DPoSV2RegisteredProducers, if exist update pinfo.EnoughVotes
+						if pinfo, ok := s.DPoSV2RegisteredProducers[hex.EncodeToString(producer.OwnerPublicKey())]; ok {
+							pinfo.EnoughVotes = true
+							s.DPoSV2RegisteredProducers[hex.EncodeToString(producer.OwnerPublicKey())] = pinfo
+						}
 					}
 				}, func() {
 					delete(producer.detailedDPoSV2Votes[*stakeAddress], dvi.ReferKey())
@@ -3893,6 +4004,9 @@ func NewState(chainParams *config.Configuration, getArbiters func() []*ArbiterIn
 		tryRevertCRMemberIllegal:      tryRevertCRMemberIllegal,
 		updateCRInactivePenalty:       updateCRInactivePenalty,
 		revertUpdateCRInactivePenalty: revertUpdateCRInactivePenalty,
+
+		RegisteredProducers:       make(map[string]PInfo),
+		DPoSV2RegisteredProducers: make(map[string]PInfo),
 	}
 	events.Subscribe(state.handleEvents)
 	return &state

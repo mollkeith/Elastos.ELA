@@ -259,6 +259,7 @@ func GetDefaultParams() *Configuration {
 		ProducerSchnorrStartHeight:      math.MaxUint32,
 		CRSchnorrStartHeight:            math.MaxUint32,
 		VotesSchnorrStartHeight:         math.MaxUint32,
+		RecordDPoSAndCRHeight:           math.MaxUint32,
 		CrossChainMonitorStartHeight:    math.MaxUint32,
 		CrossChainMonitorInterval:       100,
 		SupportMultiCodeHeight:          math.MaxUint32, // todo complete me
@@ -405,6 +406,7 @@ func (p *Configuration) TestNet() *Configuration {
 	p.ProducerSchnorrStartHeight = math.MaxUint32
 	p.CRSchnorrStartHeight = math.MaxUint32
 	p.VotesSchnorrStartHeight = math.MaxUint32
+	p.RecordDPoSAndCRHeight = math.MaxUint32
 	p.MultiExchangeVotesStartHeight = math.MaxUint32 // todo complete me
 
 	p.MemoryPoolTxMaximumStayHeight = 10
@@ -532,6 +534,7 @@ func (p *Configuration) RegNet() *Configuration {
 	p.ProducerSchnorrStartHeight = math.MaxUint32
 	p.CRSchnorrStartHeight = math.MaxUint32
 	p.VotesSchnorrStartHeight = math.MaxUint32
+	p.RecordDPoSAndCRHeight = math.MaxUint32
 	p.MultiExchangeVotesStartHeight = math.MaxUint32    // todo complete me
 	p.DPoSConfiguration.DexStartHeight = math.MaxUint32 // todo complete me
 
@@ -680,6 +683,8 @@ type Configuration struct {
 	PowConfiguration          PowConfiguration        `json:"PowConfiguration"`
 	RpcConfiguration          RpcConfiguration        `json:"RpcConfiguration"`
 	CheckPointConfiguration   CheckPointConfiguration `json:"CheckPointConfiguration"`
+
+	RecordDPoSAndCRHeight uint32 `screw:"--recorddposandcrheight" usage:"defines the start height to record dpos and cr"`
 }
 
 type CheckPointConfiguration struct {

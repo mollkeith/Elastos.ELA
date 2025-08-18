@@ -46,6 +46,18 @@ type State struct {
 
 	params  *config.Configuration
 	History *utils.History
+
+	RegisteredCrs map[string]CRInfo // code -> CRInfo
+}
+
+type CRInfo struct {
+	NickName       []string
+	RegisterHeight uint32
+	Code           string
+	Addr           string
+	DepositAmount  common.Fixed64
+	Elected        bool
+	Session        []uint64
 }
 
 // SetManager set current proposal manager that holds State of proposals.
@@ -303,6 +315,26 @@ func (s *State) registerCR(tx interfaces.Transaction, height uint32) {
 			delete(s.DepositHashCIDMap, candidate.DepositHash)
 		}
 	})
+
+	if firstTimeRegister {
+		address, _ := utils.GetAddressByCode(info.Code)
+		s.RegisteredCrs[hex.EncodeToString(info.Code)] = CRInfo{
+			NickName:       []string{nickname},
+			RegisterHeight: height,
+			Code:           code,
+			DepositAmount:  MinDepositAmount,
+			Elected:        false,
+			Session:        []uint64{s.CurrentSession},
+			Addr:           address,
+		}
+	} else {
+		// update nickname  and session into registered crs
+		if cinfo, ok := s.RegisteredCrs[hex.EncodeToString(info.Code)]; ok {
+			cinfo.NickName = append(cinfo.NickName, nickname)
+			cinfo.Session = append(cinfo.Session, s.CurrentSession)
+			s.RegisteredCrs[hex.EncodeToString(info.Code)] = cinfo
+		}
+	}
 }
 
 // updateCR handles the update CR transaction.
@@ -314,6 +346,15 @@ func (s *State) updateCR(info *payload.CRInfo, height uint32) {
 	}, func() {
 		s.updateCandidateInfo(info, &crInfo)
 	})
+
+	// if registered crs has this ownerKey and check is nickname is updated, if updated put new nickname into registered crs, with new nickname and pinfo nicknames
+	if cinfo, ok := s.RegisteredCrs[hex.EncodeToString(info.Code)]; ok {
+		if info.NickName != crInfo.NickName {
+			cinfo.NickName = append(cinfo.NickName, info.NickName)
+			s.RegisteredCrs[hex.EncodeToString(info.Code)] = cinfo
+		}
+	}
+
 }
 
 // unregisterCR handles the cancel producer transaction.
@@ -645,5 +686,6 @@ func NewState(chainParams *config.Configuration) *State {
 		StateKeyFrame: *NewStateKeyFrame(),
 		params:        chainParams,
 		History:       utils.NewHistory(maxHistoryCapacity),
+		RegisteredCrs: make(map[string]CRInfo),
 	}
 }
