@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -50,14 +51,58 @@ var (
 	oneLsh256 = new(big.Int).Lsh(big.NewInt(1), 256)
 )
 
+// esc垮链地址: XVbCTM7vqM1qHKsABSFH4xKN1qbp7ijpWf ]
+// eid垮链: XUgTgCnUEqMUKLFAg3KhGv1nnt9nn8i3wi ]
+// eco垮链: XV5cSp1y1PU4xXSQs5oaaLExgHA2xHYjp5 ]
+
+//  基金会地址：8VYXVxKKSAxkmRrfmGpQR2Kc66XhG6m3ta
+//  DPoS V1: CR：8ZZLWQUDSbjWUn8sEdxEFJsZiRFpzg53rJ
+
+//  CR DAO资产地址：
+//  CRAssetsAddress "CRASSETSXXXXXXXXXXXXXXXXXXXX2qDX5J"
+//  CR DAO当前届可用资产地址：
+//  CRCExpensesAddress "CREXPENSESXXXXXXXXXXXXXXXXXX4UdT6b"
+
+//	ELA换票权：
+//	StakePoolAddress "STAKEPooLXXXXXXXXXXXXXXXXXXXpP1PQ2"
+//	ELA投票奖励临时存放池：
+//	StakeRewardAddress "STAKEREWARDXXXXXXXXXXXXXXXXXFD5SHU"
+//
+// ELA销毁地址：
+// DestroyELAAddress "ELANULLXXXXXXXXXXXXXXXXXXXXXYvs3rr"
+type RecordAddressELAAmount struct {
+	Address string
+	Amount  Fixed64
+}
+
+type RecordAddressesELAAmount struct {
+	EscInfo RecordAddressELAAmount
+	EidInfo RecordAddressELAAmount
+	EcoInfo RecordAddressELAAmount
+
+	FoundationInfo RecordAddressELAAmount
+	DPoSV1CRInfo   RecordAddressELAAmount
+
+	CRAssetsAddressInfo    RecordAddressELAAmount
+	CRCExpensesAddressInfo RecordAddressELAAmount
+
+	StakePoolAddressInfo   RecordAddressELAAmount
+	StakeRewardAddressInfo RecordAddressELAAmount
+
+	DestroyELAInfo RecordAddressELAAmount
+
+	Others map[string]Fixed64
+}
+
 type BlockChain struct {
-	chainParams *config.Configuration
-	CkpManager  *checkpoint.Manager
-	db          IChainStore
-	state       *state.State
-	crCommittee *crstate.Committee
-	UTXOCache   *UTXOCache
-	GenesisHash Uint256
+	recordAddressesELAAmount RecordAddressesELAAmount
+	chainParams              *config.Configuration
+	CkpManager               *checkpoint.Manager
+	db                       IChainStore
+	state                    *state.State
+	crCommittee              *crstate.Committee
+	UTXOCache                *UTXOCache
+	GenesisHash              Uint256
 
 	// The following fields are calculated based upon the provided chain
 	// parameters.  They are also set when the instance is created and
@@ -97,6 +142,49 @@ func New(db IChainStore, chainParams *config.Configuration, state *state.State,
 	targetTimePerBlock := int64(chainParams.PowConfiguration.TargetTimePerBlock / time.Second)
 	adjustmentFactor := chainParams.PowConfiguration.AdjustmentFactor
 	chain := BlockChain{
+		recordAddressesELAAmount: RecordAddressesELAAmount{
+			EscInfo: RecordAddressELAAmount{
+				Address: "XVbCTM7vqM1qHKsABSFH4xKN1qbp7ijpWf",
+				Amount:  Fixed64(0),
+			},
+			EidInfo: RecordAddressELAAmount{
+				Address: "XUgTgCnUEqMUKLFAg3KhGv1nnt9nn8i3wi",
+				Amount:  Fixed64(0),
+			},
+			EcoInfo: RecordAddressELAAmount{
+				Address: "XV5cSp1y1PU4xXSQs5oaaLExgHA2xHYjp5",
+				Amount:  Fixed64(0),
+			},
+			FoundationInfo: RecordAddressELAAmount{
+				Address: "8VYXVxKKSAxkmRrfmGpQR2Kc66XhG6m3ta",
+				Amount:  Fixed64(0),
+			},
+			DPoSV1CRInfo: RecordAddressELAAmount{
+				Address: "8ZZLWQUDSbjWUn8sEdxEFJsZiRFpzg53rJ",
+				Amount:  Fixed64(0),
+			},
+			CRAssetsAddressInfo: RecordAddressELAAmount{
+				Address: "CRASSETSXXXXXXXXXXXXXXXXXXXX2qDX5J",
+				Amount:  Fixed64(0),
+			},
+			CRCExpensesAddressInfo: RecordAddressELAAmount{
+				Address: "CREXPENSESXXXXXXXXXXXXXXXXXX4UdT6b",
+				Amount:  Fixed64(0),
+			},
+			StakePoolAddressInfo: RecordAddressELAAmount{
+				Address: "STAKEPooLXXXXXXXXXXXXXXXXXXXpP1PQ2",
+				Amount:  Fixed64(0),
+			},
+			StakeRewardAddressInfo: RecordAddressELAAmount{
+				Address: "STAKEREWARDXXXXXXXXXXXXXXXXXFD5SHU",
+				Amount:  Fixed64(0),
+			},
+			DestroyELAInfo: RecordAddressELAAmount{
+				Address: "ELANULLXXXXXXXXXXXXXXXXXXXXXYvs3rr",
+				Amount:  Fixed64(0),
+			},
+			Others: make(map[string]Fixed64),
+		},
 		chainParams:         chainParams,
 		db:                  db,
 		state:               state,
@@ -302,7 +390,7 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 			barStart(bestHeight - startHeight)
 		}
 
-		for i := startHeight; i <= bestHeight; i++ {
+		for i := uint32(0); i <= bestHeight; i++ {
 			hash, e := b.GetBlockHash(i)
 			if e != nil {
 				err = e
@@ -312,6 +400,133 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 			if e != nil {
 				err = e
 				break
+			}
+
+			for _, tx := range block.Block.Transactions {
+				for _, output := range tx.Outputs() {
+					oAddress, _ := output.ProgramHash.ToAddress()
+					switch oAddress {
+					case b.recordAddressesELAAmount.EscInfo.Address:
+						b.recordAddressesELAAmount.EscInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.EidInfo.Address:
+						b.recordAddressesELAAmount.EidInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.EcoInfo.Address:
+						b.recordAddressesELAAmount.EcoInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.FoundationInfo.Address:
+						b.recordAddressesELAAmount.FoundationInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.DPoSV1CRInfo.Address:
+						b.recordAddressesELAAmount.DPoSV1CRInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.CRAssetsAddressInfo.Address:
+						b.recordAddressesELAAmount.CRAssetsAddressInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.CRCExpensesAddressInfo.Address:
+						b.recordAddressesELAAmount.CRCExpensesAddressInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.StakePoolAddressInfo.Address:
+						b.recordAddressesELAAmount.StakePoolAddressInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.StakeRewardAddressInfo.Address:
+						b.recordAddressesELAAmount.StakeRewardAddressInfo.Amount += output.Value
+					case b.recordAddressesELAAmount.DestroyELAInfo.Address:
+						b.recordAddressesELAAmount.DestroyELAInfo.Amount += output.Value
+					default:
+						b.recordAddressesELAAmount.Others[oAddress] += output.Value
+					}
+				}
+
+				for _, input := range tx.Inputs() {
+					if input.Previous.TxID.String() == "0000000000000000000000000000000000000000000000000000000000000000" {
+						continue
+					}
+					iTxHashUint256, _ := Uint256FromHexString(input.Previous.TxID.String())
+					itx, _, e := b.db.GetFFLDB().GetTransaction(*iTxHashUint256)
+					if e != nil {
+						log.Error("get block err: ", e)
+						continue
+					}
+					iAddress, _ := itx.Outputs()[input.Previous.Index].ProgramHash.ToAddress()
+					switch iAddress {
+					case b.recordAddressesELAAmount.EscInfo.Address:
+						b.recordAddressesELAAmount.EscInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.EidInfo.Address:
+						b.recordAddressesELAAmount.EidInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.EcoInfo.Address:
+						b.recordAddressesELAAmount.EcoInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.FoundationInfo.Address:
+						b.recordAddressesELAAmount.FoundationInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.DPoSV1CRInfo.Address:
+						b.recordAddressesELAAmount.DPoSV1CRInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.CRAssetsAddressInfo.Address:
+						b.recordAddressesELAAmount.CRAssetsAddressInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.CRCExpensesAddressInfo.Address:
+						b.recordAddressesELAAmount.CRCExpensesAddressInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.StakePoolAddressInfo.Address:
+						b.recordAddressesELAAmount.StakePoolAddressInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.StakeRewardAddressInfo.Address:
+						b.recordAddressesELAAmount.StakeRewardAddressInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					case b.recordAddressesELAAmount.DestroyELAInfo.Address:
+						b.recordAddressesELAAmount.DestroyELAInfo.Amount -= itx.Outputs()[input.Previous.Index].Value
+					default:
+						b.recordAddressesELAAmount.Others[iAddress] -= itx.Outputs()[input.Previous.Index].Value
+					}
+				}
+			}
+			if block.Height == bestHeight || block.Height%100000 == 0 {
+				fmt.Println("### block height ->", block.Height)
+				// write amount to file
+				// write state.ReigsterCrs map to a txt file line by line
+				file, err := os.Create("ELA_Statics.txt")
+				if err != nil {
+					log.Error("create file failed:", err.Error())
+					return
+				}
+				file.WriteString("EscInfo: " + b.recordAddressesELAAmount.EscInfo.Address + " amount: " + b.recordAddressesELAAmount.EscInfo.Amount.String() + "\n")
+				file.WriteString("EidInfo: " + b.recordAddressesELAAmount.EidInfo.Address + " amount: " + b.recordAddressesELAAmount.EidInfo.Amount.String() + "\n")
+				file.WriteString("EcoInfo: " + b.recordAddressesELAAmount.EcoInfo.Address + " amount: " + b.recordAddressesELAAmount.EcoInfo.Amount.String() + "\n")
+				file.WriteString("FoundationInfo: " + b.recordAddressesELAAmount.FoundationInfo.Address + " amount: " + b.recordAddressesELAAmount.FoundationInfo.Amount.String() + "\n")
+				file.WriteString("DPoSV1CRInfo: " + b.recordAddressesELAAmount.DPoSV1CRInfo.Address + " amount: " + b.recordAddressesELAAmount.DPoSV1CRInfo.Amount.String() + "\n")
+				file.WriteString("CRAssetsAddressInfo: " + b.recordAddressesELAAmount.CRAssetsAddressInfo.Address + " amount: " + b.recordAddressesELAAmount.CRAssetsAddressInfo.Amount.String() + "\n")
+				file.WriteString("CRCExpensesAddressInfo: " + b.recordAddressesELAAmount.CRCExpensesAddressInfo.Address + " amount: " + b.recordAddressesELAAmount.CRCExpensesAddressInfo.Amount.String() + "\n")
+				file.WriteString("StakePoolAddressInfo: " + b.recordAddressesELAAmount.StakePoolAddressInfo.Address + " amount: " + b.recordAddressesELAAmount.StakePoolAddressInfo.Amount.String() + "\n")
+				file.WriteString("StakeRewardAddressInfo: " + b.recordAddressesELAAmount.StakeRewardAddressInfo.Address + " amount: " + b.recordAddressesELAAmount.StakeRewardAddressInfo.Amount.String() + "\n")
+				file.WriteString("DestroyELAInfo: " + b.recordAddressesELAAmount.DestroyELAInfo.Address + " amount: " + b.recordAddressesELAAmount.DestroyELAInfo.Amount.String() + "\n")
+
+				// write total others amount
+				totalOthersAmount := Fixed64(0)
+				addressCount := 0
+				zeroAddressCount := 0
+				for _, v := range b.recordAddressesELAAmount.Others {
+					totalOthersAmount += v
+					if v <= 0 {
+						zeroAddressCount++
+						continue
+					}
+					addressCount++
+
+				}
+				file.WriteString("Zero address count: " + strconv.Itoa(zeroAddressCount) + "\n")
+				file.WriteString("Others address count: " + strconv.Itoa(addressCount) + "\n")
+				file.WriteString("TotalOthersAmount amount: " + totalOthersAmount.String() + "\n")
+
+				file.WriteString("=====================================================\n \n")
+				// print after sort
+				sortedOthers := make([]RecordAddressELAAmount, 0)
+				for k, v := range b.recordAddressesELAAmount.Others {
+					sortedOthers = append(sortedOthers, RecordAddressELAAmount{k, v})
+				}
+				sort.Slice(sortedOthers, func(i, j int) bool {
+					return sortedOthers[i].Amount > sortedOthers[j].Amount
+				})
+
+				for _, v := range sortedOthers {
+					if v.Amount <= 0 {
+						continue
+					}
+					file.WriteString(v.Address + " amount: " + v.Amount.String() + "\n")
+				}
+				file.WriteString("=====================================================\n")
+				file.Close()
+			}
+
+			if i < startHeight {
+				continue
 			}
 
 			if block.Height >= b.chainParams.DPoSV2StartHeight {
