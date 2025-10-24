@@ -1438,6 +1438,16 @@ func (a *Arbiters) GetCurrentArbitratorKeys() [][]byte {
 	return ret
 }
 
+func (a *Arbiters) GetCrossChainArbitratorKeys() [][]byte {
+	crossArbiters := a.GetCrossChainArbiters()
+
+	var ret [][]byte
+	for _, info := range crossArbiters {
+		ret = append(ret, info.NodePublicKey)
+	}
+	return ret
+}
+
 func (a *Arbiters) getArbitrators() []*ArbiterInfo {
 	result := make([]*ArbiterInfo, 0, len(a.CurrentArbitrators))
 	for _, v := range a.CurrentArbitrators {

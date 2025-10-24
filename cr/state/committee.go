@@ -55,9 +55,10 @@ type Committee struct {
 	createCRAssetsRectifyTransaction func() (interfaces.Transaction, error)
 	createCRRealWithdrawTransaction  func(withdrawTransactionHashes []common.Uint256,
 		outputs []*common2.OutputInfo) (interfaces.Transaction, error)
-	getUTXO            func(programHash *common.Uint168) ([]*common2.UTXO, error)
-	getCurrentArbiters func() [][]byte
-	CkpManager         *checkpoint.Manager
+	getUTXO               func(programHash *common.Uint168) ([]*common2.UTXO, error)
+	getCurrentArbiters    func() [][]byte
+	getCrossChainArbiters func() [][]byte
+	CkpManager            *checkpoint.Manager
 }
 
 type CommitteeKeyFrame struct {
@@ -1178,13 +1179,13 @@ func getSignedPubKeys(m, n int, publicKeys [][]byte, signatures, data []byte) ([
 
 // get public keys from withdraw from side chain transaction
 func (c *Committee) getSignersFromWithdrawFromSideChainTx(tx interfaces.Transaction, electedMembers []*CRMember) []string {
-	electedMemAll := make(map[string]*CRMember)
-	for _, elected := range electedMembers {
-		electedMemAll[hex.EncodeToString(elected.DPOSPublicKey)] = elected
-	}
+	// electedMemAll := make(map[string]*CRMember)
+	// for _, elected := range electedMembers {
+	// 	electedMemAll[hex.EncodeToString(elected.DPOSPublicKey)] = elected
+	// }
 	publicKeys := make([]string, 0)
 	if tx.PayloadVersion() == payload.WithdrawFromSideChainVersionV2 {
-		allPulicKeys := c.getCurrentArbiters()
+		allPulicKeys := c.getCrossChainArbiters()
 
 		pld := tx.Payload().(*payload.WithdrawFromSideChain)
 		for _, index := range pld.Signers {
@@ -2010,11 +2011,12 @@ type CommitteeFuncsConfig struct {
 	CreateCRAssetsRectifyTransaction func() (interfaces.Transaction, error)
 	CreateCRRealWithdrawTransaction  func(withdrawTransactionHashes []common.Uint256,
 		outpus []*common2.OutputInfo) (interfaces.Transaction, error)
-	IsCurrent          func() bool
-	Broadcast          func(msg p2p.Message)
-	AppendToTxpool     func(transaction interfaces.Transaction) elaerr.ELAError
-	GetUTXO            func(programHash *common.Uint168) ([]*common2.UTXO, error)
-	GetCurrentArbiters func() [][]byte
+	IsCurrent             func() bool
+	Broadcast             func(msg p2p.Message)
+	AppendToTxpool        func(transaction interfaces.Transaction) elaerr.ELAError
+	GetUTXO               func(programHash *common.Uint168) ([]*common2.UTXO, error)
+	GetCurrentArbiters    func() [][]byte
+	GetCrossChainArbiters func() [][]byte
 }
 
 func (c *Committee) RegisterFuncitons(cfg *CommitteeFuncsConfig) {
@@ -2031,6 +2033,7 @@ func (c *Committee) RegisterFuncitons(cfg *CommitteeFuncsConfig) {
 	c.getUTXO = cfg.GetUTXO
 	c.GetHeight = cfg.GetHeight
 	c.getCurrentArbiters = cfg.GetCurrentArbiters
+	c.getCrossChainArbiters = cfg.GetCrossChainArbiters
 }
 
 func (c *Committee) TryUpdateCRMemberInactivity(did common.Uint168,

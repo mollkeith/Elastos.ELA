@@ -380,7 +380,6 @@ func newRenewVoting(L *lua.LState) int {
 	})
 	referKey256, err := common.Uint256FromHexString(referkey)
 	if err != nil {
-		fmt.Println("###" + referkey)
 		fmt.Println("convert uint256 error")
 		os.Exit(1)
 	}

@@ -107,6 +107,7 @@ func (c *Committee) checkWithdrawAndInactiveCR(txs []interfaces.Transaction,
 		}
 
 		count++
+
 		if count == c.Params.CrossChainMonitorInterval {
 			// inactive member which one has not worked for withdraw
 			c.inactiveMembersByWithdrawKeys(height, members, wmap)

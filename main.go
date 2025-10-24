@@ -255,8 +255,9 @@ func startNode(cfg *config.Configuration) {
 		Broadcast: func(msg p2p.Message) {
 			netServer.BroadcastMessage(msg)
 		},
-		AppendToTxpool:     txMemPool.AppendToTxPool,
-		GetCurrentArbiters: arbiters.GetCurrentArbitratorKeys,
+		AppendToTxpool:        txMemPool.AppendToTxPool,
+		GetCurrentArbiters:    arbiters.GetCurrentArbitratorKeys,
+		GetCrossChainArbiters: arbiters.GetCrossChainArbitratorKeys,
 	})
 
 	servers.Compile = Version
