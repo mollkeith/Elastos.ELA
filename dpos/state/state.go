@@ -2134,7 +2134,7 @@ func (s *State) processVotes(tx interfaces.Transaction, blockTime uint32, height
 			switch flag {
 			case InitateVotingFlag:
 				var initateVoting InitateVoting
-				err := initateVoting.Deserialize(bytes.NewReader(data[1:]))
+				err := initateVoting.Deserialize(bytes.NewReader(data[8:]))
 				if err != nil {
 					log.Warn("[memo vote] deserialize initateVoting failed")
 					continue
@@ -2152,7 +2152,7 @@ func (s *State) processVotes(tx interfaces.Transaction, blockTime uint32, height
 				})
 			case UserVotingFlag:
 				var userVoting UserVoting
-				err := userVoting.Deserialize(bytes.NewReader(data[1:]))
+				err := userVoting.Deserialize(bytes.NewReader(data[8:]))
 				if err != nil {
 					log.Warn("[memo vote] deserialize userVoting failed")
 					continue
