@@ -1996,7 +1996,6 @@ func (s *State) activateProducer(p *payload.ActivateProducer, height uint32) {
 }
 
 type InitateVoting struct {
-	Init        string
 	ID          common.Uint256
 	EndTime     uint64
 	Description string
@@ -2009,11 +2008,7 @@ type InitateVoting struct {
 }
 
 func (v *InitateVoting) Serialize(w io.Writer) error {
-	err := common.WriteVarString(w, v.Init)
-	if err != nil {
-		return err
-	}
-	err = v.ID.Serialize(w)
+	err := v.ID.Serialize(w)
 	if err != nil {
 		return err
 	}
@@ -2044,10 +2039,6 @@ func (v *InitateVoting) Serialize(w io.Writer) error {
 
 func (v *InitateVoting) Deserialize(r io.Reader) error {
 	var err error
-	v.Init, err = common.ReadVarString(r)
-	if err != nil {
-		return err
-	}
 	err = v.ID.Deserialize(r)
 	if err != nil {
 		return err
