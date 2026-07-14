@@ -56,6 +56,28 @@ func TestEnforceCrossChainUTXORestrictionHeightIgnoresLocalOverrides(t *testing.
 	}
 }
 
+func TestEnforceFrozenAddressesIgnoresLocalOverrides(t *testing.T) {
+	configuration := config.GetDefaultParams()
+	configuration.ActiveNet = "mainnet"
+	configuration.FrozenAddresses = nil
+
+	enforceFrozenAddresses(configuration)
+
+	assert.Equal(t, config.MainNetFrozenAddresses(), configuration.FrozenAddresses)
+
+	configuration = config.GetDefaultParams()
+	configuration.ActiveNet = "testnet"
+	configuration.FrozenAddresses = []config.FrozenAddress{{
+		Address:            "EJMzC16Eorq9CuFCGtyMrq4Jmgw9jYCHQR",
+		DisableStartHeight: 1,
+	}}
+
+	enforceFrozenAddresses(configuration)
+
+	assert.Equal(t, "EJMzC16Eorq9CuFCGtyMrq4Jmgw9jYCHQR",
+		configuration.FrozenAddresses[0].Address)
+}
+
 // TestSetupConfigIgnoresCrossChainUTXORestrictionHeightOverride verifies a
 // config-file value cannot alter the mainnet consensus activation height.
 func TestSetupConfigIgnoresCrossChainUTXORestrictionHeightOverride(t *testing.T) {

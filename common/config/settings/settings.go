@@ -98,6 +98,7 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 		screw.Bind(conf.Configuration, version, about)
 	}
 	enforceCrossChainUTXORestrictionHeight(conf.Configuration)
+	enforceFrozenAddresses(conf.Configuration)
 	conf.Configuration = conf.Sterilize()
 	config.Parameters = conf.Configuration
 	return conf.Configuration
@@ -113,6 +114,17 @@ func enforceCrossChainUTXORestrictionHeight(configuration *config.Configuration)
 	default:
 		configuration.CrossChainUTXORestrictionHeight =
 			config.MainNetCrossChainUTXORestrictionHeight
+	}
+}
+
+// enforceFrozenAddresses prevents local configuration from changing the
+// coordinated mainnet frozen-address list.
+func enforceFrozenAddresses(configuration *config.Configuration) {
+	switch strings.ToLower(configuration.ActiveNet) {
+	case "testnet", "test", "regnet", "regtest", "reg":
+		// Keep network-specific or empty lists for non-mainnet.
+	default:
+		configuration.FrozenAddresses = config.MainNetFrozenAddresses()
 	}
 }
 

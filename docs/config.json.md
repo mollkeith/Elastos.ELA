@@ -74,6 +74,12 @@ Default config for `testnet`
     "SmallCrossTransferThreshold": 100000000,   // Small cross chain transaction threshold
     "ReturnDepositCoinFee": 100,                // Return Deposit Fee
     "CrossChainUTXORestrictionHeight": 2256400, // Mainnet consensus activation. Local config and CLI overrides are ignored.
+    "FrozenAddresses": [                        // Addresses frozen after DisableStartHeight (no spend from / send to). Mainnet list is enforced.
+      {
+        "Address": "EfduuvdDcAgif8njgXNJUfsBumQf9yYP72",
+        "DisableStartHeight": 2256400
+      }
+    ],
     "NewCrossChainStartHeight": 1032840,        // New Cross Chain Start Height
     "ReturnCrossChainCoinStartHeight": 1032840, // Return Cross Chain Coin Start Height
     "ProhibitTransferToDIDHeight": 1032840,     // Prohibit Transfer To DID Height
