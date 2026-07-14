@@ -538,6 +538,10 @@ func (tx *BaseTransaction) IsCreateNFTTX() bool {
 	return tx.txType == common2.CreateNFT
 }
 
+func (tx *BaseTransaction) IsNFTDestroyFromSideChainTx() bool {
+	return tx.txType == common2.NFTDestroyFromSideChain
+}
+
 func (tx *BaseTransaction) IsRecordSponorTx() bool {
 	return tx.txType == common2.RecordSponsor
 }

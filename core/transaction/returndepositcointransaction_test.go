@@ -68,6 +68,48 @@ func (s *txValidatorTestSuite) TestCheckTransactionDepositUTXO() {
 		"transaction can only use the deposit UTXO")
 }
 
+func (s *txValidatorTestSuite) TestCheckTransactionCrossChainUTXO() {
+	references := make(map[*common2.Input]common2.Output)
+	input := &common2.Input{}
+	var crossChainHash common.Uint168
+	crossChainHash[0] = byte(contract.PrefixCrossChain)
+	references[input] = common2.Output{ProgramHash: crossChainHash}
+
+	cfg := *config.GetDefaultParams()
+	cfg.ProhibitTransferFromCrossChainHeight = 100
+
+	// Before activation height, TransferAsset may still spend CrossChain UTXOs
+	// (needed to sync historical exploit transactions from genesis).
+	txn, _ := GetTransaction(common2.TransferAsset)
+	err := blockchain.CheckTransactionCrossChainUTXO(99, &cfg, txn, references)
+	s.NoError(err)
+
+	// After activation height, TransferAsset is rejected.
+	err = blockchain.CheckTransactionCrossChainUTXO(100, &cfg, txn, references)
+	s.EqualError(err, "only WithdrawFromSideChain, ReturnSideChainDepositCoin "+
+		"and NFTDestroyFromSideChain can use the cross chain UTXO")
+
+	// Whitelisted types remain allowed after activation height.
+	txn, _ = GetTransaction(common2.WithdrawFromSideChain)
+	err = blockchain.CheckTransactionCrossChainUTXO(100, &cfg, txn, references)
+	s.NoError(err)
+
+	txn, _ = GetTransaction(common2.ReturnSideChainDepositCoin)
+	err = blockchain.CheckTransactionCrossChainUTXO(100, &cfg, txn, references)
+	s.NoError(err)
+
+	txn, _ = GetTransaction(common2.NFTDestroyFromSideChain)
+	err = blockchain.CheckTransactionCrossChainUTXO(100, &cfg, txn, references)
+	s.NoError(err)
+
+	// Non-cross-chain inputs are unaffected.
+	normalHash, _ := common.Uint168FromAddress("EJMzC16Eorq9CuFCGtyMrq4Jmgw9jYCHQR")
+	references[input] = common2.Output{ProgramHash: *normalHash}
+	txn, _ = GetTransaction(common2.TransferAsset)
+	err = blockchain.CheckTransactionCrossChainUTXO(100, &cfg, txn, references)
+	s.NoError(err)
+}
+
 func (s *txValidatorTestSuite) TestCheckReturnDepositCoinTransaction() {
 	s.CurrentHeight = 1
 	ckpManager := checkpoint.NewManager(&config.DefaultParams)

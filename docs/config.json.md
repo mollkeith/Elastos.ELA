@@ -76,6 +76,7 @@ Default config for `testnet`
     "NewCrossChainStartHeight": 1032840,        // New Cross Chain Start Height
     "ReturnCrossChainCoinStartHeight": 1032840, // Return Cross Chain Coin Start Height
     "ProhibitTransferToDIDHeight": 1032840,     // Prohibit Transfer To DID Height
+    "ProhibitTransferFromCrossChainHeight": 2255600, // After this height, only WithdrawFromSideChain / ReturnSideChainDepositCoin / NFTDestroyFromSideChain may spend cross-chain UTXOs
     "CrossChainMonitorStartHeight": 2000000,    // Cross Chain Monitor Start Height
     "CrossChainMonitorInterval": 100,           // Cross Chain Monitor Interval
     "DPoSV2StartHeight": 2000000,               // Second edition Dpos start height

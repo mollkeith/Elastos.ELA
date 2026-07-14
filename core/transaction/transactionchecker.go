@@ -147,6 +147,12 @@ func (t *DefaultChecker) ContextCheck(params interfaces.Parameters) (
 		return nil, elaerr.Simple(elaerr.ErrTxInvalidInput, err)
 	}
 
+	if err := checkTransactionCrossChainUTXO(t.parameters.BlockHeight, t.parameters.Config,
+		t.parameters.Transaction, references); err != nil {
+		log.Warn("[CheckTransactionCrossChainUTXO],", err)
+		return nil, elaerr.Simple(elaerr.ErrTxInvalidInput, err)
+	}
+
 	if err := checkTransactionDepositOutputs(t.parameters.BlockChain, t.parameters.Transaction); err != nil {
 		log.Warn("[checkTransactionDepositOutputs],", err)
 		return nil, elaerr.Simple(elaerr.ErrTxInvalidInput, err)
@@ -642,6 +648,33 @@ func checkTransactionDepositUTXO(txn interfaces.Transaction, references map[*com
 					"transaction can only use the deposit UTXO")
 			}
 		}
+	}
+
+	return nil
+}
+
+// checkTransactionCrossChainUTXO restricts spending of PrefixCrossChain UTXOs to
+// transaction types that perform arbiter authorization checks. This closes the
+// gap where TransferAsset could spend cross-chain reserve UTXOs with a forged
+// self-consistent script. The restriction is height-gated so historical blocks
+// (including already-mined exploit transactions) remain syncable from genesis.
+func checkTransactionCrossChainUTXO(height uint32, cfg *config.Configuration,
+	txn interfaces.Transaction, references map[*common2.Input]common2.Output) error {
+	if cfg == nil || height < cfg.ProhibitTransferFromCrossChainHeight {
+		return nil
+	}
+
+	for _, output := range references {
+		if contract.GetPrefixType(output.ProgramHash) != contract.PrefixCrossChain {
+			continue
+		}
+		if txn.IsWithdrawFromSideChainTx() ||
+			txn.IsReturnSideChainDepositCoinTx() ||
+			txn.IsNFTDestroyFromSideChainTx() {
+			continue
+		}
+		return errors.New("only WithdrawFromSideChain, ReturnSideChainDepositCoin " +
+			"and NFTDestroyFromSideChain can use the cross chain UTXO")
 	}
 
 	return nil

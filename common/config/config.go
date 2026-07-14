@@ -250,7 +250,12 @@ func GetDefaultParams() *Configuration {
 		NewCrossChainStartHeight:        1032840,
 		ReturnCrossChainCoinStartHeight: 1032840,
 		ProhibitTransferToDIDHeight:     1032840,
-		DIDSideChainAddress:             "XKUh4GLhFJiqAMTF6HyWQrV9pK9HcGUdfJ",
+		// ProhibitTransferFromCrossChainHeight blocks TransferAsset (and other
+		// non-whitelisted tx types) from spending PrefixCrossChain UTXOs.
+		// Set after the known exploit blocks (~2255574-2255586) so sync from
+		// genesis still accepts historical transactions.
+		ProhibitTransferFromCrossChainHeight: 2255600,
+		DIDSideChainAddress:                  "XKUh4GLhFJiqAMTF6HyWQrV9pK9HcGUdfJ",
 		DPoSV2EffectiveVotes:            80000 * 100000000,
 		DPoSV2StartHeight:               1405000, //1405000+262800=1667800
 		StakePoolProgramHash:            StakePoolProgramHash,
@@ -378,6 +383,7 @@ func (p *Configuration) TestNet() *Configuration {
 	p.ReturnCrossChainCoinStartHeight = 807000
 	p.CRConfiguration.CRCProposalDraftDataStartHeight = 807000
 	p.ProhibitTransferToDIDHeight = 807000
+	p.ProhibitTransferFromCrossChainHeight = 0
 	p.DIDSideChainAddress = "XKUh4GLhFJiqAMTF6HyWQrV9pK9HcGUdfJ"
 	p.DPoSV2StartHeight = 965800 + 720*3
 	p.SupportMultiCodeHeight = 2000
@@ -507,6 +513,7 @@ func (p *Configuration) RegNet() *Configuration {
 	p.ReturnCrossChainCoinStartHeight = 730000
 	p.CRConfiguration.CRCProposalDraftDataStartHeight = 730000
 	p.ProhibitTransferToDIDHeight = 730000
+	p.ProhibitTransferFromCrossChainHeight = 0
 	p.DIDSideChainAddress = "XKUh4GLhFJiqAMTF6HyWQrV9pK9HcGUdfJ"
 	p.DPoSV2StartHeight = 875544 + 720*2
 	p.SupportMultiCodeHeight = 2000
@@ -602,6 +609,9 @@ type Configuration struct {
 	DIDSideChainAddress string `screw:"--didsidechainaddress" usage:"specify the did sidechain address"`
 	//Prohibit transfers to did height
 	ProhibitTransferToDIDHeight uint32 `screw:"--prohibittransfertodidheight" usage:"defines the height to prohibit transfer to did"`
+	// ProhibitTransferFromCrossChainHeight defines the height from which only
+	// whitelisted transaction types may spend PrefixCrossChain UTXOs.
+	ProhibitTransferFromCrossChainHeight uint32 `screw:"--prohibittransferfromcrosschainheight" usage:"defines the height to prohibit non-whitelisted txs from spending cross-chain UTXOs"`
 	// CheckAddressHeight defines the height begin to check output hash.
 	CheckAddressHeight uint32 `screw:"--checkaddressheight" usage:"defines the height begin to check output hash"`
 	// VoteStartHeight indicates the height of starting register producer and vote related.

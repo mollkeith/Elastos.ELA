@@ -641,6 +641,30 @@ func CheckTransactionDepositUTXO(txn interfaces.Transaction, references map[*com
 	return nil
 }
 
+// CheckTransactionCrossChainUTXO restricts spending of PrefixCrossChain UTXOs
+// after ProhibitTransferFromCrossChainHeight, mirroring the deposit-UTXO rule.
+func CheckTransactionCrossChainUTXO(height uint32, cfg *config.Configuration,
+	txn interfaces.Transaction, references map[*common2.Input]common2.Output) error {
+	if cfg == nil || height < cfg.ProhibitTransferFromCrossChainHeight {
+		return nil
+	}
+
+	for _, output := range references {
+		if contract.GetPrefixType(output.ProgramHash) != contract.PrefixCrossChain {
+			continue
+		}
+		if txn.IsWithdrawFromSideChainTx() ||
+			txn.IsReturnSideChainDepositCoinTx() ||
+			txn.IsNFTDestroyFromSideChainTx() {
+			continue
+		}
+		return errors.New("only WithdrawFromSideChain, ReturnSideChainDepositCoin " +
+			"and NFTDestroyFromSideChain can use the cross chain UTXO")
+	}
+
+	return nil
+}
+
 func CheckTransactionSize(txn interfaces.Transaction) error {
 	size := txn.GetSize()
 	if size <= 0 || size > int(pact.MaxBlockContextSize) {
