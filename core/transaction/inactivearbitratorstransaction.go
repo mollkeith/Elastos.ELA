@@ -6,12 +6,12 @@
 package transaction
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
 
 	"github.com/elastos/Elastos.ELA/blockchain"
-	"github.com/elastos/Elastos.ELA/core/contract/program"
 	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/interfaces"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
@@ -95,14 +95,15 @@ func (t *InactiveArbitratorsTransaction) SpecialContextCheck() (elaerr.ELAError,
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("tx already exists")), true
 	}
 
-	if err := CheckInactiveArbitrators(t); err != nil {
+	if err := CheckInactiveArbitrators(t, t.parameters.BlockHeight,
+		t.parameters.Config.StrictMoneyRangeHeight); err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
 	}
 
 	return nil, true
 }
 
-func CheckInactiveArbitrators(t interfaces.Transaction) error {
+func CheckInactiveArbitrators(t interfaces.Transaction, blockHeight, gate uint32) error {
 	p, ok := t.Payload().(*payload.InactiveArbitrators)
 	if !ok {
 		return errors.New("invalid payload")
@@ -123,16 +124,16 @@ func CheckInactiveArbitrators(t interfaces.Transaction) error {
 		}
 	}
 
-	if err := checkCRCArbitratorsSignatures(t.Programs()[0]); err != nil {
+	if err := checkCRCArbitratorsSignatures(t, blockHeight, gate); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func checkCRCArbitratorsSignatures(program *program.Program) error {
+func checkCRCArbitratorsSignatures(t interfaces.Transaction, blockHeight, gate uint32) error {
 
-	code := program.Code
+	code := t.Programs()[0].Code
 	// Get N parameter
 	// todo check
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
@@ -156,5 +157,24 @@ func checkCRCArbitratorsSignatures(program *program.Program) error {
 			return errors.New("invalid multi sign public key")
 		}
 	}
-	return nil
+	return verifyArbitratorsMultisigSignatures(t, blockHeight, gate)
+}
+
+// verifyArbitratorsMultisigSignatures verifies that the program Parameter
+// actually carries valid M-of-N arbiter signatures over the tx's unsigned
+// digest. F-022: the structure/pubkey checks above only prove the CODE lists
+// authorized arbiters; without this an unsigned special tx (empty or garbage
+// Parameter, all-public inputs) would be accepted permissionlessly and could
+// trigger an emergency ForceChange / RevertToDPOS. Height-gated at
+// StrictMoneyRangeHeight for replay-safety of pre-gate history; the digest is
+// exactly what the honest CRC signer path signs over (tx.SerializeUnsigned).
+func verifyArbitratorsMultisigSignatures(t interfaces.Transaction, blockHeight, gate uint32) error {
+	if blockHeight < gate {
+		return nil
+	}
+	buf := new(bytes.Buffer)
+	if err := t.SerializeUnsigned(buf); err != nil {
+		return err
+	}
+	return crypto.CheckMultiSigSignatures(*t.Programs()[0], buf.Bytes())
 }

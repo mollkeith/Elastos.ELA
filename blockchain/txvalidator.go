@@ -867,7 +867,7 @@ func CheckPayloadSignature(info *payload.CRInfo, payloadVersion byte) error {
 }
 
 func CheckRevertToDPOSTransaction(txn interfaces.Transaction) error {
-	return checkArbitratorsSignatures(txn.Programs()[0])
+	return checkArbitratorsSignatures(txn)
 }
 
 func CheckSidechainIllegalEvidence(p *payload.SidechainIllegalData) error {
@@ -926,15 +926,15 @@ func CheckInactiveArbitrators(txn interfaces.Transaction) error {
 		}
 	}
 
-	if err := checkCRCArbitratorsSignatures(txn.Programs()[0]); err != nil {
+	if err := checkCRCArbitratorsSignatures(txn); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func checkArbitratorsSignatures(program *program.Program) error {
-	code := program.Code
+func checkArbitratorsSignatures(txn interfaces.Transaction) error {
+	code := txn.Programs()[0].Code
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
@@ -963,12 +963,43 @@ func checkArbitratorsSignatures(program *program.Program) error {
 		}
 	}
 
-	return nil
+	return verifyArbitratorsMultisigSignatures(txn)
 }
 
-func checkCRCArbitratorsSignatures(program *program.Program) error {
+// arbitratorsMultisigActive reports whether strict multisig signature
+// verification for arbiter special txs (InactiveArbitrators / RevertToDPOS) is
+// active on the connect/gossip path: true at/above StrictMoneyRangeHeight.
+// Nil-safe: unit tests run without a wired DefaultLedger.Blockchain, which is
+// treated as below-gate (structure-only, preserving pre-gate replay behavior).
+func arbitratorsMultisigActive() bool {
+	bc := DefaultLedger.Blockchain
+	if bc == nil {
+		return false
+	}
+	return bc.GetHeight() >= bc.GetParams().StrictMoneyRangeHeight
+}
 
-	code := program.Code
+// verifyArbitratorsMultisigSignatures verifies that the program Parameter
+// actually carries valid M-of-N arbiter signatures over the tx's unsigned
+// digest. F-022: the structure/pubkey checks above only prove the CODE lists
+// authorized arbiters; without this the connect/gossip path would apply an
+// emergency ForceChange / RevertToDPOS on an unsigned, permissionlessly-forged
+// special tx. Height-gated for replay-safety; digest matches the honest signer
+// path (tx.SerializeUnsigned).
+func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction) error {
+	if !arbitratorsMultisigActive() {
+		return nil
+	}
+	buf := new(bytes.Buffer)
+	if err := txn.SerializeUnsigned(buf); err != nil {
+		return err
+	}
+	return crypto.CheckMultiSigSignatures(*txn.Programs()[0], buf.Bytes())
+}
+
+func checkCRCArbitratorsSignatures(txn interfaces.Transaction) error {
+
+	code := txn.Programs()[0].Code
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
@@ -991,7 +1022,7 @@ func checkCRCArbitratorsSignatures(program *program.Program) error {
 			return errors.New("invalid multi sign public key")
 		}
 	}
-	return nil
+	return verifyArbitratorsMultisigSignatures(txn)
 }
 
 func CheckDPOSIllegalProposals(d *payload.DPOSIllegalProposals) error {

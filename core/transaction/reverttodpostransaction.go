@@ -13,6 +13,7 @@ import (
 	"github.com/elastos/Elastos.ELA/blockchain"
 	"github.com/elastos/Elastos.ELA/core/contract/program"
 	common2 "github.com/elastos/Elastos.ELA/core/types/common"
+	"github.com/elastos/Elastos.ELA/core/types/interfaces"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	"github.com/elastos/Elastos.ELA/crypto"
 	"github.com/elastos/Elastos.ELA/dpos/state"
@@ -118,15 +119,16 @@ func (t *RevertToDPOSTransaction) SpecialContextCheck() (elaerr.ELAError, bool) 
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("already receieved  revertodpos")), true
 	}
 
-	if err := checkArbitratorsSignatures(t.Programs()[0]); err != nil {
+	if err := checkArbitratorsSignatures(t, t.parameters.BlockHeight,
+		t.parameters.Config.StrictMoneyRangeHeight); err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
 	}
 
 	return nil, true
 }
 
-func checkArbitratorsSignatures(program *program.Program) error {
-	code := program.Code
+func checkArbitratorsSignatures(t interfaces.Transaction, blockHeight, gate uint32) error {
+	code := t.Programs()[0].Code
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
@@ -155,5 +157,8 @@ func checkArbitratorsSignatures(program *program.Program) error {
 		}
 	}
 
-	return nil
+	// F-022 (RevertToDPOS sibling): verify the actual arbiter multisig signatures
+	// over the tx's unsigned digest; the checks above only prove the CODE lists
+	// authorized arbiters. Shared with the CRC path, height-gated for replay-safety.
+	return verifyArbitratorsMultisigSignatures(t, blockHeight, gate)
 }
