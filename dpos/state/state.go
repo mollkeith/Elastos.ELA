@@ -3359,22 +3359,31 @@ func (s *State) countArbitratorsInactivityV3(height uint32,
 		ps := s.getAllProducers()
 		for _, p := range ps {
 			cp := p
+			// F-168: capture the pre-reset value so the rollback restores the
+			// ORIGINAL workedInRound, not a hard-coded true. The old rollback set
+			// true for every producer, so a reorg across a round boundary made a
+			// producer that had NOT worked look worked -> inactiveCountV2 diverges.
+			// (Not height-gated: rollback closures only fire on live reorgs, never
+			// during linear replay, so historical derivation is unchanged.)
+			oriWorked := cp.workedInRound
 			// reset workedInRound value
 			s.History.Append(height, func() {
 				cp.workedInRound = false
 			}, func() {
-				cp.workedInRound = true
+				cp.workedInRound = oriWorked
 			})
 		}
 
 		ms := s.getCurrentCRMembers()
 		for _, m := range ms {
 			cm := m
+			// F-168: restore the captured original (see producer loop above).
+			oriWorked := cm.WorkedInRound
 			// reset workedInRound value
 			s.History.Append(height, func() {
 				cm.WorkedInRound = false
 			}, func() {
-				cm.WorkedInRound = true
+				cm.WorkedInRound = oriWorked
 			})
 		}
 	}
