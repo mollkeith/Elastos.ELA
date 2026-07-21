@@ -99,6 +99,24 @@ func (t *RevertToPOWTransaction) SpecialContextCheck() (result elaerr.ELAError, 
 			if int64(t.parameters.TimeStamp)-lastBlockTime < noBlockTime {
 				return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid block time")), true
 			}
+			// F-057: the block header timestamp is producer-controlled, and because
+			// RevertToPOWNoBlockTimeV1 == MaxTimeOffsetSeconds, a healthy-chain block
+			// future-dated to tip+noBlockTime satisfies the check above with ZERO real
+			// elapsed time -> forces DPoS->POW with no genuine arbiter stall. At/above
+			// the recovery gate, also require the node's OWN adjusted clock to confirm
+			// the no-block interval actually elapsed (the same guard the mempool path
+			// above already uses), so the forged header timestamp cannot be fed into the
+			// decision. A genuine >=noBlockTime stall still passes with no added delay
+			// (now - old tip >= noBlockTime, fires at exactly the threshold) and
+			// historical replay passes trivially (now >> ancient tip). Below the gate the
+			// original block-timestamp-only check is preserved for replay-safety of
+			// pre-gate history.
+			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+				localTime := t.MedianAdjustedTime().Unix()
+				if localTime-lastBlockTime < noBlockTime {
+					return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid block time")), true
+				}
+			}
 		}
 	case payload.NoProducers:
 		if !t.parameters.BlockChain.GetState().NoProducers {
