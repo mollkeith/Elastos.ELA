@@ -108,6 +108,14 @@ func (t *RevertToPOWTransaction) SpecialContextCheck() (result elaerr.ELAError, 
 		if !t.parameters.BlockChain.GetState().NoClaimDPOSNode {
 			return elaerr.Simple(elaerr.ErrTxPayload, errors.New("current CR member claimed DPoS node")), true
 		}
+	default:
+		// F-098: an unknown RevertToPOW Type previously fell through to accept,
+		// forcing DPoS->POW with NONE of the stall/flag preconditions. Reject
+		// unknown types at/above the gate. createRevertToPOWTransaction only ever
+		// emits Type 0/1/2, so no historical block carries Type>=3 -> replay-safe.
+		if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+			return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid RevertToPOW type")), true
+		}
 	}
 	return nil, true
 }
