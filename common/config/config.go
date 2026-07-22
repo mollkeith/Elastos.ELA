@@ -40,6 +40,16 @@ const (
 	// DisabledStrictMoneyRangeHeight keeps strict monetary validation inactive
 	// on networks that have not adopted a coordinated activation.
 	DisabledStrictMoneyRangeHeight uint32 = math.MaxUint32
+	// MainNetRevisedDPoSRewardHeight is the activation height for the revised
+	// DPoS reward math (F-011/086 ELA-only arbiter-reward basis; F-212 empty-
+	// arbiter-slot reward no longer double-counted). Per the core engineers
+	// (Q-B6) these reward-rule changes must NOT reuse the incident-recovery gate
+	// (StrictMoneyRangeHeight=2260451) — they take a fresh future activation
+	// height (> the frozen tip 2260595). MaxUint32 = dormant.
+	// TODO(owner): set to the coordinated post-recovery activation height before
+	// deployment; while MaxUint32 the F-212 double-count fix stays inactive
+	// (F-011/086 is byte-identical on the ELA-only mainnet either way).
+	MainNetRevisedDPoSRewardHeight uint32 = math.MaxUint32
 	// MainNetForcedRollbackHeight is the height the chain is rewound TO on first
 	// start of a patched node. The block at Height+1 is the value-overflow
 	// transaction's block; rewinding to 2260450 removes it and everything after.
@@ -304,6 +314,7 @@ func GetDefaultParams() *Configuration {
 		ReturnDepositCoinFee:            100,
 		CrossChainUTXOFreezeHeight:      MainNetCrossChainUTXOFreezeHeight,
 		StrictMoneyRangeHeight:          MainNetStrictMoneyRangeHeight,
+		RevisedDPoSRewardHeight:         MainNetRevisedDPoSRewardHeight,
 		ForcedRollbackHeight:            MainNetForcedRollbackHeight,
 		ForcedRollbackTrigger:           MainNetForcedRollbackTrigger,
 		CrossChainUTXORestrictionHeight: MainNetCrossChainUTXORestrictionHeight,
@@ -437,6 +448,7 @@ func (p *Configuration) TestNet() *Configuration {
 	p.ReturnDepositCoinFee = 100
 	p.CrossChainUTXOFreezeHeight = DisabledCrossChainUTXORestrictionHeight
 	p.StrictMoneyRangeHeight = DisabledStrictMoneyRangeHeight
+	p.RevisedDPoSRewardHeight = DisabledStrictMoneyRangeHeight
 	p.ForcedRollbackHeight = DisabledForcedRollbackHeight
 	p.ForcedRollbackTrigger = ""
 	p.CrossChainUTXORestrictionHeight = DisabledCrossChainUTXORestrictionHeight
@@ -572,6 +584,7 @@ func (p *Configuration) RegNet() *Configuration {
 	p.ReturnDepositCoinFee = 100
 	p.CrossChainUTXOFreezeHeight = DisabledCrossChainUTXORestrictionHeight
 	p.StrictMoneyRangeHeight = DisabledStrictMoneyRangeHeight
+	p.RevisedDPoSRewardHeight = DisabledStrictMoneyRangeHeight
 	p.ForcedRollbackHeight = DisabledForcedRollbackHeight
 	p.ForcedRollbackTrigger = ""
 	p.CrossChainUTXORestrictionHeight = DisabledCrossChainUTXORestrictionHeight
@@ -725,6 +738,13 @@ type Configuration struct {
 	// StrictMoneyRangeHeight defines the height from which strict monetary
 	// validation (checked arithmetic + money range) is enforced.
 	StrictMoneyRangeHeight uint32 `screw:"--strictmoneyrangeheight" usage:"defines the height from which strict monetary validation is enforced"`
+
+	// RevisedDPoSRewardHeight defines the height from which the revised DPoS
+	// reward math applies (F-011/086 ELA-only arbiter basis; F-212 empty-slot
+	// reward not double-counted). Separate from StrictMoneyRangeHeight per the
+	// core engineers (Q-B6) — a fresh future activation height, not the incident
+	// gate.
+	RevisedDPoSRewardHeight uint32 `screw:"--reviseddposrewardheight" usage:"defines the height from which the revised DPoS reward math is enforced"`
 
 	// ForcedRollbackHeight is the height a patched node rewinds TO on startup,
 	// but only when ForcedRollbackTrigger matches the block above it.

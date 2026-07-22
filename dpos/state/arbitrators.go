@@ -1070,6 +1070,16 @@ func (a *Arbiters) distributeWithNormalArbitratorsV3(height uint32, reward commo
 	// Abnormal CR`s reward need to be destroyed.
 	for i := len(a.CurrentArbitrators); i < arbitersCount; i++ {
 		roundReward[*a.ChainParams.DestroyELAProgramHash] += individualBlockConfirmReward
+		// F-212 (Q-B7): also account the destroyed empty-slot reward in realDPOSReward.
+		// Otherwise the caller's `change = reward - realDPOSReward` over-states change by
+		// the destroyed total and re-mints it to the CR+miner legs — the empty-slot reward
+		// is emitted TWICE (once burned, once spendable). Gated at RevisedDPoSRewardHeight
+		// (a fresh future height per the engineers, NOT the incident gate); below it the
+		// legacy double-count is preserved byte-identically for replay. The empty-slot
+		// reward is deterministic across nodes, so no split.
+		if height >= a.ChainParams.RevisedDPoSRewardHeight {
+			realDPOSReward += individualBlockConfirmReward
+		}
 	}
 	return roundReward, realDPOSReward, nil
 }
@@ -1137,6 +1147,16 @@ func (a *Arbiters) distributeWithNormalArbitratorsV2(height uint32, reward commo
 	// Abnormal CR`s reward need to be destroyed.
 	for i := len(a.CurrentArbitrators); i < arbitersCount; i++ {
 		roundReward[*a.ChainParams.DestroyELAProgramHash] += individualBlockConfirmReward
+		// F-212 (Q-B7): also account the destroyed empty-slot reward in realDPOSReward.
+		// Otherwise the caller's `change = reward - realDPOSReward` over-states change by
+		// the destroyed total and re-mints it to the CR+miner legs — the empty-slot reward
+		// is emitted TWICE (once burned, once spendable). Gated at RevisedDPoSRewardHeight
+		// (a fresh future height per the engineers, NOT the incident gate); below it the
+		// legacy double-count is preserved byte-identically for replay. The empty-slot
+		// reward is deterministic across nodes, so no split.
+		if height >= a.ChainParams.RevisedDPoSRewardHeight {
+			realDPOSReward += individualBlockConfirmReward
+		}
 	}
 	return roundReward, realDPOSReward, nil
 }

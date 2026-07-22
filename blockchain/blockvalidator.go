@@ -465,12 +465,15 @@ func (b *BlockChain) checkTxsContext(block *Block) error {
 		}
 	}
 	var dposReward Fixed64
-	if b.StrictMoneyActive(block.Height) {
+	// F-011/086 (re-gated per Q-B6): derive the arbiter reward leg from the ELA-filtered
+	// totalTxFee (same basis as the CR/miner legs) instead of the all-asset tx.Fee() sum,
+	// else a non-ELA fee inflates coinbase[2] above its ELA backing. The core engineers
+	// asked that this reward-rule change activate at a FRESH future height
+	// (RevisedDPoSRewardHeight), NOT the incident-recovery gate (StrictMoneyRangeHeight).
+	// On the ELA-only mainnet (Q-B1) it is byte-identical to the legacy GetBlockDPOSReward
+	// path either way (tx.Fee() sum == totalTxFee), so re-gating changes no mainnet block.
+	if block.Height >= b.chainParams.RevisedDPoSRewardHeight {
 		var err error
-		// F-011/086: derive the arbiter reward leg from the ELA-filtered
-		// totalTxFee (same basis as the CR/miner legs) instead of the all-asset
-		// tx.Fee() sum. Otherwise a non-ELA fee inflates coinbase[2] above its
-		// ELA backing, minting 0.35*(non-ELA fee) to arbiters.
 		dposReward, err = b.GetBlockDPOSRewardStrict(block.Height, totalTxFee)
 		if err != nil {
 			return elaerr.Simple(elaerr.ErrBlockValidation, err)
