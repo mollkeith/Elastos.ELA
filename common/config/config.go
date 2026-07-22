@@ -6,6 +6,7 @@
 package config
 
 import (
+	"fmt"
 	"math"
 	"math/big"
 	"time"
@@ -1008,8 +1009,16 @@ func (p *Configuration) InstantBlock() *Configuration {
 
 func (p *Configuration) Sterilize() *Configuration {
 	if p.FoundationAddress != "" {
-		p.FoundationProgramHash, _ = common.Uint168FromAddress(
+		var err error
+		p.FoundationProgramHash, err = common.Uint168FromAddress(
 			p.FoundationAddress)
+		// F-043 prereq: FoundationProgramHash is dereferenced below for the genesis
+		// block, so a malformed address must fail HERE with a clear message rather
+		// than nil-deref far away. A node cannot run without a valid foundation
+		// address, so this misconfiguration is fatal.
+		if err != nil {
+			panic(fmt.Sprintf("config: invalid FoundationAddress %q: %v", p.FoundationAddress, err))
+		}
 	}
 	if p.DestroyELAAddress != "" {
 		p.DestroyELAProgramHash, _ = common.Uint168FromAddress(
