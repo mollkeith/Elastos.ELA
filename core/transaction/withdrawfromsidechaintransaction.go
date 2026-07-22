@@ -303,6 +303,27 @@ func (t *WithdrawFromSideChainTransaction) checkWithdrawFromSideChainTransaction
 	if err != nil {
 		return err
 	}
+	// F-051: V2 (Schnorr) withdraws never performed the committed sidechain-tx-hash
+	// dedup that V0/V1 do, so one sidechain burn could be withdrawn again in a
+	// later block. Gated at StrictMoneyRangeHeight for replay-safety (below-gate
+	// byte-identical; mainnet V2 is dormant via SchnorrStartHeight=MaxUint32).
+	// testnet/regnet forward protection is a config decision (their gate is
+	// disabled) — see INFERRED-ITEMS. The mempool extractor + same-block mirror
+	// cover the pool and in-block dimensions.
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		for _, output := range t.Outputs() {
+			if output.Type != common2.OTWithdrawFromSideChain {
+				continue
+			}
+			witPayload, ok := output.Payload.(*outputpayload.Withdraw)
+			if !ok {
+				continue
+			}
+			if blockchain.DefaultLedger.Store.IsSidechainTxHashDuplicate(witPayload.SideChainTransactionHash) {
+				return errors.New("Duplicate side chain transaction hash in output paylod")
+			}
+		}
+	}
 	return nil
 }
 
@@ -416,7 +437,11 @@ func (t *WithdrawFromSideChainTransaction) GetRollbackProcessor() (database.TXPr
 
 			return nil
 		}, nil
-	} else if t.PayloadVersion() == payload.WithdrawFromSideChainVersionV1 {
+		// F-051: mirror GetSaveProcessor (V1||V2) so a reorged V2 withdraw also
+		// clears its Tx3Index; otherwise the sidechain hash stays marked-used
+		// forever (liveness brick — the burn can never be re-withdrawn).
+	} else if t.PayloadVersion() == payload.WithdrawFromSideChainVersionV1 ||
+		t.PayloadVersion() == payload.WithdrawFromSideChainVersionV2 {
 		return func(dbTx database.Tx) error {
 			for _, output := range t.Outputs() {
 				if output.Type != common2.OTWithdrawFromSideChain {

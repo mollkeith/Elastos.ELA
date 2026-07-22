@@ -279,6 +279,8 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	returnDeposit := make(map[string]struct{})          // F-068: mempool slotProgramCode (return-deposit)
 	claimNodeKeys := make(map[string]struct{})          // F-071: mempool slotCRCouncilMemberNodePublicKey
 	proposalDraft := make(map[Uint256]struct{})         // F-072: mempool slotCRCProposalDraftHash
+	sidechainWithdraw := make(map[Uint256]struct{})      // F-017/F-051: mempool slotSidechainTxHashes
+	sidechainReturnDeposit := make(map[Uint256]struct{}) // F-016: mempool slotSidechainReturnDepositTxHashes
 	for _, txn := range block.Transactions {
 		switch txn.TxType() {
 		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
@@ -388,6 +390,30 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate proposal draft hash")
 			}
 			proposalDraft[p.DraftHash] = struct{}{}
+		case common.WithdrawFromSideChain:
+			// F-017/F-051: mirror mempool slotSidechainTxHashes. The committed
+			// IsSidechainTxHashDuplicate read does not see an earlier same-block tx
+			// (Tx3Index is written post-validation), and V1/V2 carry the hash in
+			// output payloads that CheckDuplicateTx never inspects, so two same-block
+			// withdraws crediting one sidechain burn both pass -> double main-chain
+			// credit. Reject a repeated sidechain tx hash.
+			for _, h := range sidechainWithdrawHashes(txn) {
+				if _, exists := sidechainWithdraw[h]; exists {
+					return errors.New("[PowCheckBlockSanity] block contains duplicate sidechain withdraw hash")
+				}
+				sidechainWithdraw[h] = struct{}{}
+			}
+		case common.ReturnSideChainDepositCoin:
+			// F-016: mirror mempool slotSidechainReturnDepositTxHashes. The committed
+			// IsSidechainReturnDepositTxHashDuplicate read does not see an earlier
+			// same-block tx, so two same-block returns refunding one sidechain deposit
+			// both pass -> double refund. Reject a repeated deposit tx hash.
+			for _, h := range sidechainReturnDepositHashes(txn) {
+				if _, exists := sidechainReturnDeposit[h]; exists {
+					return errors.New("[PowCheckBlockSanity] block contains duplicate sidechain return-deposit hash")
+				}
+				sidechainReturnDeposit[h] = struct{}{}
+			}
 		}
 	}
 	return nil
@@ -403,6 +429,49 @@ func addWithdrawHashes(seen map[Uint256]struct{}, hashes []Uint256) error {
 		seen[h] = struct{}{}
 	}
 	return nil
+}
+
+// sidechainWithdrawHashes extracts the sidechain transaction hashes a
+// WithdrawFromSideChain credits, across payload versions (mirrors the mempool
+// key hashArraySidechainTransactionHashes). V1/V2 carry each hash in the
+// OTWithdrawFromSideChain output payloads; V0 carries them in the tx payload.
+func sidechainWithdrawHashes(txn interfaces.Transaction) []Uint256 {
+	if txn.PayloadVersion() == payload.WithdrawFromSideChainVersion {
+		if p, ok := txn.Payload().(*payload.WithdrawFromSideChain); ok {
+			return p.SideChainTransactionHashes
+		}
+		return nil
+	}
+	var hashes []Uint256
+	for _, output := range txn.Outputs() {
+		if output.Type != common.OTWithdrawFromSideChain {
+			continue
+		}
+		w, ok := output.Payload.(*outputpayload.Withdraw)
+		if !ok {
+			continue
+		}
+		hashes = append(hashes, w.SideChainTransactionHash)
+	}
+	return hashes
+}
+
+// sidechainReturnDepositHashes extracts the deposit tx hashes a
+// ReturnSideChainDepositCoin refunds (mirrors the mempool key
+// hashArraySidechainReturnDepositTransactionHashes).
+func sidechainReturnDepositHashes(txn interfaces.Transaction) []Uint256 {
+	var hashes []Uint256
+	for _, output := range txn.Outputs() {
+		if output.Type != common.OTReturnSideChainDepositCoin {
+			continue
+		}
+		w, ok := output.Payload.(*outputpayload.ReturnSideChainDeposit)
+		if !ok {
+			continue
+		}
+		hashes = append(hashes, w.DepositTransactionHash)
+	}
+	return hashes
 }
 
 // stakeVoteConflictKey mirrors the mempool slotExchangeVotes key extraction
