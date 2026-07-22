@@ -70,6 +70,7 @@ func TestArmIncidentGatesCannotWeakenMainnet(t *testing.T) {
 			c.ActiveNet = label
 			c.ArmIncidentGates = true // hostile: try to unpin mainnet
 			c.StrictMoneyRangeHeight = 1
+			c.RevisedDPoSRewardHeight = 1
 			c.CrossChainUTXOFreezeHeight = 1
 			c.CrossChainUTXORestrictionHeight = 1
 			c.ForcedRollbackHeight = 1
@@ -80,6 +81,8 @@ func TestArmIncidentGatesCannotWeakenMainnet(t *testing.T) {
 
 			assert.Equal(t, config.MainNetStrictMoneyRangeHeight, c.StrictMoneyRangeHeight,
 				"ArmIncidentGates must NEVER unpin mainnet strict-money height")
+			assert.Equal(t, config.MainNetRevisedDPoSRewardHeight, c.RevisedDPoSRewardHeight,
+				"ArmIncidentGates must NEVER unpin mainnet RevisedDPoSRewardHeight (reward gate)")
 			assert.Equal(t, config.MainNetCrossChainUTXOFreezeHeight, c.CrossChainUTXOFreezeHeight)
 			assert.Equal(t, config.MainNetCrossChainUTXORestrictionHeight, c.CrossChainUTXORestrictionHeight)
 			assert.Equal(t, config.MainNetForcedRollbackHeight, c.ForcedRollbackHeight)

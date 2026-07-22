@@ -164,6 +164,11 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
 	case "", "mainnet", "main":
 		configuration.StrictMoneyRangeHeight = config.MainNetStrictMoneyRangeHeight
+		// Pin RevisedDPoSRewardHeight too: it is a --reviseddposrewardheight-overridable,
+		// consensus-affecting coordinated height (F-212/F-032 reward gate). Leaving it
+		// unpinned let a mainnet config.json/CLI override diverge reward math from the fleet
+		// once the owner sets its activation value. No-op today (default MaxUint32/dormant).
+		configuration.RevisedDPoSRewardHeight = config.MainNetRevisedDPoSRewardHeight
 		configuration.ForcedRollbackHeight = config.MainNetForcedRollbackHeight
 		configuration.ForcedRollbackTrigger = config.MainNetForcedRollbackTrigger
 		// Pin the DPoS v2 vote lock-time bounds: payload.VoteRights clamps duration
