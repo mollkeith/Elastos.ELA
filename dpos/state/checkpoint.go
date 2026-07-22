@@ -33,6 +33,10 @@ const (
 )
 
 // CheckPoint defines all variables need record in database
+// degradationTag marks the start of the trailing degradation block appended to
+// a DPoS state checkpoint (F-096). Legacy checkpoints end before it.
+var degradationTag = [4]byte{'D', 'E', 'G', 'R'}
+
 type CheckPoint struct {
 	StateKeyFrame
 	Height                      uint32
@@ -58,7 +62,18 @@ type CheckPoint struct {
 	IllegalBlocksPayloadHashes map[common.Uint256]interface{}
 
 	ForceChanged bool
-	arbitrators  *Arbiters
+
+	// F-096: degradation state persisted so a cold restart does not lose the
+	// DSInactive / DSUnderstaffed mode + processed-inactive-tx set and re-run
+	// PreProcessSpecialTx, re-triggering a spurious ForceChange. Written as a
+	// trailing back-compat "DEGR" block (legacy checkpoints lacking it default
+	// to DSNormal on restore).
+	DegradationState  byte
+	UnderstaffedSince uint32
+	InactivateHeight  uint32
+	InactiveTxs       map[common.Uint256]interface{}
+
+	arbitrators *Arbiters
 }
 
 func (c *CheckPoint) SaveStartHeight() uint32 {
@@ -260,7 +275,60 @@ func (c *CheckPoint) Serialize(w io.Writer) (err error) {
 	if err = common.WriteElements(w, c.ForceChanged); err != nil {
 		return
 	}
-	return c.StateKeyFrame.Serialize(w)
+	if err = c.StateKeyFrame.Serialize(w); err != nil {
+		return
+	}
+	// F-096: trailing back-compat degradation block.
+	return c.serializeDegradation(w)
+}
+
+// serializeDegradation writes the trailing degradation block: a 4-byte "DEGR"
+// tag, the degradation state byte, understaffedSince, inactivateHeight and the
+// processed-inactive-tx hash set. The tag lets a legacy checkpoint (which ends
+// right after StateKeyFrame) be detected on read.
+func (c *CheckPoint) serializeDegradation(w io.Writer) (err error) {
+	if _, err = w.Write(degradationTag[:]); err != nil {
+		return
+	}
+	if err = common.WriteElements(w, c.DegradationState,
+		c.UnderstaffedSince, c.InactivateHeight); err != nil {
+		return
+	}
+	return c.serializeIllegalPayloadHashesMap(w, c.InactiveTxs)
+}
+
+// deserializeDegradation reads the optional trailing degradation block. A clean
+// EOF where the tag is expected means a legacy checkpoint written before F-096,
+// so the degradation state defaults to DSNormal instead of erroring.
+func (c *CheckPoint) deserializeDegradation(r io.Reader) (err error) {
+	var tag [4]byte
+	if _, err = io.ReadFull(r, tag[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			c.DegradationState = byte(DSNormal)
+			c.InactiveTxs = make(map[common.Uint256]interface{})
+			return nil
+		}
+		return err
+	}
+	if tag != degradationTag {
+		return errors.New("invalid degradation checkpoint tag")
+	}
+	if err = common.ReadElements(r, &c.DegradationState,
+		&c.UnderstaffedSince, &c.InactivateHeight); err != nil {
+		return
+	}
+	c.InactiveTxs, err = c.deserializeIllegalPayloadHashes(r)
+	return
+}
+
+// copyInactiveTxs returns a copy of the processed-inactive-tx hash set so the
+// checkpoint does not alias the live degradation map.
+func copyInactiveTxs(src map[common.Uint256]interface{}) map[common.Uint256]interface{} {
+	dst := make(map[common.Uint256]interface{}, len(src))
+	for k := range src {
+		dst[k] = nil
+	}
+	return dst
 }
 
 func (c *CheckPoint) serializeCRCArbitersMap(w io.Writer,
@@ -422,7 +490,11 @@ func (c *CheckPoint) Deserialize(r io.Reader) (err error) {
 	if err = common.ReadElement(r, &c.ForceChanged); err != nil {
 		return
 	}
-	return c.StateKeyFrame.Deserialize(r)
+	if err = c.StateKeyFrame.Deserialize(r); err != nil {
+		return
+	}
+	// F-096: optional trailing degradation block (absent in legacy checkpoints).
+	return c.deserializeDegradation(r)
 }
 
 func (c *CheckPoint) deserializeCRCArbitersMap(r io.Reader) (
@@ -591,6 +663,11 @@ func (c *CheckPoint) initFromArbitrators(ar *Arbiters) {
 	c.NextCRCArbitersMap = ar.nextCRCArbitersMap
 	c.NextCRCArbiters = ar.nextCRCArbiters
 	c.ForceChanged = ar.forceChanged
+	// F-096: capture degradation state so it survives serialize/restore.
+	c.DegradationState = byte(ar.degradation.state)
+	c.UnderstaffedSince = ar.degradation.understaffedSince
+	c.InactivateHeight = ar.degradation.inactivateHeight
+	c.InactiveTxs = copyInactiveTxs(ar.degradation.inactiveTxs)
 
 }
 

@@ -209,6 +209,16 @@ func (a *Arbiters) recoverFromCheckPoints(point *CheckPoint) {
 	a.nextCRCArbitersMap = point.NextCRCArbitersMap
 	a.nextCRCArbiters = point.NextCRCArbiters
 	a.forceChanged = point.ForceChanged
+	// F-096: restore degradation state so a cold restart does not re-run
+	// PreProcessSpecialTx and re-trigger a spurious ForceChange.
+	a.degradation.state = degradationState(point.DegradationState)
+	a.degradation.understaffedSince = point.UnderstaffedSince
+	a.degradation.inactivateHeight = point.InactivateHeight
+	if point.InactiveTxs != nil {
+		a.degradation.inactiveTxs = point.InactiveTxs
+	} else {
+		a.degradation.inactiveTxs = make(map[common.Uint256]interface{})
+	}
 }
 
 func (a *Arbiters) ProcessBlock(block *types.Block, confirm *payload.Confirm) {
@@ -2911,6 +2921,10 @@ func (a *Arbiters) newCheckPoint(height uint32) *CheckPoint {
 		FinalRoundChange:            a.finalRoundChange,
 		ClearingHeight:              a.clearingHeight,
 		ForceChanged:                a.forceChanged,
+		DegradationState:            byte(a.degradation.state),
+		UnderstaffedSince:           a.degradation.understaffedSince,
+		InactivateHeight:            a.degradation.inactivateHeight,
+		InactiveTxs:                 make(map[common.Uint256]interface{}),
 		ArbitersRoundReward:         make(map[common.Uint168]common.Fixed64),
 		IllegalBlocksPayloadHashes:  make(map[common.Uint256]interface{}),
 		LastArbitrators:             a.LastArbitrators,
@@ -2934,6 +2948,10 @@ func (a *Arbiters) newCheckPoint(height uint32) *CheckPoint {
 	}
 	for k := range a.illegalBlocksPayloadHashes {
 		point.IllegalBlocksPayloadHashes[k] = nil
+	}
+	// F-096: capture the processed-inactive-tx set into the checkpoint.
+	for k := range a.degradation.inactiveTxs {
+		point.InactiveTxs[k] = nil
 	}
 
 	return point
