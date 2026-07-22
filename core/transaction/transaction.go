@@ -551,6 +551,21 @@ func (tx *BaseTransaction) SerializeSizeStripped() int {
 
 func (tx *BaseTransaction) IsSmallTransfer(min common.Fixed64) bool {
 	var totalCrossAmt common.Fixed64
+	// F-001: accumulate cross-chain output values with an overflow-checked add.
+	// A wrapping int64 sum could turn a huge transfer negative and misclassify it
+	// as "small". Reachable in the mempool on nets where StrictMoneyRangeHeight is
+	// disabled (testnet/regnet, mainnet pre-activation), where the balance check
+	// that would otherwise bound the sum does not run. On overflow, treat the tx
+	// as NOT small (return false) — the safe classification. Mempool-only routing,
+	// never part of block replay, so no height gate is needed.
+	addCross := func(v common.Fixed64) bool {
+		sum, err := common.AddFixed64(totalCrossAmt, v)
+		if err != nil {
+			return false
+		}
+		totalCrossAmt = sum
+		return true
+	}
 	if tx.payloadVersion == payload.TransferCrossChainVersion {
 		payloadObj, ok := tx.payload.(*payload.TransferCrossChainAsset)
 		if !ok {
@@ -558,13 +573,17 @@ func (tx *BaseTransaction) IsSmallTransfer(min common.Fixed64) bool {
 		}
 		for i := 0; i < len(payloadObj.CrossChainAddresses); i++ {
 			if bytes.Compare(tx.outputs[payloadObj.OutputIndexes[i]].ProgramHash[0:1], []byte{byte(contract.PrefixCrossChain)}) == 0 {
-				totalCrossAmt += tx.outputs[payloadObj.OutputIndexes[i]].Value
+				if !addCross(tx.outputs[payloadObj.OutputIndexes[i]].Value) {
+					return false
+				}
 			}
 		}
 	} else {
 		for _, o := range tx.outputs {
 			if bytes.Compare(o.ProgramHash[0:1], []byte{byte(contract.PrefixCrossChain)}) == 0 {
-				totalCrossAmt += o.Value
+				if !addCross(o.Value) {
+					return false
+				}
 			}
 		}
 	}
