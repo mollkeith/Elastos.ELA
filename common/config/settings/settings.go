@@ -120,6 +120,7 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 	enforceCrossChainUTXORestrictionHeights(conf.Configuration)
 	enforceStrictMoneyAndRollbackHeights(conf.Configuration)
 	enforceFrozenAddresses(conf.Configuration)
+	enforceMainnetIncidentGatesArmed(conf.Configuration)
 	conf.Configuration = conf.Sterilize()
 	config.Parameters = conf.Configuration
 	return conf.Configuration
@@ -175,6 +176,32 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 		configuration.StrictMoneyRangeHeight = config.DisabledStrictMoneyRangeHeight
 		configuration.ForcedRollbackHeight = config.DisabledForcedRollbackHeight
 		configuration.ForcedRollbackTrigger = ""
+	}
+}
+
+// enforceMainnetIncidentGatesArmed (F-043 part 2) refuses to start the REAL mainnet
+// chain with the incident controls disabled. The ActiveNet label switch that selects
+// params has no default, so a typo (e.g. "mainet") keeps the mainnet foundation
+// identity while enforce*Heights() above hit their default branch and DISABLE the
+// CrossChain-UTXO freeze, strict-money-range and forced-rollback gates -- a mainnet
+// node that would follow the corrupt chain. Discriminates by foundation IDENTITY, not
+// the label (unknown labels are legitimately used for private/forked nets, which have a
+// different foundation and are unaffected).
+func enforceMainnetIncidentGatesArmed(configuration *config.Configuration) {
+	if !config.IsMainNetFoundationProgramHash(configuration.FoundationProgramHash) {
+		return
+	}
+	if configuration.StrictMoneyRangeHeight == config.DisabledStrictMoneyRangeHeight ||
+		configuration.CrossChainUTXOFreezeHeight == config.DisabledCrossChainUTXORestrictionHeight ||
+		configuration.ForcedRollbackTrigger == "" {
+		panic(fmt.Sprintf(
+			"config: ActiveNet %q resolves to the MAINNET chain (foundation identity) but the "+
+				"incident controls are DISABLED (StrictMoneyRangeHeight=%d, "+
+				"CrossChainUTXOFreezeHeight=%d, ForcedRollbackTrigger=%q). Refusing to start: a "+
+				"mainnet node with the CrossChain-UTXO freeze / strict-money / forced-rollback "+
+				"gates off would follow the corrupt chain. Set ActiveNet to \"mainnet\".",
+			configuration.ActiveNet, configuration.StrictMoneyRangeHeight,
+			configuration.CrossChainUTXOFreezeHeight, configuration.ForcedRollbackTrigger))
 	}
 }
 

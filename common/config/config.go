@@ -181,6 +181,14 @@ var (
 	}
 )
 
+// IsMainNetFoundationProgramHash reports whether h is the mainnet foundation identity.
+// Used to detect the REAL mainnet chain by IDENTITY (not the ActiveNet label) so the
+// incident-gate refuse-to-start guard (F-043) fires on a mislabelled mainnet node but
+// never on a private/forked net, which uses a different foundation.
+func IsMainNetFoundationProgramHash(h *common.Uint168) bool {
+	return h != nil && h.IsEqual(*mainNetFoundationProgramHash)
+}
+
 func SetParameters(configuration *Configuration) {
 	Parameters = configuration
 }
