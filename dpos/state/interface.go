@@ -59,6 +59,11 @@ type Arbitrators interface {
 	IsDisabledProducer(pk []byte) bool
 	IsNeedNextTurnDPOSInfo() bool
 	IsDPoSV2Run(blockHeight uint32) bool
+	// CheckRecordSponsorBinding (F-032) verifies a block's RecordSponsor tx names the
+	// true sponsor of the confirmed previous block, override-aware, gated at
+	// RevisedDPoSRewardHeight (no-op below the gate).
+	CheckRecordSponsorBinding(recordedSponsor []byte, lastBlockHeight uint32,
+		lastConfirmSponsor []byte, height uint32) error
 
 	GetOnDutyArbitrator() []byte
 	GetNextOnDutyArbitrator(offset uint32) []byte

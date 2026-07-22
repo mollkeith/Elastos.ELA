@@ -661,12 +661,16 @@ func (b *BlockChain) CheckBlockContext(block *Block, prevNode *BlockNode) error 
 	}
 
 	var recordSponsorExist bool
+	var recordedSponsor []byte
 	for _, tx := range block.Transactions[1:] {
 		if !IsFinalizedTransaction(tx, block.Height) {
 			return errors.New("block contains unfinalized transaction")
 		}
 		if tx.IsRecordSponorTx() {
 			recordSponsorExist = true
+			if pld, ok := tx.Payload().(*payload.RecordSponsor); ok {
+				recordedSponsor = pld.Sponsor
+			}
 		}
 	}
 
@@ -695,6 +699,23 @@ func (b *BlockChain) CheckBlockContext(block *Block, prevNode *BlockNode) error 
 		}
 		if lastBlock.Confirm != nil && !recordSponsorExist {
 			return errors.New("confirmed block must have record sponsor transaction")
+		}
+
+		// F-032: bind the RecordSponsor tx's Sponsor to the ACTUAL sponsor of the
+		// confirmed previous block. recordsponsortransaction.go SpecialContextCheck only
+		// checks the Sponsor is SOME current/last arbiter (membership), so a block
+		// producer could name any arbiter and redirect the DPoS sponsor-reward
+		// (a.LastDPoSRewards[recordedSponsor] in accumulateReward) away from the true
+		// sponsor -- conserved between arbiters, no inflation. The confirm-presence check
+		// above guarantees lastBlock.Confirm != nil whenever a RecordSponsor tx is
+		// present, so reading its sponsor is safe. Override-aware (operator sponsors file)
+		// and gated at RevisedDPoSRewardHeight -> below-gate byte-identical.
+		if recordSponsorExist {
+			if err := DefaultLedger.Arbitrators.CheckRecordSponsorBinding(
+				recordedSponsor, lastBlock.Height,
+				lastBlock.Confirm.Proposal.Sponsor, block.Height); err != nil {
+				return err
+			}
 		}
 	}
 

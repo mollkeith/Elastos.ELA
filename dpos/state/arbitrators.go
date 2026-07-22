@@ -808,6 +808,29 @@ func (a *Arbiters) getDPoSV2RewardsV2(dposReward common.Fixed64, sponsor []byte,
 	return rewards
 }
 
+// CheckRecordSponsorBinding (F-032) verifies a block's RecordSponsor tx names the true
+// sponsor of the confirmed previous block. Membership-only validation
+// (recordsponsortransaction.go SpecialContextCheck) let a block producer name any
+// current/last arbiter and redirect the deferred DPoS sponsor-reward
+// (LastDPoSRewards[recordedSponsor]) to a wrong arbiter -- conserved, no inflation.
+// Override-aware: BlockConfirmProposalSponsors (loaded from an optional operator
+// sponsors file, immutable after init) corrects specific heights. Gated at
+// RevisedDPoSRewardHeight so retained history below the rollback stays byte-identical.
+func (a *Arbiters) CheckRecordSponsorBinding(recordedSponsor []byte, lastBlockHeight uint32,
+	lastConfirmSponsor []byte, height uint32) error {
+	if height < a.ChainParams.RevisedDPoSRewardHeight {
+		return nil
+	}
+	realSponsor := lastConfirmSponsor
+	if sp, ok := a.BlockConfirmProposalSponsors[lastBlockHeight]; ok {
+		realSponsor = sp
+	}
+	if !bytes.Equal(recordedSponsor, realSponsor) {
+		return errors.New("record sponsor does not match the confirmed block sponsor")
+	}
+	return nil
+}
+
 func (a *Arbiters) accumulateReward(block *types.Block, confirm *payload.Confirm) {
 	if block.Height < a.ChainParams.PublicDPOSHeight {
 		oriDutyIndex := a.DutyIndex
