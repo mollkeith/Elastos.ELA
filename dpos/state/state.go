@@ -2253,7 +2253,15 @@ func (s *State) processDeposit(tx interfaces.Transaction, height uint32) {
 			contract.PrefixDeposit {
 			if s.addProducerAssert(output, height) {
 				op := common2.NewOutPoint(tx.Hash(), uint16(i))
-				s.DepositOutputs[op.ReferKey()] = output.Value
+				// F-065 (DPoS sibling): History-wrap so the entry reverts on rollback,
+				// mirroring the correctly-wrapped registerProducer path (and the CR-side
+				// F-065 fix). Previously a direct write that survived a reorg RollbackTo.
+				k, v := op.ReferKey(), output.Value
+				s.History.Append(height, func() {
+					s.DepositOutputs[k] = v
+				}, func() {
+					delete(s.DepositOutputs, k)
+				})
 			}
 		}
 	}
