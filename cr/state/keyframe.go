@@ -1954,6 +1954,11 @@ func (p *ProposalKeyFrame) deserializeWithdrawableTransactionsMap(r io.Reader) (
 		if err = withdrawInfo.Deserialize(r); err != nil {
 			return
 		}
+		// F-142: store the deserialized entry. The loop read hash+info off the wire
+		// but never inserted it, so every CR checkpoint round-trip / restart returned
+		// an EMPTY map — wiping the CRC RealWithdraw pending queue (WithdrawableTxInfo)
+		// -> peer desync. Mirror the serialize side.
+		withdrawableTxsMap[hash] = withdrawInfo
 	}
 	return
 }

@@ -510,6 +510,13 @@ func (p *StateKeyFrame) deserializeWithdrawableTransactionsMap(r io.Reader) (
 		if err = withdrawInfo.Deserialize(r); err != nil {
 			return
 		}
+		// F-165: store the deserialized entry. The loop read hash+info off the wire
+		// but never inserted it, so every checkpoint round-trip / restart returned an
+		// EMPTY map — wiping the DPoS pending real-withdraw queues (WithdrawableTxInfo
+		// for DposV2ClaimRewardRealWithdraw and VotesWithdrawableTxInfo for
+		// VotesRealWithdraw) -> peer desync. Mirror the serialize side (both use this
+		// function via the two Deserialize call sites).
+		withdrawableTxsMap[hash] = withdrawInfo
 	}
 	return
 }

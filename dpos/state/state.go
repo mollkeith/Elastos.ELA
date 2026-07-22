@@ -2689,12 +2689,30 @@ func (s *State) processCreateNFT(tx interfaces.Transaction, height uint32) {
 	nftPayload := tx.Payload().(*payload.CreateNFT)
 	nftID := common.GetNFTID(nftPayload.ReferKey, tx.Hash())
 
-	// record the relationship map between ID and genesis block hash
-	s.NFTIDInfoHashMap[nftID] = payload.NFTInfo{
+	// record the relationship map between ID and genesis block hash.
+	// F-040: History-wrap this write so a reorg RollbackTo removes the entry. The
+	// original DIRECT (non-History) write left a "ghost" NFT ID after rollback — the
+	// vote-rights changes below ARE History-wrapped and revert, but the map entry
+	// survived, letting a later expire/destroy inflate DposV2VoteRights and a
+	// same-referKey re-create double-mint (new tx hash -> new nftID). This is a
+	// STANDALONE TOP-LEVEL closure (the write is unconditional today — it runs even for
+	// creates with no matching vote), so forward committed state is byte-identical.
+	// Capture-and-restore (mirrors processNFTDestroyFromSideChain) keeps it overwrite-safe.
+	oriNFTInfo, hadNFTInfo := s.NFTIDInfoHashMap[nftID]
+	nftInfo := payload.NFTInfo{
 		ReferKey:         nftPayload.ReferKey,
 		GenesisBlockHash: nftPayload.GenesisBlockHash,
 		CreateNFTTxHash:  tx.Hash(),
 	}
+	s.History.Append(height, func() {
+		s.NFTIDInfoHashMap[nftID] = nftInfo
+	}, func() {
+		if hadNFTInfo {
+			s.NFTIDInfoHashMap[nftID] = oriNFTInfo
+		} else {
+			delete(s.NFTIDInfoHashMap, nftID)
+		}
+	})
 
 	producers := s.getDposV2Producers()
 	for _, producer := range producers {
@@ -2943,7 +2961,12 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 							producer.detailedDPoSV2Votes[stakeAddress][referKey] = originDetailVoteInfo
 							//remove owner's detailVoteInfo
 							delete(producer.detailedDPoSV2Votes[newOwnerStakeAddress], referKey)
-							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= s.DPoSV2RewardInfo[strNFTStakeAddress]
+							// F-073: debit the CAPTURED credited amount, not a live lookup of the
+							// key the forward closure already deleted (which reads 0 -> owner keeps
+							// the credited reward = claimable reward inflation on reorg). oriRewardsInfo
+							// is captured before History.Append (which runs apply synchronously), so it
+							// equals what the forward `owner += DPoSV2RewardInfo[NFT]` added.
+							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= oriRewardsInfo
 							s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
 							if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {
 								delete(s.DPoSV2RewardInfo, strOwnerStakeAddress)
@@ -3005,7 +3028,9 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 						producer.expiredNFTVotes[stakeAddress] = votesInfo
 						//remove owner's detailVoteInfo
 						//delete(producer.expiredNFTVotes, newOwnerStakeAddress)
-						s.DPoSV2RewardInfo[strOwnerStakeAddress] -= s.DPoSV2RewardInfo[strNFTStakeAddress]
+						// F-073 (expired branch): same fix as the active branch — debit the
+						// captured credited amount, not the deleted key's live (0) value.
+						s.DPoSV2RewardInfo[strOwnerStakeAddress] -= oriRewardsInfo
 						s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
 						if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {
 							delete(s.DPoSV2RewardInfo, strOwnerStakeAddress)

@@ -97,6 +97,17 @@ func (t *NFTDestroyTransactionFromSideChain) SpecialContextCheck() (elaerr.ELAEr
 	if !ok {
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid payload")), true
 	}
+	// F-074: IDs and OwnerStakeAddresses are two independently-counted slices; the apply
+	// path (processNFTDestroyFromSideChain, state.go:2895/2961) indexes
+	// OwnerStakeAddresses[i] over the IDs loop, so a length mismatch is accepted here then
+	// panics (index out of range) on ProcessBlock -> consensus halt. Reject the mismatch.
+	// Gated at the coordinated-upgrade height for replay-safety (no mismatched NFTDestroy
+	// exists in history — one would have halted every node before tip 2260595).
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight &&
+		len(nftDestroyPayload.IDs) != len(nftDestroyPayload.OwnerStakeAddresses) {
+		return elaerr.Simple(elaerr.ErrTxPayload,
+			errors.New("NFTDestroy IDs and OwnerStakeAddresses length mismatch")), true
+	}
 	state := t.parameters.BlockChain.GetState()
 
 	// check if the NFT exist
