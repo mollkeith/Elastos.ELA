@@ -3021,10 +3021,13 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 						if s.DposV2VoteRights[newOwnerStakeAddress] == 0 {
 							delete(s.DposV2VoteRights, newOwnerStakeAddress)
 						}
-						s.UsedDposV2Votes[newOwnerStakeAddress] -= nftAmount
-						if s.UsedDposV2Votes[newOwnerStakeAddress] == 0 {
-							delete(s.UsedDposV2Votes, newOwnerStakeAddress)
-						}
+						// F-075: the apply closure intentionally does NOT touch UsedDposV2Votes
+						// for the expired-NFT reclaim (the migrated votes become castable, not
+						// used), so the revert must be a no-op on it too. The previously-active
+						// `s.UsedDposV2Votes[newOwnerStakeAddress] -= nftAmount` block had no
+						// matching apply increment, so on a reorg RollbackTo it deflated/
+						// underflowed the new owner's used-vote count (inflating castable
+						// rights). Removed to make apply/revert exact inverses.
 						////add detailVoteInfo to  nft stake address
 						//if len(producer.detailedDPoSV2Votes[stakeAddress]) == 0 {
 						//	producer.detailedDPoSV2Votes[stakeAddress] = make(map[common.Uint256]payload.DetailedVoteInfo)

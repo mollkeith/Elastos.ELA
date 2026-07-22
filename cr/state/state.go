@@ -270,11 +270,15 @@ func (s *State) registerCR(tx interfaces.Transaction, height uint32) {
 	}
 
 	amount := common.Fixed64(0)
+	// F-065: capture the deposit outputs so the map write is History-wrapped
+	// below and reverts on rollback (previously written directly here, leaving
+	// stale DepositOutputs entries after a reorg / diverging the CR keyframe).
+	addedDeposits := make(map[string]common.Fixed64)
 	for i, output := range tx.Outputs() {
 		if output.ProgramHash.IsEqual(candidate.DepositHash) {
 			amount += output.Value
 			op := common2.NewOutPoint(tx.Hash(), uint16(i))
-			s.DepositOutputs[op.ReferKey()] = output.Value
+			addedDeposits[op.ReferKey()] = output.Value
 		}
 	}
 
@@ -292,7 +296,13 @@ func (s *State) registerCR(tx interfaces.Transaction, height uint32) {
 		s.Candidates[info.CID] = &candidate
 		s.DepositInfo[info.CID].DepositAmount += MinDepositAmount
 		s.DepositInfo[info.CID].TotalAmount += amount
+		for k, v := range addedDeposits {
+			s.DepositOutputs[k] = v
+		}
 	}, func() {
+		for k := range addedDeposits {
+			delete(s.DepositOutputs, k)
+		}
 		delete(s.Candidates, info.CID)
 		delete(s.Nicknames, nickname)
 		s.DepositInfo[info.CID].DepositAmount -= MinDepositAmount
@@ -354,7 +364,13 @@ func (s *State) processDeposit(tx interfaces.Transaction, height uint32) {
 		if contract.GetPrefixType(output.ProgramHash) == contract.PrefixDeposit {
 			if s.addCRCRelatedAssert(output, height) {
 				op := common2.NewOutPoint(tx.Hash(), uint16(i))
-				s.DepositOutputs[op.ReferKey()] = output.Value
+				// F-065: History-wrap so the entry reverts on rollback.
+				k, v := op.ReferKey(), output.Value
+				s.History.Append(height, func() {
+					s.DepositOutputs[k] = v
+				}, func() {
+					delete(s.DepositOutputs, k)
+				})
 			}
 		}
 	}
