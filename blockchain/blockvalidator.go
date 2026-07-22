@@ -322,7 +322,11 @@ func (b *BlockChain) checkTxsContext(block *Block) error {
 	var dposReward Fixed64
 	if b.StrictMoneyActive(block.Height) {
 		var err error
-		dposReward, err = b.GetBlockDPOSRewardStrict(block)
+		// F-011/086: derive the arbiter reward leg from the ELA-filtered
+		// totalTxFee (same basis as the CR/miner legs) instead of the all-asset
+		// tx.Fee() sum. Otherwise a non-ELA fee inflates coinbase[2] above its
+		// ELA backing, minting 0.35*(non-ELA fee) to arbiters.
+		dposReward, err = b.GetBlockDPOSRewardStrict(block.Height, totalTxFee)
 		if err != nil {
 			return elaerr.Simple(elaerr.ErrBlockValidation, err)
 		}
@@ -640,16 +644,14 @@ func (b *BlockChain) coinbaseTotalReward(blockHeight uint32,
 }
 
 // GetBlockDPOSRewardStrict is the post-activation form of GetBlockDPOSReward.
-func (b *BlockChain) GetBlockDPOSRewardStrict(block *Block) (Fixed64, error) {
-	totalTxFx := Fixed64(0)
-	for _, tx := range block.Transactions {
-		var err error
-		totalTxFx, err = AddFixed64(totalTxFx, tx.Fee())
-		if err != nil {
-			return 0, fmt.Errorf("total block fee: %w", err)
-		}
-	}
-	totalReward, err := b.coinbaseTotalReward(block.Height, totalTxFx)
+// GetBlockDPOSRewardStrict returns the DPoS arbiter reward leg for the coinbase
+// at/above the gate. F-011/086: it takes the ELA-filtered totalTxFee (the same
+// value the CR/miner legs use) rather than summing all-asset tx.Fee(), so a
+// non-ELA fee can no longer inflate coinbase[2] above its ELA backing. For any
+// all-ELA block totalTxFee == sum tx.Fee(), so this is byte-identical for every
+// honest block (coinbase.Fee() is always 0).
+func (b *BlockChain) GetBlockDPOSRewardStrict(blockHeight uint32, totalTxFee Fixed64) (Fixed64, error) {
+	totalReward, err := b.coinbaseTotalReward(blockHeight, totalTxFee)
 	if err != nil {
 		return 0, err
 	}
