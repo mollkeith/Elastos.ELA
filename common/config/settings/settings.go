@@ -120,8 +120,14 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 	enforceCrossChainUTXORestrictionHeights(conf.Configuration)
 	enforceStrictMoneyAndRollbackHeights(conf.Configuration)
 	enforceFrozenAddresses(conf.Configuration)
-	enforceMainnetIncidentGatesArmed(conf.Configuration)
 	conf.Configuration = conf.Sterilize()
+	// F-043 part 2: run AFTER Sterilize so FoundationProgramHash reflects any config.json
+	// FoundationAddress (Sterilize recomputes it from a non-empty address). Running before
+	// Sterilize would compare the INHERITED default hash, falsely refusing a private/forked
+	// net that set a custom FoundationAddress with the incident gates off. Real mainnet has
+	// an empty FoundationAddress, so Sterilize keeps the default identity and the
+	// typo-mainnet-with-gates-off case is still caught.
+	enforceMainnetIncidentGatesArmed(conf.Configuration)
 	config.Parameters = conf.Configuration
 	return conf.Configuration
 }

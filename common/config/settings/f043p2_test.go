@@ -9,6 +9,8 @@ import (
 
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/common/config"
+	"github.com/elastos/Elastos.ELA/core/transaction"
+	"github.com/elastos/Elastos.ELA/core/types/functions"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -55,4 +57,33 @@ func TestF043RefuseMainnetWithGatesOff(t *testing.T) {
 	assert.False(t, config.IsMainNetFoundationProgramHash(private.FoundationProgramHash))
 	assert.NotPanics(t, func() { enforceMainnetIncidentGatesArmed(private) },
 		"a private/forked net (different foundation) with gates off must start")
+}
+
+// TestF043PostSterilizeCustomFoundationNotRefused is the regression test for the ordering
+// fix: enforceMainnetIncidentGatesArmed must run AFTER Sterilize, so a private/forked net
+// that sets a custom (non-mainnet) FoundationAddress is respected. Before the fix the guard
+// ran before Sterilize recomputed FoundationProgramHash and saw the inherited mainnet
+// default hash -> a legitimate private net with gates off was falsely refused.
+func TestF043PostSterilizeCustomFoundationNotRefused(t *testing.T) {
+	// Sterilize computes GenesisBlock via the functions.* tx hooks; initialize them as
+	// SetupConfig does so the real Sterilize path runs.
+	functions.GetTransactionByTxType = transaction.GetTransaction
+	functions.GetTransactionByBytes = transaction.GetTransactionByBytes
+	functions.CreateTransaction = transaction.CreateTransaction
+	functions.GetTransactionParameters = transaction.GetTransactionparameters
+
+	p := config.GetDefaultParams()                                // mainnet default identity
+	p.FoundationAddress = "8ZNizBf4KhhPjeJRGpox6rPcHE5Np6tFx3"    // custom (testnet) foundation
+	// BEFORE Sterilize the inherited hash is STILL the mainnet default -- running the
+	// guard here (the pre-fix ordering) would see mainnet identity and falsely refuse.
+	assert.True(t, config.IsMainNetFoundationProgramHash(p.FoundationProgramHash),
+		"pre-Sterilize the hash is the inherited mainnet default (the bug trigger)")
+	p = p.Sterilize()                                            // recomputes FoundationProgramHash
+	p.StrictMoneyRangeHeight = config.DisabledStrictMoneyRangeHeight
+	p.ForcedRollbackTrigger = ""
+
+	assert.False(t, config.IsMainNetFoundationProgramHash(p.FoundationProgramHash),
+		"after Sterilize the identity must be the custom foundation, not mainnet")
+	assert.NotPanics(t, func() { enforceMainnetIncidentGatesArmed(p) },
+		"a private/forked net (custom FoundationAddress) with gates off must start")
 }
