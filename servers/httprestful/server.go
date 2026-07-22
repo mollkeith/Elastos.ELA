@@ -40,7 +40,6 @@ const (
 	ApiGetUTXOByAddr       = "/api/v1/asset/utxos/:addr"
 	ApiSendRawTransaction  = "/api/v1/transaction"
 	ApiGetTransactionPool  = "/api/v1/transactionpool"
-	ApiRestart             = "/api/v1/restart"
 )
 
 type Action struct {
@@ -77,8 +76,14 @@ func InitRestServer() ApiServer {
 }
 
 func (rt *restServer) Start() {
+	// F-036: log.Fatal does NOT exit in this codebase (common/log/log.go Fatal only
+	// writes a line), so every error path below used to fall through to
+	// Serve(rt.listener) with a nil listener and panic. On the restart path that
+	// panic runs in a bare goroutine outside net/http's per-connection recover, so
+	// it killed the whole daemon. Return on every failure and hard-guard Serve.
 	if config.Parameters.HttpRestPort == 0 {
-		log.Fatal("Not configure HttpRestPort port ")
+		log.Error("Not configure HttpRestPort port ")
+		return
 	}
 
 	if config.Parameters.HttpRestPort%1000 == servers.TlsPort {
@@ -86,13 +91,19 @@ func (rt *restServer) Start() {
 		rt.listener, err = rt.initTlsListen()
 		if err != nil {
 			log.Error("Https Cert: ", err.Error())
+			return
 		}
 	} else {
 		var err error
 		rt.listener, err = net.Listen("tcp", ":"+strconv.Itoa(config.Parameters.HttpRestPort))
 		if err != nil {
-			log.Fatal("net.Listen: ", err.Error())
+			log.Error("net.Listen: ", err.Error())
+			return
 		}
+	}
+	if rt.listener == nil {
+		log.Error("restful listener is nil, not serving")
+		return
 	}
 	rt.server = &http.Server{Handler: rt.router}
 	err := rt.server.Serve(rt.listener)
@@ -121,7 +132,6 @@ func (rt *restServer) initializeMethod() {
 		ApiGetUTXOByAsset:      {name: "getutxobyasset", handler: servers.GetUnspendOutput},
 		ApiGetBalanceByAddr:    {name: "getbalancebyaddr", handler: servers.GetBalanceByAddr},
 		ApiGetBalanceByAsset:   {name: "getbalancebyasset", handler: servers.GetBalanceByAsset},
-		ApiRestart:             {name: "restart", handler: rt.Restart},
 	}
 
 	postMethodMap := map[string]Action{
@@ -208,8 +218,6 @@ func (rt *restServer) getParams(r *http.Request, url string, req map[string]inte
 	case ApiGetUTXOByAsset:
 		req["addr"] = getParam(r, "addr")
 		req["assetid"] = getParam(r, "assetid")
-
-	case ApiRestart:
 
 	case ApiSendRawTransaction:
 
