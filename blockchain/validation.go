@@ -29,6 +29,20 @@ func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Progra
 		prefixType := contract.GetPrefixType(programHash)
 
 		// TODO: this implementation will be deprecated
+		// NOTE (F-218, verified BY-DESIGN — do NOT "restore" an ownerHash==codeHash bind
+		// here): a PrefixCrossChain custody address is derived from the SIDECHAIN GENESIS
+		// hash (contract.CreateCrossChainRedeemScript), NOT from the arbiter pubkeys, while
+		// a legitimate spend supplies program.Code = the arbiter m/n multisig script — so
+		// ToCodeHash(arbiterCode) can NEVER equal the genesis-derived ownerHash. Applying
+		// the generic bind below to this branch would reject EVERY legitimate
+		// WithdrawFromSideChain/Return (a consensus break). The real arbiter authorization
+		// lives in the tx-type SpecialContextCheck (withdrawfromsidechain / returnsidechain
+		// deposit) plus the checkTransactionCrossChainUTXO admit-list. The `continue` is
+		// therefore correct. DEFERRED (F-091): checkCrossChainSignatures lacks an
+		// `m<1||m>n` guard (VerifyMultisigSignatures treats m<=0 as satisfied), an
+		// anyone-can-spend on freeze-OFF paths (masked on mainnet by the freeze/restriction
+		// admit-list). A gated fix needs the block height threaded into RunPrograms — see
+		// INFERRED-ITEMS.md.
 		if prefixType == contract.PrefixCrossChain {
 			if contract.IsSchnorr(program.Code) {
 				if ok, err := checkSchnorrSignatures(*program, common.Sha256D(data[:])); !ok {

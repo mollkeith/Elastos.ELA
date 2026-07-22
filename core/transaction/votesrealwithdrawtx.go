@@ -63,6 +63,29 @@ func (t *VotesRealWithdrawTransaction) SpecialContextCheck() (result elaerr.ELAE
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid real votes withdraw transaction outputs count")), true
 	}
 
+	// F-015: real-withdraw txs are EXEMPT from RunPrograms (checkTransactionSignature
+	// short-circuits for them), so the ONLY authorization is that the inputs come from the
+	// treasury. Without this, an attacker funds the withdraw with a VICTIM UTXO (empty
+	// programs, no signature) and — since the trailing change output was unbound — pockets
+	// the change (direct theft). Bind every input AND the change output to the stake pool.
+	// Gated for replay-safety: honest votes-real-withdraw txs are built from stake-pool
+	// UTXOs and return change to the stake pool, so this rejects no legitimate tx.
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		stakePool := t.parameters.Config.StakePoolProgramHash
+		for _, ref := range t.references {
+			if !ref.ProgramHash.IsEqual(*stakePool) {
+				return elaerr.Simple(elaerr.ErrTxPayload,
+					errors.New("votes real withdraw input not from stake pool")), true
+			}
+		}
+		if txsCount == len(t.Outputs())-1 {
+			if !t.Outputs()[txsCount].ProgramHash.IsEqual(*stakePool) {
+				return elaerr.Simple(elaerr.ErrTxPayload,
+					errors.New("votes real withdraw change output not to stake pool")), true
+			}
+		}
+	}
+
 	// check other outputs, need to match with VotesRealWithdraw
 	txs := t.parameters.BlockChain.GetState().GetVotesWithdrawableTxInfo()
 	txsMap := make(map[common.Uint256]struct{})

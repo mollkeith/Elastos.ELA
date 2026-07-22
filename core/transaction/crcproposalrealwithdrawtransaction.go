@@ -71,6 +71,21 @@ func (t *CRCProposalRealWithdrawTransaction) SpecialContextCheck() (result elaer
 		}
 	}
 
+	// F-015: real-withdraw txs are EXEMPT from RunPrograms, so the ONLY authorization is
+	// that the inputs come from the treasury. Bind every input to the CR expenses pool,
+	// else an attacker funds the withdraw from a VICTIM UTXO (the change is already pinned
+	// to CRExpenses above, so this variant is grief rather than self-pay, but a victim UTXO
+	// is still consumed). Gated for replay-safety.
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		crExpenses := t.parameters.Config.CRConfiguration.CRExpensesProgramHash
+		for _, ref := range t.references {
+			if !ref.ProgramHash.IsEqual(*crExpenses) {
+				return elaerr.Simple(elaerr.ErrTxPayload,
+					errors.New("crc proposal real withdraw input not from cr expenses")), true
+			}
+		}
+	}
+
 	// check other outputs, need to match with WithdrawTransactionHashes
 	txs := t.parameters.BlockChain.GetCRCommittee().GetRealWithdrawTransactions()
 	txsMap := make(map[common.Uint256]struct{})
