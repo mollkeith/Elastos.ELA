@@ -134,7 +134,11 @@ func PreProcessSpecialTx(block *Block) error {
 			if err := CheckInactiveArbitrators(tx, block.Height); err != nil {
 				return err
 			}
-			if err := checkTransactionSignature(tx, map[*common2.Input]common2.Output{}); err != nil {
+			// InactiveArbitrators programs are arbiter-multisig, never Standard/Deposit/
+			// CrossChain, so the F-049/F-091 gated guards do not apply here; pass the
+			// block height + real gate for a faithful, uniform signature.
+			if err := checkTransactionSignature(tx, map[*common2.Input]common2.Output{},
+				block.Height, DefaultLedger.Blockchain.chainParams.StrictMoneyRangeHeight); err != nil {
 				return err
 			}
 

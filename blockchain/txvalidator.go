@@ -693,7 +693,8 @@ func (b *BlockChain) CheckTransactionFee(tx interfaces.Transaction, references m
 	return nil
 }
 
-func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output) error {
+func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output,
+	blockHeight, strictMoneyHeight uint32) error {
 	programHashes, err := GetTxProgramHashes(tx, references)
 	if (tx.IsCRCProposalWithdrawTx() && tx.PayloadVersion() == payload.CRCProposalWithdrawDefault) ||
 		tx.IsCRAssetsRectifyTx() || tx.IsCRCProposalRealWithdrawTx() || tx.IsNextTurnDPOSInfoTx() {
@@ -709,7 +710,7 @@ func checkTransactionSignature(tx interfaces.Transaction, references map[*common
 	// sort the program hashes of owner and programs of the transaction
 	common.SortProgramHashByCodeHash(programHashes)
 	SortPrograms(tx.Programs())
-	return RunPrograms(buf.Bytes(), programHashes, tx.Programs())
+	return RunPrograms(buf.Bytes(), programHashes, tx.Programs(), blockHeight, strictMoneyHeight)
 }
 
 func CheckAmountPrecise(amount common.Fixed64, precision byte) bool {

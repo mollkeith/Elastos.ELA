@@ -247,7 +247,7 @@ func (s *txValidatorSpecialTxTestSuite) TestReturnSideChainDepositCoinCrossChain
 	s.NoError(err)
 	s.signCrossChainProgram(txn, txn.Programs()[0])
 	s.NoError(checkTransactionSignature(txn,
-		crossChainUTXOReferences(contract.PrefixCrossChain)))
+		crossChainUTXOReferences(contract.PrefixCrossChain), 0, ^uint32(0)))
 
 	txn.SetPrograms([]*program.Program{{Code: s.crossChainArbiterScript(1, 2)}})
 	err, _ = txn.SpecialContextCheck()

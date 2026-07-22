@@ -19,7 +19,8 @@ import (
 	"github.com/elastos/Elastos.ELA/crypto"
 )
 
-func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Program) error {
+func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Program,
+	blockHeight, strictMoneyHeight uint32) error {
 	if len(programHashes) != len(programs) {
 		return errors.New("the number of data hashes is different with number of programs")
 	}
@@ -49,7 +50,8 @@ func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Progra
 					return errors.New("check schnorr signature failed:" + err.Error())
 				}
 			} else {
-				if err := checkCrossChainSignatures(*program, data); err != nil {
+				if err := checkCrossChainSignatures(*program, data,
+					blockHeight, strictMoneyHeight); err != nil {
 					return err
 				}
 			}
@@ -76,6 +78,12 @@ func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Progra
 				if err := crypto.CheckMultiSigSignatures(*program, data); err != nil {
 					return err
 				}
+			} else if blockHeight >= strictMoneyHeight {
+				// F-049: a Standard/Deposit-prefixed program whose Code hashes to the
+				// address (ownerHash==codeHash) but is none of Schnorr/Standard/MultiSig
+				// otherwise fell through with NO signature check (anyone-can-spend of any
+				// UTXO parked at such an address). Fail closed at/above the gate.
+				return errors.New("unknown standard/deposit signature type")
 			}
 		} else if prefixType == contract.PrefixMultiSig {
 			if err := crypto.CheckMultiSigSignatures(*program, data); err != nil {
@@ -150,12 +158,20 @@ func checkSchnorrSignatures(program Program, data [32]byte) (bool, error) {
 	return crypto.SchnorrVerify(publicKey, data, signature)
 }
 
-func checkCrossChainSignatures(program Program, data []byte) error {
+func checkCrossChainSignatures(program Program, data []byte,
+	blockHeight, strictMoneyHeight uint32) error {
 	code := program.Code
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
 	m := int(code[0]) - crypto.PUSH1 + 1
+	// F-091: VerifyMultisigSignatures treats m<=0 as trivially satisfied, so an
+	// m<1 (or m>n) crosschain redeem script was anyone-can-spend on freeze-OFF
+	// paths. Reject at/above the gate (masked on mainnet by the freeze/restriction
+	// admit-list, so below-gate stays byte-identical).
+	if blockHeight >= strictMoneyHeight && (m < 1 || m > n) {
+		return errors.New("invalid crosschain multisig m/n")
+	}
 	publicKeys, err := crypto.ParseCrossChainScript(code)
 	if err != nil {
 		return err

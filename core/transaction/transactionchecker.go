@@ -189,7 +189,8 @@ func (t *DefaultChecker) ContextCheck(params interfaces.Parameters) (
 		return nil, elaerr.Simple(elaerr.ErrTxInvalidInput, err)
 	}
 
-	if err := checkTransactionSignature(t.parameters.Transaction, references); err != nil {
+	if err := checkTransactionSignature(t.parameters.Transaction, references,
+		t.parameters.BlockHeight, t.parameters.Config.StrictMoneyRangeHeight); err != nil {
 		log.Warn("[checkTransactionSignature],", err)
 		return nil, elaerr.Simple(elaerr.ErrTxSignature, err)
 	}
@@ -623,7 +624,8 @@ func (t *DefaultChecker) checkInvalidUTXO(txn interfaces.Transaction) error {
 	return nil
 }
 
-func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output) error {
+func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output,
+	blockHeight, strictMoneyHeight uint32) error {
 	programHashes, err := blockchain.GetTxProgramHashes(tx, references)
 	if (tx.IsCRCProposalWithdrawTx() && tx.PayloadVersion() == payload.CRCProposalWithdrawDefault) ||
 		tx.IsCRAssetsRectifyTx() || tx.IsCRCProposalRealWithdrawTx() || tx.IsNextTurnDPOSInfoTx() ||
@@ -641,7 +643,7 @@ func checkTransactionSignature(tx interfaces.Transaction, references map[*common
 	// sort the program hashes of owner and programs of the transaction
 	common.SortProgramHashByCodeHash(programHashes)
 	blockchain.SortPrograms(tx.Programs())
-	return blockchain.RunPrograms(buf.Bytes(), programHashes, tx.Programs())
+	return blockchain.RunPrograms(buf.Bytes(), programHashes, tx.Programs(), blockHeight, strictMoneyHeight)
 }
 
 func checkTransactionDepositOutputs(bc *blockchain.BlockChain, txn interfaces.Transaction) error {

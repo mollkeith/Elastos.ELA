@@ -58,7 +58,7 @@ func TestF021ActivateInputSignatureEnforced(t *testing.T) {
 		[]*common2.Output{{AssetID: core.ELAAssetID, Value: common.Fixed64(100),
 			Type: common2.OTNone, ProgramHash: common.Uint168{}, Payload: &outputpayload.DefaultOutput{}}},
 		0, []*program.Program{{Code: attackerCode}})
-	if err := checkTransactionSignature(theft, refs); err == nil {
+	if err := checkTransactionSignature(theft, refs, 0, ^uint32(0)); err == nil {
 		t.Fatal("F-021: activate spending an unowned UTXO with a non-matching program must be REJECTED by checkTransactionSignature")
 	}
 
@@ -69,7 +69,7 @@ func TestF021ActivateInputSignatureEnforced(t *testing.T) {
 		[]*common2.Input{}, []*common2.Output{}, 0, []*program.Program{})
 	legit.SetParameters(&TransactionParameters{Transaction: legit, BlockHeight: b3Gate, Config: b3MinCfg()})
 	emptyRefs := map[*common2.Input]common2.Output{}
-	if err := checkTransactionSignature(legit, emptyRefs); err != nil {
+	if err := checkTransactionSignature(legit, emptyRefs, 0, ^uint32(0)); err != nil {
 		t.Fatalf("F-021: legit zero-input activate must pass checkTransactionSignature, got %v", err)
 	}
 	if err := legit.CheckTransactionFee(emptyRefs); err != nil {
