@@ -150,6 +150,18 @@ func (s *txValidatorTestSuite) TestCheckRegisterCRTransaction() {
 	err, _ = txn.SpecialContextCheck()
 	s.EqualError(err, "transaction validate error: payload content invalid:code is nil")
 
+	// F-204: a short-but-nonzero code (1 byte) with a matching CID reaches
+	// code[1:len(code)-1] = code[1:0] -> pre-auth remote panic (slice bounds [1:0]) before
+	// signature verify. The guard now rejects it cleanly (before the CID check), so
+	// SpecialContextCheck returns an error instead of crashing the node.
+	shortCode := []byte{0xac}
+	shortCID, _ := contract.CreateCRIDContractByCode(shortCode)
+	crInfo := txn.Payload().(*payload.CRInfo)
+	crInfo.Code = shortCode
+	crInfo.CID = *shortCID.ToProgramHash()
+	err, _ = txn.SpecialContextCheck()
+	s.EqualError(err, "transaction validate error: payload content invalid:invalid code length")
+
 	// Give an invalid CID in payload
 	txn.Payload().(*payload.CRInfo).Code = code1
 	txn.Payload().(*payload.CRInfo).CID = common.Uint168{1, 2, 3}

@@ -7,12 +7,17 @@ package payload
 
 import (
 	"bytes"
+	"errors"
 	"io"
 
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/crypto"
 	"github.com/elastos/Elastos.ELA/elanet/pact"
 )
+
+// MaxDPoSIllegalSigners bounds the signer slice at decode time (DoS ceiling, F-012
+// sibling of the SidechainIllegalData fix). Far above any legitimate signer set.
+const MaxDPoSIllegalSigners = 1024
 
 type CoinType uint32
 
@@ -94,6 +99,11 @@ func (b *BlockEvidence) DeserializeOthers(r io.Reader) (err error) {
 	var len uint64
 	if len, err = common.ReadVarUint(r, 0); err != nil {
 		return err
+	}
+	// F-012 sibling: cap before allocating (a crafted varint -> `makeslice: cap out of
+	// range` / OOM, reachable pre-auth via IllegalBlockEvidence relay).
+	if len > MaxDPoSIllegalSigners {
+		return errors.New("dpos illegal signers length exceeds maximum")
 	}
 
 	b.Signers = make([][]byte, 0, len)

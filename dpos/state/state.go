@@ -2858,8 +2858,12 @@ func (s *State) recordSpecialTx(hash common.Uint256, height uint32) {
 
 // removeSpecialTx record hash of a special tx
 func (s *State) RemoveSpecialTx(hash common.Uint256) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
+	// F-188: this DELETES from SpecialTxHashes (a write) but held only RLock, so it
+	// raced the Lock-held writer (recordSpecialTx via ProcessBlock) and RLock readers
+	// (SpecialTxExists) -> Go fatal "concurrent map read and map write" (os.Exit,
+	// uncatchable). A map mutation must hold the exclusive Lock.
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	delete(s.SpecialTxHashes, hash)
 }
 

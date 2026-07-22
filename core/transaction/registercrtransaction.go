@@ -12,6 +12,7 @@ import (
 	"github.com/elastos/Elastos.ELA/blockchain"
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/core/contract"
+	"github.com/elastos/Elastos.ELA/core/contract/program"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	crstate "github.com/elastos/Elastos.ELA/cr/state"
 	elaerr "github.com/elastos/Elastos.ELA/errors"
@@ -111,6 +112,16 @@ func (t *RegisterCRTransaction) SpecialContextCheck() (elaerr.ELAError, bool) {
 	ct, err := contract.CreateCRIDContractByCode(code)
 	if err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
+	}
+	// F-204: info.Code is a payload field NOT covered by the program MinProgramCodeSize
+	// guard; the slices below (code[len(code)-1], code[1:len(code)-1], code[2:]) panic on
+	// a short-but-nonzero code (e.g. a 1-byte [0xAC] with a crafted matching CID) during
+	// SpecialContextCheck, before signature verify -> pre-auth remote crash in any CR
+	// voting period. (len==0 is already caught above by CreateCRIDContractByCode's
+	// "code is nil".) Reject sub-minimal code. Ungated crash-harden (a legitimate CR code
+	// is a 35-byte / >=71-byte redeem script -> never below MinProgramCodeSize).
+	if len(code) < program.MinProgramCodeSize {
+		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid code length")), true
 	}
 	programHash := ct.ToProgramHash()
 

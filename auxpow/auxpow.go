@@ -195,12 +195,25 @@ func (ap *AuxPow) Check(hashAuxBlock *common.Uint256, chainID int) bool {
 	}
 
 	rootHashIndex += len(auxRootHashReverseStr)
-	if len(scriptStr)-rootHashIndex < 8 {
+	// F-172: scriptStr is a HEX string (2 chars/byte); the reads below take 8 raw
+	// bytes (4-byte size + 4-byte nonce), i.e. 16 hex chars. The original `< 8` guard
+	// counted hex chars as bytes, so a coinbase ending 4-7 bytes (8-15 hex chars) after
+	// the aux-root commit passed the guard then sliced OOB at the nonce read -> pre-PoW
+	// remote panic. Require 16 hex chars.
+	if len(scriptStr)-rootHashIndex < 16 {
 		return false
 	}
 
 	size := binary.LittleEndian.Uint32(script[rootHashIndex/2 : rootHashIndex/2+4])
 	merkleHeight := len(ap.AuxMerkleBranch)
+	// F-173: merkleHeight is attacker-controlled (len(AuxMerkleBranch) via ReadVarUint).
+	// For merkleHeight >= 32 the uint32 shift `1 << merkleHeight` overflows to 0, which
+	// (a) degenerates this size guard (0 == 0 passes when size==0) and (b) makes
+	// GetExpectedIndex do `rand % 0` -> divide-by-zero panic. A legitimate aux branch is
+	// far shorter; reject oversized branches. Ungated crash-harden.
+	if merkleHeight >= 32 {
+		return false
+	}
 	if size != uint32(1<<uint32(merkleHeight)) {
 		return false
 	}
@@ -234,6 +247,12 @@ func GetMerkleRoot(hash common.Uint256, merkleBranch []common.Uint256, index int
 }
 
 func GetExpectedIndex(nonce uint32, chainID, h int) int {
+	// F-173 defense-in-depth: `1 << uint32(h)` overflows to 0 for h >= 32 (uint32),
+	// making the modulus a divide-by-zero. Callers should reject such heights (Check
+	// does), but guard here too since GetExpectedIndex is exported.
+	if h < 0 || h >= 32 {
+		return -1
+	}
 	rand := nonce
 	rand = rand*1103515245 + 12345
 	rand += uint32(chainID)
