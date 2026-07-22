@@ -104,6 +104,12 @@ func (f *Filter) Clear() {
 
 func (f *Filter) MatchConfirmed(tx interfaces.Transaction) bool {
 	f.mtx.Lock()
+	// F-076: a concurrent Clear() can nil f.filter between IsLoaded() and here
+	// (two separate lock acquisitions); guard the deref to avoid a crash.
+	if f.filter == nil {
+		f.mtx.Unlock()
+		return false
+	}
 	match := f.filter.MatchConfirmed(tx)
 	f.mtx.Unlock()
 	return match
@@ -111,6 +117,11 @@ func (f *Filter) MatchConfirmed(tx interfaces.Transaction) bool {
 
 func (f *Filter) MatchUnconfirmed(tx interfaces.Transaction) bool {
 	f.mtx.Lock()
+	// F-076: guard against a concurrent Clear() niling f.filter.
+	if f.filter == nil {
+		f.mtx.Unlock()
+		return false
+	}
 	match := f.filter.MatchUnconfirmed(tx)
 	f.mtx.Unlock()
 	return match

@@ -100,6 +100,14 @@ func (msg *FilterLoad) Deserialize(r io.Reader) error {
 		return common.FuncError("FilterLoad.Deserialize", str)
 	}
 
+	// F-034: an empty filter with a nonzero hash-func count is malformed and
+	// would cause a modulo-by-zero panic on the match path (len(Filter)<<3 == 0).
+	// Reject it so the peer is disconnected rather than crashing the node.
+	if len(msg.Filter) == 0 && msg.HashFuncs > 0 {
+		str := "empty filter with nonzero hash functions"
+		return common.FuncError("FilterLoad.Deserialize", str)
+	}
+
 	// deserialize flags
 	err = common.ReadElements(r, &msg.Flags)
 	if err != nil {

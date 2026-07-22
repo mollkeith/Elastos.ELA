@@ -143,6 +143,12 @@ func (bf *Filter) matches(data []byte) bool {
 		return false
 	}
 
+	// F-034 (defense in depth): an empty filter would make hash() compute
+	// mm %% (len(Filter)<<3) == mm %% 0 and panic. Treat as no-match.
+	if len(bf.msg.Filter) == 0 {
+		return false
+	}
+
 	// The bloom filter does not contain the data if any of the bit offsets
 	// which result from hashing the data using each independent hash
 	// function are not set.  The shifts and masks below are a faster

@@ -642,6 +642,13 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				sm.requestedTxns[iv.Hash] = struct{}{}
 				sm.limitMap(sm.requestedTxns, maxRequestedTxns)
 				state.requestedTxns[iv.Hash] = struct{}{}
+				// F-077: also bound the per-peer tx map so a peer that floods
+				// distinct inv hashes without ever delivering cannot grow it
+				// unbounded (OOM). Safe for txns: handleTxMsg only deletes on
+				// delivery, so an evicted entry just triggers a harmless
+				// re-request (unlike the block maps, whose delivery is
+				// authorized against this set).
+				sm.limitMap(state.requestedTxns, maxRequestedTxns)
 				gdmsg.AddInvVect(iv)
 				numRequested++
 			}

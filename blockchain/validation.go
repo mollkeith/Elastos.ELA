@@ -139,6 +139,12 @@ func checkSchnorrSignatures(program Program, data [32]byte) (bool, error) {
 	copy(publicKey[:], program.Code[2:])
 
 	signature := [64]byte{}
+	// F-050: reject a malformed Schnorr program whose Parameter is not a
+	// full 64-byte signature before slicing; otherwise program.Parameter[:64]
+	// panics (slice bounds out of range) on any pre-auth P2P-relayed tx.
+	if len(program.Parameter) != 64 {
+		return false, errors.New("invalid schnorr signature length")
+	}
 	copy(signature[:], program.Parameter[:64])
 
 	return crypto.SchnorrVerify(publicKey, data, signature)
