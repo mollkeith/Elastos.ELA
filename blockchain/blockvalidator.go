@@ -19,9 +19,11 @@ import (
 	"github.com/elastos/Elastos.ELA/common/config"
 	"github.com/elastos/Elastos.ELA/common/log"
 	"github.com/elastos/Elastos.ELA/core"
+	"github.com/elastos/Elastos.ELA/core/contract"
 	. "github.com/elastos/Elastos.ELA/core/types"
 	"github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/interfaces"
+	"github.com/elastos/Elastos.ELA/core/types/outputpayload"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	"github.com/elastos/Elastos.ELA/crypto"
 	"github.com/elastos/Elastos.ELA/dpos/state"
@@ -124,6 +126,10 @@ func (b *BlockChain) CheckBlockSanity(block *Block) error {
 		txIDs = append(txIDs, txID)
 	}
 	if err := CheckDuplicateTx(block); err != nil {
+		return err
+	}
+	if err := CheckSameBlockConflicts(block,
+		b.chainParams.StrictMoneyRangeHeight); err != nil {
 		return err
 	}
 	calcTransactionsRoot, err := crypto.ComputeRoot(txIDs)
@@ -246,6 +252,145 @@ func CheckDuplicateTx(block *Block) error {
 		}
 	}
 	return nil
+}
+
+// checkSameBlockConflicts closes the same-block double-pay/race cluster
+// (F-028, F-066, F-067, F-078, F-088). The mempool conflictmanager rejects two
+// conflicting stake/reward/withdraw/tracking txs, but the block-level validation never
+// mirrored those slots — so an on-duty block producer could pack two conflicting txs
+// into ONE block (bypassing its own mempool) and cause a double ReturnVotes/ClaimReward
+// payout, a double RealWithdraw, a double unused-budget return, or cloned renewal votes.
+// This mirrors the relevant mempool conflict slots at the block level, keyed on the
+// EXACT conflict identity (stake program hash / claim program hash / pending withdraw
+// hash / proposal hash), so two DIFFERENT identities of the same tx type in one block
+// remain legitimate. Gated at StrictMoneyRangeHeight: below the coordinated-upgrade gate
+// this is a no-op, so the frozen chain re-derives byte-identically.
+func CheckSameBlockConflicts(block *Block, gate uint32) error {
+	if block.Height < gate {
+		return nil
+	}
+	stakeVotes := make(map[Uint168]struct{})            // mempool slotExchangeVotes
+	claimReward := make(map[Uint168]struct{})           // mempool slotDposV2ClaimReward
+	tracking := make(map[Uint256]struct{})              // mempool slotCRCProposalTrackingHash
+	crcRealWithdraw := make(map[Uint256]struct{})       // mempool slotCRCProposalRealWithdrawKey
+	dposClaimRealWithdraw := make(map[Uint256]struct{}) // mempool slotDposV2ClaimRewardRealWithdrawKey
+	votesRealWithdrawCount := 0                          // mempool slotVotesRealWithdraw (singleton)
+	for _, txn := range block.Transactions {
+		switch txn.TxType() {
+		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
+			key, err := stakeVoteConflictKey(txn)
+			if err != nil {
+				return err
+			}
+			if _, exists := stakeVotes[key]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains conflicting same-stake vote transaction")
+			}
+			stakeVotes[key] = struct{}{}
+		case common.DposV2ClaimReward:
+			key, err := claimRewardConflictKey(txn)
+			if err != nil {
+				return err
+			}
+			if _, exists := claimReward[key]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains conflicting same-stake claim reward transaction")
+			}
+			claimReward[key] = struct{}{}
+		case common.CRCProposalTracking:
+			p, ok := txn.Payload().(*payload.CRCProposalTracking)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid CRCProposalTracking payload")
+			}
+			if _, exists := tracking[p.ProposalHash]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains duplicate proposal tracking")
+			}
+			tracking[p.ProposalHash] = struct{}{}
+		case common.CRCProposalRealWithdraw:
+			p, ok := txn.Payload().(*payload.CRCProposalRealWithdraw)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid CRCProposalRealWithdraw payload")
+			}
+			if err := addWithdrawHashes(crcRealWithdraw, p.WithdrawTransactionHashes); err != nil {
+				return err
+			}
+		case common.DposV2ClaimRewardRealWithdraw:
+			p, ok := txn.Payload().(*payload.DposV2ClaimRewardRealWithdraw)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid DposV2ClaimRewardRealWithdraw payload")
+			}
+			if err := addWithdrawHashes(dposClaimRealWithdraw, p.WithdrawTransactionHashes); err != nil {
+				return err
+			}
+		case common.VotesRealWithdraw:
+			// The mempool slotVotesRealWithdraw keys on a constant singleton, so at most
+			// one VotesRealWithdraw is ever in flight; mirror that (reject the second).
+			votesRealWithdrawCount++
+			if votesRealWithdrawCount > 1 {
+				return errors.New("[PowCheckBlockSanity] block contains duplicate votes real withdraw")
+			}
+		}
+	}
+	return nil
+}
+
+// addWithdrawHashes rejects a block that references the same pending withdraw hash twice
+// (mirrors the mempool hashArray real-withdraw slots).
+func addWithdrawHashes(seen map[Uint256]struct{}, hashes []Uint256) error {
+	for _, h := range hashes {
+		if _, exists := seen[h]; exists {
+			return errors.New("[PowCheckBlockSanity] block contains duplicate real withdraw pending hash")
+		}
+		seen[h] = struct{}{}
+	}
+	return nil
+}
+
+// stakeVoteConflictKey mirrors the mempool slotExchangeVotes key extraction
+// (strStake / strVoting / strReturnVotes / strCreateNFT): the stake program hash.
+func stakeVoteConflictKey(txn interfaces.Transaction) (Uint168, error) {
+	if txn.TxType() == common.ExchangeVotes {
+		if len(txn.Outputs()) < 1 || txn.Outputs()[0].Payload == nil {
+			return Uint168{}, errors.New("[PowCheckBlockSanity] invalid exchange votes outputs")
+		}
+		pld, ok := txn.Outputs()[0].Payload.(*outputpayload.ExchangeVotesOutput)
+		if !ok {
+			return Uint168{}, errors.New("[PowCheckBlockSanity] invalid exchange votes output payload")
+		}
+		return pld.StakeAddress, nil
+	}
+	if len(txn.Programs()) < 1 {
+		return Uint168{}, errors.New("[PowCheckBlockSanity] invalid vote transaction programs")
+	}
+	code := txn.Programs()[0].Code
+	if rv, ok := txn.Payload().(*payload.ReturnVotes); ok &&
+		txn.PayloadVersion() == payload.ReturnVotesVersionV0 {
+		code = rv.Code
+	}
+	ct, err := contract.CreateStakeContractByCode(code)
+	if err != nil {
+		return Uint168{}, errors.New("[PowCheckBlockSanity] invalid vote transaction code")
+	}
+	return *ct.ToProgramHash(), nil
+}
+
+// claimRewardConflictKey mirrors the mempool slotDposV2ClaimReward key extraction
+// (programHashDposV2ClaimReward): the claimer's stake program hash.
+func claimRewardConflictKey(txn interfaces.Transaction) (Uint168, error) {
+	pld, ok := txn.Payload().(*payload.DPoSV2ClaimReward)
+	if !ok {
+		return Uint168{}, errors.New("[PowCheckBlockSanity] invalid DposV2ClaimReward payload")
+	}
+	if len(txn.Programs()) < 1 {
+		return Uint168{}, errors.New("[PowCheckBlockSanity] invalid DposV2ClaimReward programs")
+	}
+	code := txn.Programs()[0].Code
+	if txn.PayloadVersion() == payload.DposV2ClaimRewardVersionV0 {
+		code = pld.Code
+	}
+	ct, err := contract.CreateStakeContractByCode(code)
+	if err != nil {
+		return Uint168{}, errors.New("[PowCheckBlockSanity] invalid DposV2ClaimReward code")
+	}
+	return *ct.ToProgramHash(), nil
 }
 
 func RecordCRCProposalAmount(usedAmount *Fixed64, txn interfaces.Transaction) {
