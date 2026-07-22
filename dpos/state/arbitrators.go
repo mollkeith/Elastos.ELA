@@ -214,11 +214,10 @@ func (a *Arbiters) recoverFromCheckPoints(point *CheckPoint) {
 	a.degradation.state = degradationState(point.DegradationState)
 	a.degradation.understaffedSince = point.UnderstaffedSince
 	a.degradation.inactivateHeight = point.InactivateHeight
-	if point.InactiveTxs != nil {
-		a.degradation.inactiveTxs = point.InactiveTxs
-	} else {
-		a.degradation.inactiveTxs = make(map[common.Uint256]interface{})
-	}
+	// F-096: copy (do not alias the transient CheckPoint map) for consistency with
+	// the newCheckPoint/initFromArbitrators capture discipline; copyInactiveTxs
+	// returns an empty map for a nil (legacy-checkpoint) source.
+	a.degradation.inactiveTxs = copyInactiveTxs(point.InactiveTxs)
 }
 
 func (a *Arbiters) ProcessBlock(block *types.Block, confirm *payload.Confirm) {
