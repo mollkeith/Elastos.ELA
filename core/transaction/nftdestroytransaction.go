@@ -124,6 +124,15 @@ func (t *NFTDestroyTransactionFromSideChain) SpecialContextCheck() (elaerr.ELAEr
 			errors.New(" NFT can not destroy")), true
 	}
 
+	// F-052: bind each destroyed NFT to the sidechain it was created on (see
+	// checkNFTDestroyGenesisBinding). Gated at StrictMoneyRangeHeight -> below-gate
+	// byte-identical.
+	if err := checkNFTDestroyGenesisBinding(nftDestroyPayload.IDs,
+		nftDestroyPayload.GenesisBlockHash, state.GetNFTGenesisBlockHash,
+		t.parameters.BlockHeight, t.parameters.Config.StrictMoneyRangeHeight); err != nil {
+		return elaerr.Simple(elaerr.ErrTxPayload, err), true
+	}
+
 	err := t.checkNFTDestroyTransactionFromSideChain()
 	if err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
@@ -167,6 +176,34 @@ func (t *NFTDestroyTransactionFromSideChain) checkNFTDestroyTransactionFromSideC
 		}
 		if err := checkCrossChainSignatures(*p, buf.Bytes()); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// checkNFTDestroyGenesisBinding (F-052) verifies each destroyed NFT's recorded origin
+// sidechain genesis (NFTInfo.GenesisBlockHash, set at CreateNFT) matches the destroy
+// payload's GenesisBlockHash, at/above the gate. NFTDestroyFromSideChain carried an
+// unvalidated GenesisBlockHash, so an arbiter-signed destroy could name ANY sidechain
+// genesis. genesisOf is injected (state.GetNFTGenesisBlockHash) for testability.
+//
+// ENGINEER Q14 (gate-height): unlike F-074 (a mismatch CRASHES, so its absence in history
+// is provable), F-052 is SILENT-accept, so absence in the re-derived [2260451,2260595]
+// band is not scan-provable. Safe under the mine-new rollback (corrupt blocks discarded,
+// not replayed); if any node re-derives by REPLAYING historical blocks, confirm absence in
+// that band or move this to a fresh dormant height > resume tip.
+func checkNFTDestroyGenesisBinding(ids []common.Uint256, payloadGenesis common.Uint256,
+	genesisOf func(common.Uint256) (common.Uint256, error), height, gate uint32) error {
+	if height < gate {
+		return nil
+	}
+	for _, id := range ids {
+		genesis, err := genesisOf(id)
+		if err != nil {
+			return err
+		}
+		if !genesis.IsEqual(payloadGenesis) {
+			return errors.New("NFTDestroy genesis block hash does not match the NFT origin sidechain")
 		}
 	}
 	return nil

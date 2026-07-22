@@ -902,6 +902,19 @@ func (s *State) GetNFTReferKey(nftID common.Uint256) (common.Uint256, error) {
 	return nftInfo.ReferKey, nil
 }
 
+// GetNFTGenesisBlockHash returns the sidechain genesis block hash recorded for an NFT
+// at CreateNFT (NFTInfo.GenesisBlockHash). Used by the F-052 NFTDestroy origin bind.
+func (s *State) GetNFTGenesisBlockHash(nftID common.Uint256) (common.Uint256, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	nftInfo, exist := s.NFTIDInfoHashMap[nftID]
+	if !exist {
+		return common.Uint256{}, errors.New("nft is not exist")
+	}
+
+	return nftInfo.GenesisBlockHash, nil
+}
+
 // GetPendingProducers returns all producers that in pending state.
 func (s *State) GetPendingProducers() []*Producer {
 	s.mtx.RLock()
