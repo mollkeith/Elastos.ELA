@@ -1915,6 +1915,18 @@ func (s *State) registerProducer(tx interfaces.Transaction, height uint32) {
 		depositHash:                  *programHash,
 	}
 
+	// F-065 revert-symmetry: capture prior DepositOutputs so the revert restores a
+	// pre-existing entry instead of deleting it (a re-registration reuses the same
+	// deposit outpoint; an unconditional delete on rollback dropped an entry the
+	// pre-block keyframe held, diverging the keyframe on reorg).
+	oriDeposits := make(map[string]common.Fixed64)
+	oriDepositExists := make(map[string]bool)
+	for k := range depositOutputs {
+		if ov, ok := s.DepositOutputs[k]; ok {
+			oriDeposits[k] = ov
+			oriDepositExists[k] = true
+		}
+	}
 	s.History.Append(height, func() {
 		s.Nicknames[nickname] = struct{}{}
 		s.NodeOwnerKeys[nodeKey] = ownerKey
@@ -1929,7 +1941,11 @@ func (s *State) registerProducer(tx interfaces.Transaction, height uint32) {
 		delete(s.PendingProducers, ownerKey)
 		delete(s.ProducerDepositMap, *programHash)
 		for k := range depositOutputs {
-			delete(s.DepositOutputs, k)
+			if oriDepositExists[k] {
+				s.DepositOutputs[k] = oriDeposits[k]
+			} else {
+				delete(s.DepositOutputs, k)
+			}
 		}
 	})
 }
@@ -2270,10 +2286,15 @@ func (s *State) processDeposit(tx interfaces.Transaction, height uint32) {
 				// mirroring the correctly-wrapped registerProducer path (and the CR-side
 				// F-065 fix). Previously a direct write that survived a reorg RollbackTo.
 				k, v := op.ReferKey(), output.Value
+				oriV, oriExists := s.DepositOutputs[k]
 				s.History.Append(height, func() {
 					s.DepositOutputs[k] = v
 				}, func() {
-					delete(s.DepositOutputs, k)
+					if oriExists {
+						s.DepositOutputs[k] = oriV
+					} else {
+						delete(s.DepositOutputs, k)
+					}
 				})
 			}
 		}

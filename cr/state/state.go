@@ -286,6 +286,18 @@ func (s *State) registerCR(tx interfaces.Transaction, height uint32) {
 	if _, ok := s.DepositInfo[info.CID]; !ok {
 		firstTimeRegister = true
 	}
+	// F-065 revert-symmetry: capture prior DepositOutputs so the revert restores a
+	// pre-existing entry instead of deleting it (a re-registration reuses the same
+	// deposit outpoint; an unconditional delete on rollback dropped an entry the
+	// pre-block keyframe held, diverging the keyframe on reorg).
+	oriDeposits := make(map[string]common.Fixed64)
+	oriDepositExists := make(map[string]bool)
+	for k := range addedDeposits {
+		if ov, ok := s.DepositOutputs[k]; ok {
+			oriDeposits[k] = ov
+			oriDepositExists[k] = true
+		}
+	}
 	s.History.Append(height, func() {
 		if firstTimeRegister {
 			s.DepositInfo[info.CID] = &DepositInfo{}
@@ -301,7 +313,11 @@ func (s *State) registerCR(tx interfaces.Transaction, height uint32) {
 		}
 	}, func() {
 		for k := range addedDeposits {
-			delete(s.DepositOutputs, k)
+			if oriDepositExists[k] {
+				s.DepositOutputs[k] = oriDeposits[k]
+			} else {
+				delete(s.DepositOutputs, k)
+			}
 		}
 		delete(s.Candidates, info.CID)
 		delete(s.Nicknames, nickname)
@@ -366,10 +382,15 @@ func (s *State) processDeposit(tx interfaces.Transaction, height uint32) {
 				op := common2.NewOutPoint(tx.Hash(), uint16(i))
 				// F-065: History-wrap so the entry reverts on rollback.
 				k, v := op.ReferKey(), output.Value
+				oriV, oriExists := s.DepositOutputs[k]
 				s.History.Append(height, func() {
 					s.DepositOutputs[k] = v
 				}, func() {
-					delete(s.DepositOutputs, k)
+					if oriExists {
+						s.DepositOutputs[k] = oriV
+					} else {
+						delete(s.DepositOutputs, k)
+					}
 				})
 			}
 		}
