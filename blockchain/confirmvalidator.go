@@ -128,7 +128,10 @@ func PreProcessSpecialTx(block *Block) error {
 	for _, tx := range block.Transactions {
 		switch tx.TxType() {
 		case common2.InactiveArbitrators:
-			if err := CheckInactiveArbitrators(tx); err != nil {
+			// F-022 Path B: gate on the BLOCK height (not the current tip) so
+			// replaying a below-gate historical special tx during InitCheckpoint /
+			// fresh-from-genesis sync stays structure-only (replay-safe).
+			if err := CheckInactiveArbitrators(tx, block.Height); err != nil {
 				return err
 			}
 			if err := checkTransactionSignature(tx, map[*common2.Input]common2.Output{}); err != nil {

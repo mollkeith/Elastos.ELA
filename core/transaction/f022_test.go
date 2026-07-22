@@ -8,6 +8,7 @@ package transaction
 import (
 	"bytes"
 
+	"github.com/elastos/Elastos.ELA/blockchain"
 	"github.com/elastos/Elastos.ELA/core/contract/program"
 	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/functions"
@@ -243,4 +244,39 @@ func (s *txValidatorSpecialTxTestSuite) TestF022SiblingRevertToDPOS() {
 	legit.Programs()[0].Parameter = f022MultisigParameter(legit, privs, m)
 	s.NoError(checkArbitratorsSignatures(legit, f022Gate, f022Gate),
 		"SIBLING: genuine arbiter-signed RevertToDPOS must be accepted at/above gate")
+}
+
+// TestF022PathBGatesOnBlockHeight verifies the blockchain-copy (Path B, invoked
+// by PreProcessSpecialTx during InitCheckpoint / connectBlock) gates on the
+// BLOCK height, not the current tip. A prior bug gated on GetHeight(); during
+// fresh-from-genesis replay the tip is pinned above the gate, so it wrongly
+// re-verified signatures on below-gate historical special txs (a bootstrap
+// hazard). With the fix, gating follows the passed block height regardless of
+// the (near-zero) live tip.
+func (s *txValidatorSpecialTxTestSuite) TestF022PathBGatesOnBlockHeight() {
+	gate := s.Chain.GetParams().StrictMoneyRangeHeight
+
+	prev := blockchain.DefaultLedger.Blockchain
+	blockchain.DefaultLedger.Blockchain = s.Chain // so arbitratorsMultisigActive can read the gate
+	defer func() { blockchain.DefaultLedger.Blockchain = prev }()
+
+	origCRC := s.arbitrators.CRCArbitrators
+	origAP := s.arbitrators.ActiveProducer
+	defer func() {
+		s.arbitrators.CRCArbitrators = origCRC
+		s.arbitrators.ActiveProducer = origAP
+	}()
+
+	_, code, sponsor, target := s.f022SetupCRC(5)
+	tx := s.f022BuildInactive(sponsor, [][]byte{target}, code, randomSignature())
+
+	// The live tip (s.Chain.GetHeight()) is ~0, far below the gate. If Path B
+	// (wrongly) gated on the tip, ALL of these would be structure-only/accepted.
+	// The fix gates on the passed block height:
+	s.NoError(blockchain.CheckInactiveArbitrators(tx, gate-1),
+		"Path B below-gate block: structure-only, forged accepted (replay-safe)")
+	s.Error(blockchain.CheckInactiveArbitrators(tx, gate),
+		"Path B at-gate block: signatures verified, forged REJECTED")
+	s.Error(blockchain.CheckInactiveArbitrators(tx, gate+100000),
+		"Path B above-gate block: signatures verified, forged REJECTED")
 }

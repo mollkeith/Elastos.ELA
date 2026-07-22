@@ -701,7 +701,8 @@ func (d *DPOSManager) OnRevertToDPOSTxReceived(id dpeer.PID,
 	}
 	log.Info("### RevertToDPoS OnRevertToDPOSTxReceived  start 2")
 
-	if err := blockchain.CheckRevertToDPOSTransaction(tx); err != nil {
+	if err := blockchain.CheckRevertToDPOSTransaction(tx,
+		blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
 		log.Info("[OnRevertToDPOSTxReceived] received error evidence: ", err)
 		return
 	}
@@ -715,7 +716,8 @@ func (d *DPOSManager) OnInactiveArbitratorsReceived(id dpeer.PID,
 	if !d.isCRCArbiter() {
 		return
 	}
-	if err := blockchain.CheckInactiveArbitrators(tx); err != nil {
+	if err := blockchain.CheckInactiveArbitrators(tx,
+		blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
 		log.Info("[OnIllegalProposalReceived] received error evidence: ", err)
 		return
 	}

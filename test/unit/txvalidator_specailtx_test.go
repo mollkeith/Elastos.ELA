@@ -713,7 +713,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckInactiveArbitrators() {
 
 	s.arbitrators.ActiveProducer = s.arbitrators.CurrentArbitrators
 
-	s.EqualError(blockchain.CheckInactiveArbitrators(tx),
+	s.EqualError(blockchain.CheckInactiveArbitrators(tx, 0),
 		"sponsor is not belong to arbitrators")
 
 	// correct sponsor
@@ -727,7 +727,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckInactiveArbitrators() {
 	// correct number of Arbitrators
 	p.Arbitrators = make([][]byte, 0)
 	p.Arbitrators = append(p.Arbitrators, randomPublicKey())
-	s.EqualError(blockchain.CheckInactiveArbitrators(tx),
+	s.EqualError(blockchain.CheckInactiveArbitrators(tx, 0),
 		"inactive arbitrator is not belong to arbitrators")
 
 	// correct "Arbitrators" to be current arbitrators
@@ -736,7 +736,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckInactiveArbitrators() {
 		p.Arbitrators = append(p.Arbitrators,
 			s.arbitrators.CurrentArbitrators[i].GetNodePublicKey())
 	}
-	s.EqualError(blockchain.CheckInactiveArbitrators(tx),
+	s.EqualError(blockchain.CheckInactiveArbitrators(tx, 0),
 		"invalid multi sign script code")
 
 	// let "Arbitrators" has CRC arbitrators
@@ -745,7 +745,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckInactiveArbitrators() {
 		ar,
 		s.arbitrators.CurrentArbitrators[4],
 	}
-	s.EqualError(blockchain.CheckInactiveArbitrators(tx),
+	s.EqualError(blockchain.CheckInactiveArbitrators(tx, 0),
 		"inactive arbiters should not include CRC")
 
 	// set invalid redeem script
@@ -771,13 +771,13 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckInactiveArbitrators() {
 	ar, _ = state.NewOriginArbiter(pkBuf)
 	arbitrators = append(arbitrators, ar)
 	tx.Programs()[0].Code = s.createArbitratorsRedeemScript(arbitrators)
-	s.EqualError(blockchain.CheckInactiveArbitrators(tx),
+	s.EqualError(blockchain.CheckInactiveArbitrators(tx, 0),
 		"invalid multi sign public key")
 
 	// correct redeem script
 	tx.Programs()[0].Code = s.createArbitratorsRedeemScript(
 		s.arbitrators.CRCArbitrators)
-	s.NoError(blockchain.CheckInactiveArbitrators(tx))
+	s.NoError(blockchain.CheckInactiveArbitrators(tx, 0))
 }
 
 func (s *txValidatorSpecialTxTestSuite) TestCheckUpdateVersion() {

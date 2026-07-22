@@ -866,8 +866,8 @@ func CheckPayloadSignature(info *payload.CRInfo, payloadVersion byte) error {
 	return CheckCRTransactionSignature(info.Signature, info.Code, signedBuf.Bytes())
 }
 
-func CheckRevertToDPOSTransaction(txn interfaces.Transaction) error {
-	return checkArbitratorsSignatures(txn)
+func CheckRevertToDPOSTransaction(txn interfaces.Transaction, blockHeight uint32) error {
+	return checkArbitratorsSignatures(txn, blockHeight)
 }
 
 func CheckSidechainIllegalEvidence(p *payload.SidechainIllegalData) error {
@@ -905,7 +905,7 @@ func CheckSidechainIllegalEvidence(p *payload.SidechainIllegalData) error {
 	return nil
 }
 
-func CheckInactiveArbitrators(txn interfaces.Transaction) error {
+func CheckInactiveArbitrators(txn interfaces.Transaction, blockHeight uint32) error {
 	p, ok := txn.Payload().(*payload.InactiveArbitrators)
 	if !ok {
 		return errors.New("invalid payload")
@@ -926,14 +926,14 @@ func CheckInactiveArbitrators(txn interfaces.Transaction) error {
 		}
 	}
 
-	if err := checkCRCArbitratorsSignatures(txn); err != nil {
+	if err := checkCRCArbitratorsSignatures(txn, blockHeight); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func checkArbitratorsSignatures(txn interfaces.Transaction) error {
+func checkArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint32) error {
 	code := txn.Programs()[0].Code
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
@@ -963,20 +963,23 @@ func checkArbitratorsSignatures(txn interfaces.Transaction) error {
 		}
 	}
 
-	return verifyArbitratorsMultisigSignatures(txn)
+	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
 }
 
 // arbitratorsMultisigActive reports whether strict multisig signature
 // verification for arbiter special txs (InactiveArbitrators / RevertToDPOS) is
-// active on the connect/gossip path: true at/above StrictMoneyRangeHeight.
-// Nil-safe: unit tests run without a wired DefaultLedger.Blockchain, which is
-// treated as below-gate (structure-only, preserving pre-gate replay behavior).
-func arbitratorsMultisigActive() bool {
+// active for a tx at the given blockHeight: true at/above StrictMoneyRangeHeight.
+// The gate is keyed on the BLOCK height (not the current tip) so that replaying
+// a below-gate historical block during InitCheckpoint / fresh-from-genesis sync
+// stays structure-only (byte-identical to legacy) — matching the mempool Path A
+// gate on t.parameters.BlockHeight. Nil-safe: unit tests run without a wired
+// DefaultLedger.Blockchain, treated as below-gate (structure-only).
+func arbitratorsMultisigActive(blockHeight uint32) bool {
 	bc := DefaultLedger.Blockchain
 	if bc == nil {
 		return false
 	}
-	return bc.GetHeight() >= bc.GetParams().StrictMoneyRangeHeight
+	return blockHeight >= bc.GetParams().StrictMoneyRangeHeight
 }
 
 // verifyArbitratorsMultisigSignatures verifies that the program Parameter
@@ -986,8 +989,8 @@ func arbitratorsMultisigActive() bool {
 // emergency ForceChange / RevertToDPOS on an unsigned, permissionlessly-forged
 // special tx. Height-gated for replay-safety; digest matches the honest signer
 // path (tx.SerializeUnsigned).
-func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction) error {
-	if !arbitratorsMultisigActive() {
+func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction, blockHeight uint32) error {
+	if !arbitratorsMultisigActive(blockHeight) {
 		return nil
 	}
 	buf := new(bytes.Buffer)
@@ -997,7 +1000,7 @@ func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction) error {
 	return crypto.CheckMultiSigSignatures(*txn.Programs()[0], buf.Bytes())
 }
 
-func checkCRCArbitratorsSignatures(txn interfaces.Transaction) error {
+func checkCRCArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint32) error {
 
 	code := txn.Programs()[0].Code
 	// Get N parameter
@@ -1022,7 +1025,7 @@ func checkCRCArbitratorsSignatures(txn interfaces.Transaction) error {
 			return errors.New("invalid multi sign public key")
 		}
 	}
-	return verifyArbitratorsMultisigSignatures(txn)
+	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
 }
 
 func CheckDPOSIllegalProposals(d *payload.DPOSIllegalProposals) error {
