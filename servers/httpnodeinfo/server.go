@@ -64,7 +64,18 @@ func viewHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// newInfoMux builds a PRIVATE mux serving ONLY /info. F-036(info): the old code
+// registered on http.DefaultServeMux and served it with a nil handler, so
+// net/http/pprof's init() (pulled in transitively via the statsview profiler)
+// also exposed /debug/pprof/* on this unauthenticated port -- /debug/pprof/cmdline
+// returns the process argv, which can include the keystore --password. A private
+// mux serves only /info; the pprof routes 404.
+func newInfoMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/info", viewHandler)
+	return mux
+}
+
 func StartServer() {
-	http.HandleFunc("/info", viewHandler)
-	http.ListenAndServe(":"+strconv.Itoa(int(config.Parameters.HttpInfoPort)), nil)
+	http.ListenAndServe(":"+strconv.Itoa(int(config.Parameters.HttpInfoPort)), newInfoMux())
 }
