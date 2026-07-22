@@ -48,6 +48,13 @@ type TxReceivingInfo struct {
 // append transaction to txnpool when check ok, and broadcast the transaction.
 // 1.check  2.check with ledger(db) 3.check with pool
 func (mp *TxPool) AppendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
+	// Defensive: the global event bus delivers ETAppendTxToTxPool asynchronously
+	// (dpos/state notifyNextTurnDPOSInfoTx -> go events.Notify -> netsync handler). A
+	// SyncManager with an unwired/torn-down pool (test harness, shutdown race) must not
+	// crash the process on a nil receiver; production always wires the pool.
+	if mp == nil {
+		return nil
+	}
 	mp.Lock()
 	defer mp.Unlock()
 	err := mp.appendToTxPool(tx)
