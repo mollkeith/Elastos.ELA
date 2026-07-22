@@ -275,6 +275,10 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	crcRealWithdraw := make(map[Uint256]struct{})       // mempool slotCRCProposalRealWithdrawKey
 	dposClaimRealWithdraw := make(map[Uint256]struct{}) // mempool slotDposV2ClaimRewardRealWithdrawKey
 	votesRealWithdrawCount := 0                          // mempool slotVotesRealWithdraw (singleton)
+	proposalWithdraw := make(map[Uint256]struct{})      // F-047: mempool slotCRCProposalHash (queue side)
+	returnDeposit := make(map[string]struct{})          // F-068: mempool slotProgramCode (return-deposit)
+	claimNodeKeys := make(map[string]struct{})          // F-071: mempool slotCRCouncilMemberNodePublicKey
+	proposalDraft := make(map[Uint256]struct{})         // F-072: mempool slotCRCProposalDraftHash
 	for _, txn := range block.Transactions {
 		switch txn.TxType() {
 		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
@@ -327,6 +331,63 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 			if votesRealWithdrawCount > 1 {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate votes real withdraw")
 			}
+		case common.CRCProposalWithdraw:
+			// F-047: mirror mempool slotCRCProposalHash (queue side). Two same-block
+			// V1 withdraws for the same proposal both pass ContextCheck (the first's
+			// WithdrawnBudgets update commits only post-validation) and each queue a
+			// WithdrawableTxInfo entry keyed by tx hash -> double CRExpenses payout.
+			p, ok := txn.Payload().(*payload.CRCProposalWithdraw)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid CRCProposalWithdraw payload")
+			}
+			if _, exists := proposalWithdraw[p.ProposalHash]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains conflicting same-proposal withdraw")
+			}
+			proposalWithdraw[p.ProposalHash] = struct{}{}
+		case common.ReturnDepositCoin, common.ReturnCRDepositCoin:
+			// F-068: mirror mempool slotProgramCode. Two same-block deposit returns
+			// with the same program code (producer/CR) but disjoint deposit UTXOs both
+			// read the same committed availableAmount and each refund up to it,
+			// escaping the block dup-UTXO check -> over-refund of the forfeited bond.
+			// (The mempool already forbids this pairing, so no honest mempool-built
+			// block is affected; this catches a malicious producer.)
+			if len(txn.Programs()) == 0 {
+				return errors.New("[PowCheckBlockSanity] return deposit tx without program")
+			}
+			codeKey := BytesToHexString(txn.Programs()[0].Code)
+			if _, exists := returnDeposit[codeKey]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains conflicting same-code deposit return")
+			}
+			returnDeposit[codeKey] = struct{}{}
+		case common.CRCouncilMemberClaimNode:
+			// F-071: mirror mempool slotCRCouncilMemberNodePublicKey. Two same-block
+			// claims of the same node public key by distinct members both pass (the key
+			// is absent from pre-block ClaimedDPoSKeys) -> two CR members bound to one
+			// DPoS node key, breaking the node-key uniqueness invariant.
+			p, ok := txn.Payload().(*payload.CRCouncilMemberClaimNode)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid CRCouncilMemberClaimNode payload")
+			}
+			nodeKey := BytesToHexString(p.NodePublicKey)
+			if _, exists := claimNodeKeys[nodeKey]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains duplicate CR claim DPOS node public key")
+			}
+			claimNodeKeys[nodeKey] = struct{}{}
+		case common.CRCProposal:
+			// F-072 (DraftHash only): mirror mempool slotCRCProposalDraftHash. A
+			// same-block duplicate DraftHash is never legitimate (the draft hash is a
+			// hash over the draft data) and breaks the ExistDraft uniqueness invariant
+			// + shares a ProposalDraftDataBucketName key (rollback corruption). DID /
+			// CustomID uniqueness is NOT promoted here (a member may legitimately file
+			// multiple distinct-draft proposals) - see INFERRED-ITEMS.
+			p, ok := txn.Payload().(*payload.CRCProposal)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid CRCProposal payload")
+			}
+			if _, exists := proposalDraft[p.DraftHash]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains duplicate proposal draft hash")
+			}
+			proposalDraft[p.DraftHash] = struct{}{}
 		}
 	}
 	return nil
