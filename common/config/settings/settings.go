@@ -6,6 +6,9 @@
 package settings
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/RainFallsSilent/screw"
 	"github.com/elastos/Elastos.ELA/common/config"
 	"github.com/elastos/Elastos.ELA/core/transaction"
@@ -64,7 +67,7 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 
 	// switch activeNet params
 	var testNet bool
-	switch strings.ToLower(conf.ActiveNet) {
+	switch strings.ToLower(strings.TrimSpace(conf.ActiveNet)) {
 	case "testnet", "test":
 		testNet = true
 		conf.TestNet()
@@ -72,6 +75,23 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 	case "regnet", "regtest", "reg":
 		conf.RegNet()
 		s.loadConfigFile(conf.Conf, conf)
+	}
+
+	// F-043: an unrecognized ActiveNet keeps the MAINNET params (the switch above
+	// has no default) while enforce*Heights() below treats it as non-mainnet and
+	// DISABLES the CrossChain-UTXO freeze/restriction, strict-money-range and
+	// forced-rollback controls. That combination (mainnet chain, incident gates
+	// off) is what a typo such as "mainet"/"production" produces. Unknown labels
+	// are still supported on purpose for private/forked nets, so warn loudly
+	// rather than refuse to start.
+	switch strings.ToLower(strings.TrimSpace(conf.ActiveNet)) {
+	case "", "mainnet", "main", "testnet", "test", "regnet", "regtest", "reg":
+	default:
+		fmt.Fprintf(os.Stderr,
+			"WARNING: unrecognized ActiveNet %q - keeping MAINNET chain params while "+
+				"DISABLING the CrossChain-UTXO freeze/restriction, strict-money-range and "+
+				"forced-rollback controls. Use one of: mainnet, testnet, regnet. If this is "+
+				"an intentional private/forked net, ignore this warning.\n", conf.ActiveNet)
 	}
 
 	if conf.MaxBlockSize > 0 {
@@ -108,7 +128,7 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 // enforceCrossChainUTXORestrictionHeights prevents local configuration from
 // changing the coordinated mainnet CrossChain UTXO consensus heights.
 func enforceCrossChainUTXORestrictionHeights(configuration *config.Configuration) {
-	switch strings.ToLower(configuration.ActiveNet) {
+	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
 	case "", "mainnet", "main":
 		configuration.CrossChainUTXOFreezeHeight =
 			config.MainNetCrossChainUTXOFreezeHeight
@@ -128,7 +148,7 @@ func enforceCrossChainUTXORestrictionHeights(configuration *config.Configuration
 // local value would fork that node, so these are pinned for mainnet exactly like
 // the CrossChain heights.
 func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
-	switch strings.ToLower(configuration.ActiveNet) {
+	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
 	case "", "mainnet", "main":
 		configuration.StrictMoneyRangeHeight = config.MainNetStrictMoneyRangeHeight
 		configuration.ForcedRollbackHeight = config.MainNetForcedRollbackHeight
@@ -149,7 +169,7 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 // enforceFrozenAddresses prevents local configuration from changing the
 // coordinated mainnet frozen-address list.
 func enforceFrozenAddresses(configuration *config.Configuration) {
-	switch strings.ToLower(configuration.ActiveNet) {
+	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
 	case "", "mainnet", "main":
 		configuration.FrozenAddresses = config.MainNetFrozenAddresses()
 	default:
