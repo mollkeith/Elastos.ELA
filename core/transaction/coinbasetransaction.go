@@ -97,6 +97,18 @@ func (t *CoinBaseTransaction) IsAllowedInPOWConsensus() bool {
 
 func (a *CoinBaseTransaction) SpecialContextCheck() (result elaerr.ELAError, end bool) {
 	para := a.parameters
+	// F-031: pin the coinbase LockTime to its own block height. The coinbase-
+	// maturity window (checkInvalidUTXO, transactionchecker.go) derives the
+	// 100-block lock from the coinbase's own LockTime, which no validator
+	// checked -> a malicious producer could set LockTime=0 (or a future value
+	// causing a uint32 underflow) to spend the reward before maturity. Honest
+	// coinbases already set LockTime=height (pow/service.go), so gating at
+	// StrictMoneyRangeHeight rejects no historical block.
+	if para.BlockHeight >= para.Config.StrictMoneyRangeHeight &&
+		a.LockTime() != para.BlockHeight {
+		return elaerr.Simple(elaerr.ErrTxInvalidOutput,
+			errors.New("coinbase locktime must equal block height")), true
+	}
 	if para.BlockHeight >= para.Config.CRConfiguration.CRCommitteeStartHeight {
 		if para.BlockChain.GetState().GetConsensusAlgorithm() == 0x01 {
 			if !a.outputs[0].ProgramHash.IsEqual(*para.Config.DestroyELAProgramHash) {
