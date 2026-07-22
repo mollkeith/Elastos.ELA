@@ -45,6 +45,17 @@ func (t *UpdateProducerTransaction) HeightVersionCheck() error {
 				t.TxType().Name(), t.PayloadVersion()))
 		}
 	}
+	// F-069: reject unknown UpdateProducer payload versions at/above the
+	// coordinated-upgrade gate. SpecialContextCheck only authenticates versions up to
+	// ProducerInfoMultiVersion (0x03); a v>=4 payload falls through with NO owner
+	// proof and then overwrites the producer info (nickname / NodePublicKey re-key =
+	// identity takeover; LIVE, permissionless). Below the gate is left byte-identical
+	// for replay-safety (mirrors RegisterProducer's default-deny).
+	if blockHeight >= chainParams.StrictMoneyRangeHeight &&
+		t.PayloadVersion() > payload.ProducerInfoMultiVersion {
+		return errors.New(fmt.Sprintf("unsupported %s transaction payload version %d",
+			t.TxType().Name(), t.PayloadVersion()))
+	}
 	return nil
 }
 

@@ -141,7 +141,20 @@ func (t *ActivateProducerTransaction) SpecialContextCheck() (elaerr.ELAError, bo
 			if t.parameters.BlockChain.GetCRCommittee().GetAvailableDepositAmount(crMember.Info.CID) < 0 {
 				return elaerr.Simple(elaerr.ErrTxPayload, errors.New("balance of CR is not enough ")), true
 			}
-			return nil, true
+			// F-021: the CR-member activation path returns end=true, which skips
+			// CheckTransactionFee AND checkTransactionSignature. Above NFTStartHeight a
+			// CR activate may carry Inputs(), so end=true lets it spend arbitrary UTXOs
+			// with NO input-ownership proof (theft; F-166's fee==0 guard only prevents
+			// net inflation, not equal-value theft). At/above the coordinated-upgrade
+			// gate, fall through so the fee + input-signature checks run. Below the gate
+			// keep end=true for replay-safety (the producer branch already gates end on
+			// NFTStartHeight, but re-gating the CR branch there would change acceptance
+			// for the historical 1405000..2260451 window -> gate at StrictMoneyRangeHeight).
+			end := true
+			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+				end = false
+			}
+			return nil, end
 		}
 	}
 

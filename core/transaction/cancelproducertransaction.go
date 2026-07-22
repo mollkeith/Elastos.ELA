@@ -46,6 +46,16 @@ func (t *CancelProducerTransaction) HeightVersionCheck() error {
 				t.TxType().Name(), t.PayloadVersion()))
 		}
 	}
+	// F-039: reject unknown CancelProducer payload versions at/above the
+	// coordinated-upgrade gate. checkProcessProducer only authenticates v0/v1/v2;
+	// a v>=3 payload falls through the version dispatch with NO owner proof and
+	// cancels an arbitrary producer (LIVE, permissionless). Below the gate is left
+	// byte-identical for replay-safety (mirrors RegisterProducer's default-deny).
+	if blockHeight >= chainParams.StrictMoneyRangeHeight &&
+		t.PayloadVersion() > payload.ProcessMultiCodeVersion {
+		return errors.New(fmt.Sprintf("unsupported %s transaction payload version %d",
+			t.TxType().Name(), t.PayloadVersion()))
+	}
 	return nil
 }
 
@@ -107,6 +117,17 @@ func (t *CancelProducerTransaction) checkProcessProducer(params *TransactionPara
 		if !contract.IsMultiSig(t.Programs()[0].Code) {
 			return nil, elaerr.Simple(elaerr.ErrTxPayload,
 				errors.New("only multi sign code can use ProcessMultiCodeVersion"))
+		}
+		// F-025: bind the multisig program code to the payload OwnerKey (mirror
+		// RegisterProducer :187 / UpdateProducer :142). Without this, a caller pays
+		// the fee with their OWN unrelated multisig program yet sets OwnerKey to a
+		// victim, cancelling any eligible producer without the victim's key. Gated at
+		// the coordinated-upgrade height for replay-safety; the branch is itself gated
+		// by SupportMultiCodeHeight (MaxUint32 on mainnet -> dead until flipped, at
+		// which point this bind is active because StrictMoneyRangeHeight is far below).
+		if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight &&
+			!bytes.Equal(t.Programs()[0].Code, processProducer.OwnerKey) {
+			return nil, errors.New("ProcessMultiCodeVersion program code must equal OwnerKey")
 		}
 	}
 
