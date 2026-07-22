@@ -630,6 +630,16 @@ func (p *Configuration) RegNet() *Configuration {
 type Configuration struct {
 	Conf          string `screw:"--conf" usage:"set the config file path"`
 	ActiveNet     string `json:"ActiveNet"`
+	// ArmIncidentGates lets a NON-MAINNET (rehearsal) chain opt in to the
+	// coordinated incident gates -- StrictMoneyRangeHeight, the CrossChain-UTXO
+	// freeze/restriction heights and the forced-rollback trigger -- which are
+	// otherwise pinned to Disabled for every non-mainnet net. Without this, every
+	// gated fix (F-015, F-212, the same-block mirrors, ...) is INERT on testnet and
+	// a green testnet run proves nothing. It is IGNORED on mainnet: the mainnet
+	// branch of enforceCrossChainUTXORestrictionHeights /
+	// enforceStrictMoneyAndRollbackHeights pins the real values unconditionally, so
+	// this flag can only ever ARM a rehearsal chain, never weaken mainnet.
+	ArmIncidentGates bool `json:"ArmIncidentGates"`
 	Password      string `screw:"short;--password" usage:"password for keystore"`
 	DataDir       string `screw:"short;--datadir" usage:"block data and logs storage path default: elastos"`
 	HttpInfoPort  uint16 `screw:"--infoport" usage:"port for the http info server"`

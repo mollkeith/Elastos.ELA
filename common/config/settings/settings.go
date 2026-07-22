@@ -135,6 +135,12 @@ func enforceCrossChainUTXORestrictionHeights(configuration *config.Configuration
 		configuration.CrossChainUTXORestrictionHeight =
 			config.MainNetCrossChainUTXORestrictionHeight
 	default:
+		// Rehearsal opt-in: keep whatever the net defaults / config.json supplied so a
+		// testnet can exercise the gated CrossChain-UTXO fixes. Mainnet never reaches
+		// here (handled above), so this cannot weaken mainnet.
+		if configuration.ArmIncidentGates {
+			break
+		}
 		configuration.CrossChainUTXOFreezeHeight =
 			config.DisabledCrossChainUTXORestrictionHeight
 		configuration.CrossChainUTXORestrictionHeight =
@@ -160,6 +166,12 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 		configuration.DPoSConfiguration.DPoSV2MinVotesLockTime = 7200
 		configuration.DPoSConfiguration.DPoSV2MaxVotesLockTime = 720000
 	default:
+		// Rehearsal opt-in (see ArmIncidentGates): keep the supplied heights so the
+		// strict-money / forced-rollback path can be exercised on a testnet. Mainnet
+		// never reaches this branch, so mainnet cannot be weakened by the flag.
+		if configuration.ArmIncidentGates {
+			break
+		}
 		configuration.StrictMoneyRangeHeight = config.DisabledStrictMoneyRangeHeight
 		configuration.ForcedRollbackHeight = config.DisabledForcedRollbackHeight
 		configuration.ForcedRollbackTrigger = ""
