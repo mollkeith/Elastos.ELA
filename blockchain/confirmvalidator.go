@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"math"
 
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/common/log"
@@ -160,9 +161,14 @@ func PreProcessSpecialTx(block *Block) error {
 	//	}
 	//}
 	if len(inactivePayloads) != 0 {
+		gate := uint32(math.MaxUint32)
+		if bc := DefaultLedger.Blockchain; bc != nil {
+			gate = bc.GetParams().StrictMoneyRangeHeight
+		}
+		forceChangeHeight := forceChangeCommitHeight(block.Height, gate)
 		for _, v := range inactivePayloads {
 			if err := DefaultLedger.Arbitrators.ProcessSpecialTxPayload(
-				v, block.Height-1); err != nil {
+				v, forceChangeHeight); err != nil {
 				return errors.New("force change fail when finding an " +
 					"inactive arbitrators transaction")
 			}
@@ -170,6 +176,28 @@ func PreProcessSpecialTx(block *Block) error {
 	}
 
 	return nil
+}
+
+// forceChangeCommitHeight returns the height at which an InactiveArbitrators
+// ForceChange is recorded in the arbiters History. F-093: the legacy binding at
+// block.Height-1 could not be undone by a confirm-fail / reorg rollback to
+// block.Height-1 because History.RollbackTo only reverses changes strictly above
+// the target height. The emergency arbiter rotation therefore stuck on a block
+// that was subsequently rejected. At/above the recovery gate we record it at
+// block.Height so OnRollbackTo(block.Height-1) undoes it together with the block.
+// Height-gated for replay-safety: below the gate the original block.Height-1
+// binding (and its SnapshotByHeight / UpdateNextArbitrators heights) is preserved
+// so historical state derivation is byte-identical.
+//
+// This closes the confirm-fail / reorg prong ONLY. The connect-internal-fail
+// path (connectBestChain rolls back only b.state, never Arbitrators.History) is a
+// documented residual that needs multi-node reorg simulation — see the F-093
+// engineer-question note.
+func forceChangeCommitHeight(blockHeight, gate uint32) uint32 {
+	if blockHeight >= gate {
+		return blockHeight
+	}
+	return blockHeight - 1
 }
 
 func ProposalCheck(proposal *payload.DPOSProposal) error {
