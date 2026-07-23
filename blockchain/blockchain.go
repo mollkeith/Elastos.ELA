@@ -276,6 +276,102 @@ func (b *BlockChain) MigrateOldDB(
 	return err
 }
 
+// restoreCheckpoints loads every checkpoint from its file and re-initializes the
+// in-memory state from it.
+//
+// #4 (R2): CkpManager.Restore -> ICheckPoint.OnInit ->
+// Arbiters.RecoverFromCheckPoints REPLACES the whole arbiter set, the degradation
+// state, both History objects and the pending special-tx savepoint -- and it swaps
+// State.History under a.mtx while a concurrent gossip bracket uses it under s.mtx.
+// main.go starts the DPoS arbitrator (main.go:286) BEFORE it calls InitCheckpoint
+// (main.go:328), so such a bracket can already be running on another goroutine:
+// serialize the restore against it. Nothing below re-acquires specialTxMtx.
+func (b *BlockChain) restoreCheckpoints() error {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	return b.CkpManager.Restore()
+}
+
+// resetCheckpoints throws away all in-memory checkpoint state and rebuilds it from
+// the genesis defaults. Only reorganizeChain's recoverFromDefault branch uses it.
+//
+// #4 (R2): dpos/state CheckPoint.OnReset rebuilds the Arbiters wholesale
+// (initArbitrators -> initFromArbitrators -> RecoverFromCheckPoints), so it is its
+// own special-tx bracket and must not interleave with a gossip emergency bracket.
+// It is reached from reorganizeChain under b.mutex with specialTxMtx free (the
+// detach-loop rollback released it), so there is no re-acquisition and the
+// [b.mutex ->] specialTxMtx order is preserved.
+func (b *BlockChain) resetCheckpoints() {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	// Return value discarded exactly as the pristine call site discarded it.
+	b.CkpManager.OnReset()
+}
+
+// replayCheckpointBlock replays ONE retained-history block into the checkpoints.
+//
+// #4 (R2): this is a special-tx BRACKET -- PreProcessSpecialTx marks the savepoint
+// and applies the emergency ForceChange, CkpManager.OnBlockSaved then mutates the
+// very same Arbiters state (dpos/state/checkpoint.go OnBlockSaved ->
+// Arbiters.ProcessBlock -> State.ProcessBlock under s.mtx + IncreaseChainHeight
+// under a.mtx), and only then is the savepoint committed or undone. N-001 shipped
+// this serialization for connectBlock and for the four DPoS-gossip sites but NOT
+// for the init/recover replay, which is reachable from main.go:328 (startup, with
+// the arbitrator already started at main.go:286) and from reorganizeChain's
+// recoverFromDefault branch. Unserialized, a gossip ProcessSpecialTxPayload
+// (forceChange reads the producer maps under a.mtx only) races State.ProcessBlock
+// (writes them under s.mtx only) -- a genuine cross-mutex data race -- and can also
+// mark/commit its own savepoint inside this open bracket.
+//
+// The lock is taken at the BOUNDARY and released here; nothing inside re-acquires
+// it (RollbackTo / RollbackSeekTo deliberately do not self-acquire), so there is no
+// self-deadlock. Lock order is [b.mutex ->] specialTxMtx -> {a.mtx, s.mtx,
+// CkpManager.mtx, IndexLock} -- reorganizeChain reaches this under b.mutex, the
+// startup caller reaches it with no chain lock held, and nothing takes b.mutex
+// while holding specialTxMtx, so the order cannot invert.
+//
+// Pure runtime locking: no decision, no ordering and no stored byte changes, so
+// below-gate replay stays identical and the change is UNGATED.
+func (b *BlockChain) replayCheckpointBlock(block *DposBlock) error {
+	arbiters := DefaultLedger.Arbitrators
+	arbiters.LockSpecialTx()
+	defer arbiters.UnlockSpecialTx()
+
+	if err := PreProcessSpecialTx(block.Block); err != nil {
+		// F-093: the replay aborts here, so the emergency ForceChange this
+		// block's special tx just applied must not survive.
+		arbiters.UndoPendingSpecialTx()
+		return err
+	}
+
+	b.CkpManager.OnBlockSaved(block, nil,
+		b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, true)
+	// F-093: the block is replayed from the retained main chain, so its
+	// special-tx effect is committed exactly as it historically was.
+	arbiters.CommitPendingSpecialTx()
+	return nil
+}
+
+// saveBlockCheckpoints is the post-connect checkpoint-save boundary used by the
+// reorg attach loop and by processBlock's linear-extend branch.
+//
+// #4 (R2): CkpManager.OnBlockSaved reaches dpos/state/checkpoint.go OnBlockSaved ->
+// Arbiters.ProcessBlock, which mutates exactly the state a concurrent gossip
+// emergency bracket mutates (producer maps, arbiter set, DutyIndex, History,
+// Snapshots) under a DIFFERENT mutex, so the two must be serialized. connectBlock
+// released specialTxMtx in its deferred commit/undo before returning, and
+// connectBestChain likewise, so this site never re-acquires a lock it already
+// holds.
+func (b *BlockChain) saveBlockCheckpoints(block *DposBlock) {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	b.CkpManager.OnBlockSaved(block, nil,
+		b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, false)
+}
+
 // InitCheckpoint go through all blocks since the genesis block
 // to initialize all checkpoint.
 func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
@@ -288,7 +384,7 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 		// Notify initialize process start.
 		startHeight := uint32(0)
 
-		if err = b.CkpManager.Restore(); err != nil {
+		if err = b.restoreCheckpoints(); err != nil {
 			log.Warn(err)
 			err = nil
 		}
@@ -323,19 +419,10 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 				}
 			}
 
-			if e = PreProcessSpecialTx(block.Block); e != nil {
-				// F-093: the replay aborts here, so the emergency ForceChange this
-				// block's special tx just applied must not survive.
-				arbiters.UndoPendingSpecialTx()
+			if e = b.replayCheckpointBlock(block); e != nil {
 				err = e
 				break
 			}
-
-			b.CkpManager.OnBlockSaved(block, nil,
-				b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, true)
-			// F-093: the block is replayed from the retained main chain, so its
-			// special-tx effect is committed exactly as it historically was.
-			arbiters.CommitPendingSpecialTx()
 
 			// Notify process increase.
 			if increase != nil {
@@ -1435,7 +1522,11 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	// recover check point from genesis block
 	if recoverFromDefault {
 		//reset all mem state data
-		b.CkpManager.OnReset()
+		// #4 (R2): resetCheckpoints holds the bracket lock; the replay that follows
+		// re-acquires it ONCE PER REPLAYED BLOCK inside replayCheckpointBlock -- the
+		// same per-block granularity connectBlock already uses -- so the lock is
+		// released before InitCheckpoint and there is no self-deadlock.
+		b.resetCheckpoints()
 		b.InitCheckpoint(nil, nil, nil)
 	}
 
@@ -1452,12 +1543,11 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		}
 
 		// update state after connected block
-		b.CkpManager.OnBlockSaved(&DposBlock{
+		b.saveBlockCheckpoints(&DposBlock{
 			Block:       block,
 			HaveConfirm: confirm != nil,
 			Confirm:     confirm,
-		}, nil, b.state.ConsensusAlgorithm == state.POW,
-			b.state.RevertToPOWBlockHeight, false)
+		})
 		DefaultLedger.Arbitrators.DumpInfo(block.Height)
 		delete(b.blockCache, *n.Hash)
 		delete(b.confirmCache, *n.Hash)
@@ -1716,12 +1806,11 @@ func (b *BlockChain) maybeAcceptBlock(block *Block, confirm *payload.Confirm) (b
 	}
 
 	if inMainChain && !reorganized {
-		b.CkpManager.OnBlockSaved(&DposBlock{
+		b.saveBlockCheckpoints(&DposBlock{
 			Block:       block,
 			HaveConfirm: confirm != nil,
 			Confirm:     confirm,
-		}, nil, b.state.ConsensusAlgorithm == state.POW,
-			b.state.RevertToPOWBlockHeight, false)
+		})
 		DefaultLedger.Arbitrators.DumpInfo(block.Height)
 	}
 
