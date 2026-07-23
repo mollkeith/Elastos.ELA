@@ -78,15 +78,20 @@ func TestF068ReturnDepositConflict(t *testing.T) {
 // TestF071ClaimNodeConflict — two CRCouncilMemberClaimNode for the SAME node public key.
 func TestF071ClaimNodeConflict(t *testing.T) {
 	nk := f047NodeKey(t)
-	c1 := f028Tx(common2.CRCouncilMemberClaimNode, 0, &payload.CRCouncilMemberClaimNode{NodePublicKey: nk}, nil)
-	c2 := f028Tx(common2.CRCouncilMemberClaimNode, 0, &payload.CRCouncilMemberClaimNode{NodePublicKey: nk}, nil)
+	// Distinct council members (DIDs) so this test isolates the node-key dimension; the
+	// council-member-DID dimension is exercised separately by TestF083SameMemberDifferentNodeKey.
+	didA := common.Uint168{0x07, 0x01, 0x0a}
+	didB := common.Uint168{0x07, 0x01, 0x0b}
+	didC := common.Uint168{0x07, 0x01, 0x0c}
+	c1 := f028Tx(common2.CRCouncilMemberClaimNode, 0, &payload.CRCouncilMemberClaimNode{NodePublicKey: nk, CRCouncilCommitteeDID: didA}, nil)
+	c2 := f028Tx(common2.CRCouncilMemberClaimNode, 0, &payload.CRCouncilMemberClaimNode{NodePublicKey: nk, CRCouncilCommitteeDID: didB}, nil)
 	assert.Error(t, blockchain.CheckSameBlockConflicts(f028Block(f028Gate, c1, c2), f028Gate),
-		"two claims of the same node key in one block must be rejected at/above the gate")
+		"two claims of the same node key (distinct members) in one block must be rejected at/above the gate")
 	assert.NoError(t, blockchain.CheckSameBlockConflicts(f028Block(f028Gate-1, c1, c2), f028Gate),
 		"below the gate the block must validate byte-identically")
-	cOther := f028Tx(common2.CRCouncilMemberClaimNode, 0, &payload.CRCouncilMemberClaimNode{NodePublicKey: f047NodeKey(t)}, nil)
+	cOther := f028Tx(common2.CRCouncilMemberClaimNode, 0, &payload.CRCouncilMemberClaimNode{NodePublicKey: f047NodeKey(t), CRCouncilCommitteeDID: didC}, nil)
 	assert.NoError(t, blockchain.CheckSameBlockConflicts(f028Block(f028Gate, c1, cOther), f028Gate),
-		"claims of DIFFERENT node keys are legitimate and must pass")
+		"claims of DIFFERENT node keys by DIFFERENT members are legitimate and must pass")
 }
 
 // TestF072ProposalDraftConflict — two CRCProposal with the SAME draft hash.

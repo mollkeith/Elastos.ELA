@@ -29,6 +29,7 @@ import (
 	"github.com/elastos/Elastos.ELA/dpos/state"
 	"github.com/elastos/Elastos.ELA/elanet/pact"
 	elaerr "github.com/elastos/Elastos.ELA/errors"
+	"github.com/elastos/Elastos.ELA/vm"
 )
 
 const (
@@ -294,6 +295,8 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	sidechainWithdraw := make(map[Uint256]struct{})      // F-017/F-051: mempool slotSidechainTxHashes
 	sidechainReturnDeposit := make(map[Uint256]struct{}) // F-016: mempool slotSidechainReturnDepositTxHashes
 	nftDestroyIDs := make(map[Uint256]struct{})          // F-118: mempool slotNFTDestroyFromSideChainHash
+	producerCRKeys := make(map[string]struct{})          // F-100: mempool slotDPoSOwnerPublicKey/slotDPoSNodePublicKey (producer/CR overlap)
+	claimNodeDIDs := make(map[Uint168]struct{})          // F-083: mempool slotCRCouncilMemberDID
 	for _, txn := range block.Transactions {
 		switch txn.TxType() {
 		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
@@ -388,6 +391,20 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate CR claim DPOS node public key")
 			}
 			claimNodeKeys[nodeKey] = struct{}{}
+			// F-083: mirror mempool slotCRCouncilMemberDID. processCRCouncilMemberClaimNode
+			// captures the member's old DPoS key / member state OUTSIDE the History forward
+			// closure (oriPublicKey/oriMemberState/oriInactiveCount are read at process time,
+			// = pre-block state). A second claim by the SAME council member in one block --
+			// with a DIFFERENT node key, so the node-key guard above does not catch it --
+			// touches that same member twice; the History comment states such capture-outside
+			// revert patterns are only safe if no two same-block changes touch the same key.
+			// The mempool forbids this pairing (slotCRCouncilMemberDID), so no honest
+			// mempool-built block is affected; this catches a malicious block-packer. Reject
+			// a repeated council-member DID.
+			if _, exists := claimNodeDIDs[p.CRCouncilCommitteeDID]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains duplicate CR claim council member DID")
+			}
+			claimNodeDIDs[p.CRCouncilCommitteeDID] = struct{}{}
 		case common.CRCProposal:
 			// F-072 (DraftHash only): mirror mempool slotCRCProposalDraftHash. A
 			// same-block duplicate DraftHash is never legitimate (the draft hash is a
@@ -440,9 +457,99 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 					nftDestroyIDs[id] = struct{}{}
 				}
 			}
+		case common.RegisterProducer:
+			// F-100: mirror mempool slotDPoSOwnerPublicKey + slotDPoSNodePublicKey (the
+			// producer/CR-overlap slots). RegisterProducer.SpecialContextCheck rejects a key
+			// already registered as a producer (ProducerOwnerPublicKeyExists /
+			// ProducerOrCRNodePublicKeyExists) or CR (ExistCR), but those read committed
+			// state only, so two same-block registrations sharing a key -- or a
+			// RegisterProducer and a RegisterCR keyed on the SAME public key -- both pass and
+			// bind one key to two identities (producer<->producer or producer<->CR). Reject a
+			// repeated producer owner/node public key.
+			p, ok := txn.Payload().(*payload.ProducerInfo)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid RegisterProducer payload")
+			}
+			for _, k := range dedupHexKeys(p.OwnerKey, p.NodePublicKey) {
+				if _, exists := producerCRKeys[k]; exists {
+					return errors.New("[PowCheckBlockSanity] block contains conflicting producer/CR public key")
+				}
+				producerCRKeys[k] = struct{}{}
+			}
+		case common.RegisterCR:
+			// F-100: the RegisterCR side of the same two mempool slots. RegisterCR rejects a
+			// public key already in the producer list (ProducerExists) but reads committed
+			// state only, so a same-block RegisterCR + RegisterProducer (or a second
+			// RegisterCR) sharing one key both pass. Extract the CR registration public key
+			// exactly as the RegisterCR check derives the key it feeds to ProducerExists.
+			key, ok := registerCRConflictKey(txn)
+			if !ok {
+				// Malformed / unsupported CR code: leave rejection to the per-tx
+				// SpecialContextCheck (canonical error); do not seed the shared map.
+				break
+			}
+			if _, exists := producerCRKeys[key]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains conflicting producer/CR public key")
+			}
+			producerCRKeys[key] = struct{}{}
 		}
 	}
 	return nil
+}
+
+// dedupHexKeys returns the hex encodings of the given public keys with duplicates
+// removed, so a producer whose owner key equals its own node key contributes a single
+// shared-map entry (mirrors the mempool strDPoSOwnerNodePublicKeys owner==node dedup) and
+// does not self-collide.
+func dedupHexKeys(keys ...[]byte) []string {
+	out := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		s := BytesToHexString(k)
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// registerCRConflictKey extracts the RegisterCR registration public key the same way the
+// RegisterCR SpecialContextCheck derives the key it feeds to GetState().ProducerExists
+// (and the same way the mempool strRegisterCRPublicKey keys slotDPoSOwnerPublicKey), so a
+// collision with a producer owner/node key is detected. It is bounds-safe against a
+// crafted short code (CheckSameBlockConflicts runs before the per-tx payload check) and
+// returns false for a malformed / unsupported code, leaving rejection to that per-tx check.
+func registerCRConflictKey(txn interfaces.Transaction) (string, bool) {
+	p, ok := txn.Payload().(*payload.CRInfo)
+	if !ok {
+		return "", false
+	}
+	var code []byte
+	if txn.PayloadVersion() == payload.CRInfoSchnorrVersion ||
+		txn.PayloadVersion() == payload.CRInfoMultiSignVersion {
+		if len(txn.Programs()) == 0 || txn.Programs()[0] == nil {
+			return "", false
+		}
+		code = txn.Programs()[0].Code
+	} else {
+		code = p.Code
+	}
+	if contract.IsSchnorr(code) {
+		return BytesToHexString(code[2:]), true
+	}
+	if len(code) < 2 {
+		return "", false
+	}
+	switch code[len(code)-1] {
+	case vm.CHECKSIG:
+		return BytesToHexString(code[1 : len(code)-1]), true
+	case vm.CHECKMULTISIG:
+		return BytesToHexString(code), true
+	default:
+		return "", false
+	}
 }
 
 // addWithdrawHashes rejects a block that references the same pending withdraw hash twice
