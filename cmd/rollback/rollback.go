@@ -104,6 +104,15 @@ func rollbackAction(c *cli.Context) error {
 			return err
 		}
 
+		// Residue #2 parity: RollbackBlock/removeBlockNode clear the header, height and
+		// tx indexes but NOT the raw by-hash entry in ffldb-blockidx, so without this the
+		// manually rolled-back node keeps serving the discarded blocks by hash (same defect
+		// the forced-rollback path fixes). Purge the raw-store location entry too.
+		if err = chainStore.GetFFLDB().DeleteBlockFromStore(*nodes[i].Hash); err != nil {
+			fmt.Println("purge block store failed, ", block.Height, err)
+			return err
+		}
+
 		blockHashAfter := *nodes[i-1].Hash
 		fmt.Println("block hash after rollback:", blockHashAfter)
 	}
