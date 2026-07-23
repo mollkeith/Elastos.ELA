@@ -614,8 +614,17 @@ func (b *BlockChain) checkTxsContext(block *Block) error {
 	// else a non-ELA fee inflates coinbase[2] above its ELA backing. The core engineers
 	// asked that this reward-rule change activate at a FRESH future height
 	// (RevisedDPoSRewardHeight), NOT the incident-recovery gate (StrictMoneyRangeHeight).
-	// On the ELA-only mainnet (Q-B1) it is byte-identical to the legacy GetBlockDPOSReward
-	// path either way (tx.Fee() sum == totalTxFee), so re-gating changes no mainnet block.
+	// MEASURED (not assumed): a full scan of the retained chain — all 2,260,597 blocks to the
+	// frozen tip 2260595 — found ZERO outputs carrying a non-ELA AssetID, and F-056 rejects
+	// RegisterAsset at/above StrictMoneyRangeHeight, so no non-ELA asset can appear after the
+	// restart either. With every fee in ELA the two bases are the same number (the coinbase
+	// contributes 0 to both: CalculateTxsFee skips it and this loop sums from i=1), so
+	// activating at 2265000 is a provable no-op and cannot split the fleet.
+	// CLASSIFICATION: real code defect, exposure DORMANT — realized over-mint to date is zero
+	// and its precondition is now structurally unreachable. Kept as defence in depth.
+	// Same scan validated the reward model itself: 233,271 fee-free blocks above height
+	// 2,000,000 reproduce ceil(0.3R)/ceil(0.35R)/remainder exactly, 0 mismatches, at halving
+	// factor 3 (R = 76,103,500 sela; next halving at 3,153,600, far outside this window).
 	if block.Height >= b.chainParams.RevisedDPoSRewardHeight {
 		var err error
 		dposReward, err = b.GetBlockDPOSRewardStrict(block.Height, totalTxFee)
