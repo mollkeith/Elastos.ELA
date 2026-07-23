@@ -13,6 +13,7 @@ import (
 	cmdcom "github.com/elastos/Elastos.ELA/cmd/common"
 	"github.com/elastos/Elastos.ELA/cmd/info"
 	"github.com/elastos/Elastos.ELA/cmd/mine"
+	"github.com/elastos/Elastos.ELA/cmd/purgeresidue"
 	"github.com/elastos/Elastos.ELA/cmd/rollback"
 	"github.com/elastos/Elastos.ELA/cmd/script"
 	"github.com/elastos/Elastos.ELA/cmd/wallet"
@@ -57,6 +58,7 @@ func main() {
 		*mine.NewCommand(),
 		*script.NewCommand(),
 		*rollback.NewCommand(),
+		*purgeresidue.NewCommand(),
 	}
 
 	//sort.Sort(cli.CommandsByName(app.Commands))

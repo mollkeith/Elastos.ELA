@@ -334,6 +334,23 @@ func (c *ChainStoreFFLDB) EvictBlockCache(hash Uint256) {
 	}
 }
 
+// DeleteBlockFromStore purges a block's by-hash location entry from the raw block
+// store (ffldb-blockidx) and evicts it from the RAM cache, so the store returns
+// ErrBlockNotFound and can no longer deserialize or serve the block by hash. The
+// flat-file bytes are intentionally left orphaned/unfetchable (see
+// DBRemoveBlockFromStore). This is the offline-cleaner entry point; the forced
+// rollback path performs the same delete inline because it already holds an Update
+// transaction for the surrounding index removals.
+func (c *ChainStoreFFLDB) DeleteBlockFromStore(hash Uint256) error {
+	if err := c.db.Update(func(dbTx database.Tx) error {
+		return DBRemoveBlockFromStore(dbTx, &hash)
+	}); err != nil {
+		return err
+	}
+	c.EvictBlockCache(hash)
+	return nil
+}
+
 func (c *ChainStoreFFLDB) GetHeader(hash Uint256) (*common.Header, error) {
 	var headerBytes []byte
 	err := c.db.View(func(tx database.Tx) error {
