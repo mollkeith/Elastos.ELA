@@ -251,6 +251,12 @@ func (h *History) RollbackTo(height uint32) error {
 		}
 	}
 	h.height = height
+	// F-131: keep the seek/commit invariant (seekHeight == current view height), exactly
+	// as Commit and SeekTo do. Without this a stale seekHeight left by a prior SeekTo
+	// stays > the rollback target, so the next Commit computes seek = h.height -
+	// h.seekHeight and UNDERFLOWS (uint32). Reorg/history-consistency; forward state
+	// unchanged (Commit always sets seekHeight==height on the accepted path).
+	h.seekHeight = height
 
 	return nil
 }
