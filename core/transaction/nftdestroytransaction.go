@@ -108,6 +108,20 @@ func (t *NFTDestroyTransactionFromSideChain) SpecialContextCheck() (elaerr.ELAEr
 		return elaerr.Simple(elaerr.ErrTxPayload,
 			errors.New("NFTDestroy IDs and OwnerStakeAddresses length mismatch")), true
 	}
+	// F-104: reject duplicate NFT IDs within one destroy tx. ExistNFTID/CanNFTDestroy are
+	// read-only during validation, so a repeated ID passes both and double-applies the
+	// destroy on ProcessBlock. Gated at StrictMoneyRangeHeight (like F-074/F-052) ->
+	// below-gate byte-identical (no arbiter-signed dup-ID NFTDestroy in retained history).
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		seen := make(map[common.Uint256]struct{}, len(nftDestroyPayload.IDs))
+		for _, id := range nftDestroyPayload.IDs {
+			if _, dup := seen[id]; dup {
+				return elaerr.Simple(elaerr.ErrTxPayload,
+					errors.New("duplicate NFT id in NFTDestroy payload")), true
+			}
+			seen[id] = struct{}{}
+		}
+	}
 	state := t.parameters.BlockChain.GetState()
 
 	// check if the NFT exist

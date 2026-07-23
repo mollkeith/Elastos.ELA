@@ -281,6 +281,7 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	proposalDraft := make(map[Uint256]struct{})         // F-072: mempool slotCRCProposalDraftHash
 	sidechainWithdraw := make(map[Uint256]struct{})      // F-017/F-051: mempool slotSidechainTxHashes
 	sidechainReturnDeposit := make(map[Uint256]struct{}) // F-016: mempool slotSidechainReturnDepositTxHashes
+	nftDestroyIDs := make(map[Uint256]struct{})          // F-118: mempool slotNFTDestroyFromSideChainHash
 	for _, txn := range block.Transactions {
 		switch txn.TxType() {
 		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
@@ -413,6 +414,19 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 					return errors.New("[PowCheckBlockSanity] block contains duplicate sidechain return-deposit hash")
 				}
 				sidechainReturnDeposit[h] = struct{}{}
+			}
+		case common.NFTDestroyFromSideChain:
+			// F-118: mirror mempool slotNFTDestroyFromSideChainHash. NFTDestroy
+			// SpecialContextCheck reads committed state only, so two same-block NFTDestroy
+			// txs sharing an NFT id both pass and double-apply the destroy. Reject a
+			// repeated id. Gated with the function (returns nil below `gate`).
+			if p, ok := txn.Payload().(*payload.NFTDestroyFromSideChain); ok {
+				for _, id := range p.IDs {
+					if _, exists := nftDestroyIDs[id]; exists {
+						return errors.New("[PowCheckBlockSanity] block contains duplicate NFTDestroy id")
+					}
+					nftDestroyIDs[id] = struct{}{}
+				}
 			}
 		}
 	}
