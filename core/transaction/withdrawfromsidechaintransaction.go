@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 
@@ -99,6 +100,71 @@ func (t *WithdrawFromSideChainTransaction) CheckTransactionPayload() error {
 
 func (t *WithdrawFromSideChainTransaction) IsAllowedInPOWConsensus() bool {
 	return false
+}
+
+// HeightVersionCheck enforces SchnorrStartHeight as a real two-sided activation
+// gate for the WithdrawFromSideChain payload version.
+//
+// F-185: SchnorrStartHeight is documented as "the start height to support
+// schnorr withdraw transaction", but SpecialContextCheck only ever used it to
+// MANDATE V2 ABOVE the height -- nothing rejected a V2 payload BELOW it. So
+// checkWithdrawFromSideChainTransactionV2 was dispatched purely on
+// PayloadVersion==0x02 at ANY height, even though MainNet SchnorrStartHeight is
+// math.MaxUint32, i.e. the feature is configured OFF. That left the
+// aggregate-Schnorr group key live: checkSchnorrWithdrawFromSidechain builds it
+// as a PLAIN sum of the signers' NodePublicKeys, with no MuSig H(L)
+// coefficients and no proof-of-possession on NodePublicKey (F-189). An arbiter
+// who registers NodePublicKey = g^x - SUM(other signers' keys) makes the
+// aggregate equal g^x and can alone forge a full-threshold withdraw of the
+// cross-chain "X" custody UTXOs, naming honest arbiters' indexes without their
+// participation.
+//
+// Every other Schnorr feature in this tree gates on the reject side --
+// registerproducertransaction.go (ProducerSchnorrStartHeight),
+// registercrtransaction.go (CRSchnorrStartHeight), exchangevotes.go
+// (VotesSchnorrStartHeight), transactionchecker.go CheckAttributeProgram
+// (NormalSchnorrStartHeight). WithdrawFromSideChain V2 was the sole outlier.
+// Enforcing the declared gate makes the entire aggregate-Schnorr withdraw path
+// unreachable wherever the feature is configured off, instead of shipping a
+// protocol-breaking MuSig/PoP rewrite for a path that is meant to be dormant.
+//
+// PROVEN, not inferred: a full read-only census of the real frozen mainnet
+// chain (2,260,597 blocks, heights 0..2,260,595) found 3,295 V0 and 7,786 V1
+// WithdrawFromSideChain transactions and ZERO V2 -- and zero Schnorr program
+// codes in ANY transaction type, chain-wide. The production Arbiter emits V1,
+// so enforcing the gate removes no behaviour the chain has ever used.
+//
+// The unknown-version default-deny mirrors RegisterProducer / RegisterCR /
+// UpdateProducer (F-069). On MainNet it is redundant with the
+// checkTransactionCrossChainUTXO admit-list, which already refuses any
+// WithdrawFromSideChain payload version outside {0,1,2} from spending an "X"
+// output above CrossChainUTXOFreezeHeight; it is kept here so the rule does not
+// depend on that ordering.
+//
+// Gated at StrictMoneyRangeHeight (gate 1, the coordinated incident gate). No
+// third gate: replay of retained history at or below gate-1 stays bit-identical.
+func (t *WithdrawFromSideChainTransaction) HeightVersionCheck() error {
+	blockHeight := t.parameters.BlockHeight
+	chainParams := t.parameters.Config
+	if blockHeight < chainParams.StrictMoneyRangeHeight {
+		return nil
+	}
+
+	switch t.PayloadVersion() {
+	case payload.WithdrawFromSideChainVersion,
+		payload.WithdrawFromSideChainVersionV1:
+	case payload.WithdrawFromSideChainVersionV2:
+		if blockHeight < chainParams.SchnorrStartHeight {
+			return fmt.Errorf("not support %s transaction with payload "+
+				"version %d before SchnorrStartHeight", t.TxType().Name(),
+				t.PayloadVersion())
+		}
+	default:
+		return fmt.Errorf("unsupported %s transaction payload version %d",
+			t.TxType().Name(), t.PayloadVersion())
+	}
+
+	return nil
 }
 
 func (t *WithdrawFromSideChainTransaction) SpecialContextCheck() (elaerr.ELAError, bool) {
@@ -347,7 +413,25 @@ func checkSchnorrWithdrawFromSidechain(t interfaces.Transaction,
 			signerIndexes[index] = struct{}{}
 		}
 
-		px, py := crypto.Unmarshal(crypto.Curve, arbiters[index].NodePublicKey)
+		// F-185 (crash-harden, ungated): the index guard above only runs at or
+		// above CrossChainUTXORestrictionHeight (F-070). Outside that window an
+		// out-of-range Signers index panics on arbiters[index], and a
+		// NodePublicKey that crypto.Unmarshal cannot decode yields (nil, nil),
+		// which panics inside Curve.Add (nil big.Int receiver / invalid point).
+		// A panic is never an accepted block, so failing closed here cannot
+		// change any acceptance decision on any history -- same rationale as the
+		// F-050 Schnorr parameter-length harden. Left ungated for that reason.
+		if int(index) >= len(arbiters) {
+			return errors.New("schnorr withdraw signer index out of range")
+		}
+		nodePublicKey := arbiters[index].NodePublicKey
+		if len(nodePublicKey) != crypto.COMPRESSEDLEN {
+			return errors.New("invalid schnorr withdraw arbiter public key length")
+		}
+		px, py := crypto.Unmarshal(crypto.Curve, nodePublicKey)
+		if px == nil || py == nil || !crypto.Curve.IsOnCurve(px, py) {
+			return errors.New("invalid schnorr withdraw arbiter public key")
+		}
 		pxArr = append(pxArr, px)
 		pyArr = append(pyArr, py)
 	}
