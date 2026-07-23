@@ -776,9 +776,14 @@ func (p *ProposalDispatcher) tryEnterEmergencyState(signCount int) bool {
 		p.illegalMonitor.AddEvidence(payload)
 		p.cfg.Manager.AppendToTxnPool(p.currentInactiveArbitratorTx)
 
-		if err := p.cfg.Arbitrators.ProcessSpecialTxPayload(
+		// N-001: live gossip/consensus emergency, no connectBlock bracket, so this
+		// ForceChange must be permanent. Commit the savepoint UNCONDITIONALLY
+		// (also on the error early-return) before branching. See arbitrator.go.
+		err := p.cfg.Arbitrators.ProcessSpecialTxPayload(
 			p.currentInactiveArbitratorTx.Payload(),
-			blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
+			blockchain.DefaultLedger.Blockchain.GetHeight())
+		p.cfg.Arbitrators.CommitPendingSpecialTx()
+		if err != nil {
 			log.Error("[tryEnterEmergencyState] force change arbitrators"+
 				" error: ", err.Error())
 			return false

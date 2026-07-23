@@ -177,8 +177,20 @@ func (a *Arbitrator) OnInactiveArbitratorsTxReceived(
 		}
 
 		if isEmergencyCandidate {
-			if err := a.cfg.Arbitrators.ProcessSpecialTxPayload(p,
-				blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
+			// N-001: this is a live DPoS-gossip emergency with no connectBlock
+			// bracket, so its ForceChange must be permanent (the pre-e376150
+			// semantics). ProcessSpecialTxPayload opens a savepoint via
+			// markPendingSpecialTx; commit it here UNCONDITIONALLY -- including on
+			// the error early-return -- so a later failing connectBlock or
+			// Arbiters.RollbackTo can never silently reverse this emergency change.
+			// Mirrors the ProcessIllegalBlock/ProcessInactiveArbiter gossip
+			// precedent (blockchain.go:861/876). GATE: none (reorg-only-undo
+			// doctrine; the commit is a pointer-clear on the accepted path and the
+			// gossip handlers are not part of below-gate historical replay).
+			err := a.cfg.Arbitrators.ProcessSpecialTxPayload(p,
+				blockchain.DefaultLedger.Blockchain.GetHeight())
+			a.cfg.Arbitrators.CommitPendingSpecialTx()
+			if err != nil {
 				log.Error("[OnInactiveArbitratorsTxReceived] force change "+
 					"arbitrators error: ", err)
 				return

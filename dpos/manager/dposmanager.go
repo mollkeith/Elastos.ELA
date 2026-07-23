@@ -587,8 +587,15 @@ func (d *DPOSManager) OnBlockReceived(b *types.Block, confirmed bool) {
 	for _, tx := range b.Transactions {
 		if tx.IsInactiveArbitrators() {
 			p := tx.Payload().(*payload.InactiveArbitrators)
-			if err := d.arbitrators.ProcessSpecialTxPayload(p,
-				blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
+			// N-001: live gossip/consensus emergency, no connectBlock bracket.
+			// Commit each payload's savepoint UNCONDITIONALLY (also on the error
+			// early-return); committing inside the loop is correct because each
+			// payload's ForceChange is independently permanent, and it also closes
+			// the shared per-block savepoint before the next iteration.
+			err := d.arbitrators.ProcessSpecialTxPayload(p,
+				blockchain.DefaultLedger.Blockchain.GetHeight())
+			d.arbitrators.CommitPendingSpecialTx()
+			if err != nil {
 				log.Errorf("process special tx payload err: %s", err.Error())
 				return
 			}
@@ -656,6 +663,10 @@ func (d *DPOSManager) OnInactiveArbitratorsAccepted(p *payload.InactiveArbitrato
 		return
 	}
 	d.arbitrators.ProcessSpecialTxPayload(p, blockchain.DefaultLedger.Blockchain.GetHeight())
+	// N-001: live gossip/consensus emergency, no connectBlock bracket -- commit the
+	// savepoint so a later failing connectBlock or Arbiters.RollbackTo cannot reverse
+	// this ForceChange. (The return value is intentionally ignored, as before.)
+	d.arbitrators.CommitPendingSpecialTx()
 	d.clearInactiveData(p)
 }
 
