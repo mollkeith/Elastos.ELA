@@ -61,8 +61,14 @@ func (c *Checkpoint) OnReset() error {
 	}
 	c.initFromCommittee(committee)
 	c.committee.Recover(c)
+	// F-144: bind GetHistoryMember to the REAL, persistent committee (c.committee),
+	// not the throwaway local one. The local committee is discarded after
+	// initFromCommittee; its HistoryMembers map is never advanced by ProcessBlock and
+	// diverges from the real committee the moment changeCommittee reassigns
+	// c.committee.HistoryMembers, so a throwaway binding makes post-reset history-member
+	// lookups (returnDeposit at state.go:458) resolve against frozen/empty state.
 	c.committee.state.RegisterFunctions(&FunctionsConfig{
-		GetHistoryMember: committee.getHistoryMember,
+		GetHistoryMember: c.committee.getHistoryMember,
 	})
 	return nil
 }
@@ -81,8 +87,9 @@ func (c *Checkpoint) OnRollbackTo(height uint32) error {
 		}
 		c.initFromCommittee(committee)
 		c.committee.Recover(c)
+		// F-144: bind to the real committee (c.committee), not the throwaway local one.
 		c.committee.state.RegisterFunctions(&FunctionsConfig{
-			GetHistoryMember: committee.getHistoryMember,
+			GetHistoryMember: c.committee.getHistoryMember,
 		})
 		return nil
 	}
