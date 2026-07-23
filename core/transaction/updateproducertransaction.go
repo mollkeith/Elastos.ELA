@@ -56,6 +56,20 @@ func (t *UpdateProducerTransaction) HeightVersionCheck() error {
 		return errors.New(fmt.Sprintf("unsupported %s transaction payload version %d",
 			t.TxType().Name(), t.PayloadVersion()))
 	}
+	// F-026: RegisterProducer rejects ProducerInfoSchnorrVersion below
+	// ProducerSchnorrStartHeight (dormant on mainnet -- MaxUint32), but UpdateProducer
+	// enforced no such gate: the Schnorr producer version reached this path only
+	// bounded by the general NormalSchnorrStartHeight (1405000) from CheckAttributeProgram,
+	// so the dormant Schnorr producer re-key path leaked in via the update route. Mirror
+	// the register gate. Activated only at/above the coordinated-upgrade gate
+	// (StrictMoneyRangeHeight) so retained below-gate history replays byte-identically;
+	// reuses the campaign gate -- no third incident gate is introduced.
+	if blockHeight >= chainParams.StrictMoneyRangeHeight &&
+		t.PayloadVersion() == payload.ProducerInfoSchnorrVersion &&
+		blockHeight < chainParams.ProducerSchnorrStartHeight {
+		return errors.New(fmt.Sprintf("not support %s transaction "+
+			"before ProducerSchnorrStartHeight", t.TxType().Name()))
+	}
 	return nil
 }
 

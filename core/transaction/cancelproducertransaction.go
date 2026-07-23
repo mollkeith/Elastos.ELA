@@ -56,6 +56,19 @@ func (t *CancelProducerTransaction) HeightVersionCheck() error {
 		return errors.New(fmt.Sprintf("unsupported %s transaction payload version %d",
 			t.TxType().Name(), t.PayloadVersion()))
 	}
+	// F-026: RegisterProducer gates the Schnorr producer version on
+	// ProducerSchnorrStartHeight (dormant on mainnet -- MaxUint32), but CancelProducer
+	// enforced no such gate: the Schnorr process-producer version reached
+	// checkProcessProducer bounded only by the general NormalSchnorrStartHeight (1405000),
+	// leaking the dormant Schnorr cancel path via the cancel route. Mirror the register
+	// gate, activated only at/above StrictMoneyRangeHeight so retained below-gate history
+	// replays byte-identically; reuses the campaign gate -- no third incident gate.
+	if blockHeight >= chainParams.StrictMoneyRangeHeight &&
+		t.PayloadVersion() == payload.ProcessProducerSchnorrVersion &&
+		blockHeight < chainParams.ProducerSchnorrStartHeight {
+		return errors.New(fmt.Sprintf("not support %s transaction "+
+			"before ProducerSchnorrStartHeight", t.TxType().Name()))
+	}
 	return nil
 }
 
