@@ -154,15 +154,32 @@ func (t *UpdateProducerTransaction) SpecialContextCheck() (elaerr.ELAError, bool
 	//      distinct messages were legitimately re-submitted (up to 3x, months apart),
 	//      so P false-rejects honest A/B node failovers.
 	//   C. reject an already-applied (message||signature) credential: 0 measured
-	//      false rejects (961 credentials, 0 duplicates) but INEFFECTIVE -- crypto.
-	//      Verify calls ecdsa.Verify with no low-S canonicalisation, so (r, n-s)
-	//      verifies and hashes differently and walks straight past the blacklist
-	//      (sibling F-129; proven in f205_test.go). Canonicalising S first is itself
-	//      an ecosystem break -- 48.3% of all real mainnet program signatures
-	//      (1,487,608 of 3,077,730) and 22.9% of real producer payload credentials
-	//      are high-S -- and C additionally needs new unbounded per-producer
-	//      consensus state plus a fresh History/rollback surface.
-	// The only complete fix is D: domain-separate the payload signing message
+	//      false rejects (961 credentials, 0 duplicates) but INEFFECTIVE AS KEYED --
+	//      crypto.Verify calls ecdsa.Verify with no low-S canonicalisation, so
+	//      (r, n-s) verifies and hashes differently and walks straight past the
+	//      blacklist (sibling F-129; proven in f205_test.go). Canonicalising S first
+	//      is itself an ecosystem break -- 48.3% of all real mainnet program
+	//      signatures (1,487,608 of 3,077,730) and 22.9% of real producer payload
+	//      credentials are high-S.
+	//   C2. CORRECTION (F-205 adversarial audit; scanner left at /root/f205scan6).
+	//      C is defeated by S-malleation only because of HOW IT WAS KEYED. Keying the
+	//      blacklist on (message || r) instead of (message || full signature) is
+	//      immune: the malleation (r,s)->(r,n-s) preserves r, and producing a fresh r
+	//      for the same message requires the private key. Re-measured over the SAME
+	//      full 2,260,597-block history and across the WHOLE payload-signature class,
+	//      (message||r) has ZERO duplicates in every family -- UpdateProducer 961/0,
+	//      ActivateProducer 902/0, CancelProducer 117/0, UpdateCR 37/0 -- i.e. the
+	//      same zero false-reject rate as C, over only 2,017 digests in eight years,
+	//      so the "unbounded consensus state" objection does not hold either.
+	//      C2 is therefore an OPEN, un-refuted fix candidate. Unlike D it changes
+	//      nothing about what wallets sign, so the "gate 1 is already below the tip
+	//      so there is no upgrade window" argument does NOT rule it out. It is not
+	//      free: the digest set must be seeded by RECORDING (not enforcing) below the
+	//      gate so replay of retained history stays byte-identical, and it must be
+	//      carried in the DPoS/CR checkpoints and the History/rollback surface or
+	//      checkpoint-bootstrapped nodes will diverge from full-replay nodes. C2
+	//      stops verbatim credential reuse only; it is not domain separation.
+	// The most complete fix is D: domain-separate the payload signing message
 	// (network magic / genesis hash plus an anti-replay binding). D changes what
 	// EVERY wallet must sign. StrictMoneyRangeHeight is already below the tip, so a
 	// gate there activates on the first block of the recovery fork with no upgrade

@@ -271,6 +271,14 @@ func TestF205SigningMessageCarriesNoNetworkBinding(t *testing.T) {
 // attacker malleates the copied credential, its hash changes, and the
 // blacklist is walked straight past. (Sibling F-129, same root cause: the
 // signature encoding itself is not canonical.)
+//
+// SCOPE CORRECTION (F-205 adversarial audit): this kills the rule ONLY AS KEYED
+// on the full signature. Keying the same blacklist on (message || r) is immune,
+// because this very malleation preserves r. Measured over the full mainnet
+// history, (message||r) has zero duplicates in every payload-signature family
+// (UpdateProducer 961/0, ActivateProducer 902/0, CancelProducer 117/0, UpdateCR
+// 37/0), so it retains C's zero false-reject property. Do NOT read this test as
+// "no blacklist rule can work" -- see C2 in updateproducertransaction.go.
 func TestF205CredentialBlacklistIsDefeatedByMalleation(t *testing.T) {
 	priv, pub, err := crypto.GenerateKeyPair()
 	if err != nil {
