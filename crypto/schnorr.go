@@ -7,10 +7,10 @@ package crypto
 
 import (
 	"crypto/elliptic"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"math/big"
-	"math/rand"
 )
 
 var (
@@ -201,21 +201,40 @@ func AggregateSignatures(privateKeys []*big.Int, message [32]byte) ([64]byte, er
 	return sig, nil
 }
 
-func randomBytes(len int) []byte {
+// randomBytes returns len cryptographically secure random bytes.
+//
+// F-190 (sibling of F-059, same weak-randomness root-cause class): this drew
+// from math/rand, whose global source is explicitly re-seeded from wall-clock
+// time elsewhere in these binaries (p2p/server/server.go:1524,
+// dpos/p2p/server.go:1058, cmd/ela-cli.go:49), making its output predictable.
+// The bytes returned here are the only entropy behind the Schnorr signing
+// nonce k0, and a repeated or predictable nonce leaks the signing private key.
+// Only the signing side reaches this code; SchnorrVerify does not, so no
+// acceptance decision changes and no height gate is required.
+func randomBytes(len int) ([]byte, error) {
 	a := make([]byte, len)
-	rand.Read(a)
-	return a
+	if _, err := crand.Read(a); err != nil {
+		return nil, err
+	}
+	return a, nil
 }
 
+// deterministicGetK0 derives the Schnorr signing nonce k0 from the private key
+// and fresh CSPRNG entropy.
+//
+// TODO: the name is a misnomer inherited from the original code - this is a
+// randomized nonce, not an RFC 6979 / BIP-340 deterministic one. Renaming it
+// is out of scope for the F-059/F-190 patch.
 func deterministicGetK0(d []byte) (*big.Int, error) {
-	for {
-		message := randomBytes(32)
-		h := sha256.Sum256(append(d, message[:]...))
-		i := new(big.Int).SetBytes(h[:])
-		k0 := i.Mod(i, N)
-		if k0.Sign() == 0 {
-			return nil, errors.New("k0 is zero")
-		}
-		return k0, nil
+	message, err := randomBytes(32)
+	if err != nil {
+		return nil, err
 	}
+	h := sha256.Sum256(append(d, message[:]...))
+	i := new(big.Int).SetBytes(h[:])
+	k0 := i.Mod(i, N)
+	if k0.Sign() == 0 {
+		return nil, errors.New("k0 is zero")
+	}
+	return k0, nil
 }

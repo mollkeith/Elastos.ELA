@@ -7,14 +7,13 @@ package account
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"math/rand"
 	"os"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/core/contract"
@@ -199,13 +198,23 @@ func NewClient(path string, password []byte, create bool) *Client {
 		client.iv = make([]byte, 16)
 		client.masterKey = make([]byte, 32)
 
-		//generate random number for iv/masterkey
-		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		for i := 0; i < 16; i++ {
-			client.iv[i] = byte(r.Intn(256))
+		// F-059: the keystore IV and master key are long-lived secrets that
+		// protect every private key held in this store. They must come from
+		// the OS CSPRNG. The previous implementation drew both from a
+		// math/rand stream seeded with time.Now().UnixNano(); because the IV
+		// is written to the keystore in plaintext it acts as a 128-bit
+		// confirmation oracle for a wall-clock-bounded seed search, so the
+		// master key - and therefore every private key in the file - was
+		// recoverable from the keystore alone, with no password. This is
+		// local key custody only: it sits on no validation path and changes
+		// no acceptance decision, so it carries no height gate.
+		if _, err := crand.Read(client.iv); err != nil {
+			fmt.Println("error: failed to generate keystore iv:", err.Error())
+			return nil
 		}
-		for i := 0; i < 32; i++ {
-			client.masterKey[i] = byte(r.Intn(256))
+		if _, err := crand.Read(client.masterKey); err != nil {
+			fmt.Println("error: failed to generate keystore master key:", err.Error())
+			return nil
 		}
 
 		//new client store (build DB)
