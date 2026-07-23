@@ -935,7 +935,19 @@ func CheckInactiveArbitrators(txn interfaces.Transaction, blockHeight uint32) er
 }
 
 func checkArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint32) error {
+	// H (F-099 siblings): reachable pre-auth via the DPoS gossip handler
+	// (CheckRevertToDPOSTransaction / CheckInactiveArbitrators -> here, with NO SanityCheck /
+	// CheckAttributeProgram), so an empty Programs() or a <2-byte code would PANIC the
+	// receiving CRC arbiter (code[len-2]/code[0] index). Guard both. len(code) < 2 is the pure
+	// panic-guard (NOT MinMultiSignCodeLength, which preempts ParseMultisigScript's existing
+	// error path); ungated crash-harden -> below-gate byte-identical.
+	if len(txn.Programs()) == 0 {
+		return errors.New("no program in arbiter signature check")
+	}
 	code := txn.Programs()[0].Code
+	if len(code) < 2 {
+		return errors.New("invalid multi sign script code, length not enough")
+	}
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
@@ -1003,7 +1015,19 @@ func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction, blockHeight
 
 func checkCRCArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint32) error {
 
+	// H (F-099 siblings): reachable pre-auth via the DPoS gossip handler
+	// (CheckRevertToDPOSTransaction / CheckInactiveArbitrators -> here, with NO SanityCheck /
+	// CheckAttributeProgram), so an empty Programs() or a <2-byte code would PANIC the
+	// receiving CRC arbiter (code[len-2]/code[0] index). Guard both. len(code) < 2 is the pure
+	// panic-guard (NOT MinMultiSignCodeLength, which preempts ParseMultisigScript's existing
+	// error path); ungated crash-harden -> below-gate byte-identical.
+	if len(txn.Programs()) == 0 {
+		return errors.New("no program in arbiter signature check")
+	}
 	code := txn.Programs()[0].Code
+	if len(code) < 2 {
+		return errors.New("invalid multi sign script code, length not enough")
+	}
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
