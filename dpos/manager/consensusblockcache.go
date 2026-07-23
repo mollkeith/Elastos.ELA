@@ -35,7 +35,7 @@ func (c *ConsensusBlockCache) Reset(block *types.Block) {
 			continue
 		}
 		newConsensusBlocks[b.Hash()] = b
-		newConsensusBlockList = append(c.ConsensusBlockList, b.Hash())
+		newConsensusBlockList = append(newConsensusBlockList, b.Hash())
 	}
 	c.ConsensusBlocks = newConsensusBlocks
 	c.ConsensusBlockList = newConsensusBlockList
