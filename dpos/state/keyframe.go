@@ -6,6 +6,7 @@
 package state
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"math"
@@ -144,6 +145,11 @@ func (s *StateKeyFrame) snapshot() *StateKeyFrame {
 	state.IllegalProducers = copyProducerMap(s.IllegalProducers)
 	state.PendingCanceledProducers = copyProducerMap(s.PendingCanceledProducers)
 	state.DposV2EffectedProducers = copyProducerMap(s.DposV2EffectedProducers)
+	// KS-ALIAS-01: copyProducerMap allocates a fresh *Producer per map, so the two
+	// ALIAS INDEXES above would otherwise come out of a snapshot as detached
+	// duplicates of the producers held by the five owning state maps.  Re-point
+	// them; this adds and removes no key, so every len() is unchanged.
+	state.realignProducerAliases()
 	state.Votes = copyStringSet(s.Votes)
 
 	state.NFTIDInfoHashMap = copyUint256MapSet(s.NFTIDInfoHashMap)
@@ -411,6 +417,19 @@ func (s *StateKeyFrame) Deserialize(r io.Reader) (err error) {
 	}
 
 	s.ConsensusAlgorithm = ConsesusAlgorithm(consensusAlgorithm)
+
+	// KS-ALIAS-01: DeserializeProducerMap allocates a fresh *Producer for every map it
+	// reads, so a restored keyframe holds one detached copy of the same producer
+	// per map.  Replay then mutates only the producer owned by the five state
+	// maps and the two alias indexes silently rot into stale frozen duplicates,
+	// which is what made the persisted dpos keyframe restore-baseline dependent.
+	// Re-point them at the canonical objects.  Pure de-duplication: no key is
+	// added or removed, so len() - the only property any consensus path reads -
+	// is unchanged.
+	if unresolved := s.realignProducerAliases(); unresolved != 0 {
+		log.Warnf("[StateKeyFrame] %d producer alias index entries could not "+
+			"be re-pointed and were kept as-is", unresolved)
+	}
 
 	return
 }
@@ -995,7 +1014,102 @@ func NewRewardData() *RewardData {
 	}
 }
 
+// canonicalProducer returns the *Producer that the five OWNING state maps hold
+// under the given key.  Those five maps are disjoint by construction - a
+// producer has exactly one state and every transition pairs an insert with a
+// delete - so at most one of them can match.  The probe order mirrors
+// State.getProducerByOwnerPublicKey so that a re-pointed index entry is always
+// the very object the rest of the state machine resolves for that key.
+func (s *StateKeyFrame) canonicalProducer(key string) *Producer {
+	if p, ok := s.ActivityProducers[key]; ok {
+		return p
+	}
+	if p, ok := s.CanceledProducers[key]; ok {
+		return p
+	}
+	if p, ok := s.IllegalProducers[key]; ok {
+		return p
+	}
+	if p, ok := s.PendingProducers[key]; ok {
+		return p
+	}
+	if p, ok := s.InactiveProducers[key]; ok {
+		return p
+	}
+	return nil
+}
+
+// realignProducerIndex re-points every value of an alias index at the producer
+// the owning state maps hold under the same key.
+//
+// It is a pure de-duplication.  A value is either replaced by the canonical
+// object of the SAME producer identity (compared on the immutable owner key,
+// not on the map key, so a mis-keyed entry can never be silently re-bound to a
+// different producer), or left exactly as it was.  Keys are never added and
+// never removed, therefore len(index) is unchanged by construction.
+//
+// Entries that cannot be resolved - no producer under that key, or a producer
+// with a different owner key - are deliberately KEPT.  Dropping them would
+// change len(), and len(DposV2EffectedProducers) feeds isDposV2Active(), which
+// is consensus-visible.  Retaining them reproduces exactly what a node that
+// never restored would hold.  The count of such entries is returned so the
+// restore path can report it.
+func (s *StateKeyFrame) realignProducerIndex(
+	index map[string]*Producer) (unresolved int) {
+	// Assigning to already-present keys while ranging the same map is defined
+	// behaviour in Go; no key is inserted or deleted here.
+	for k, v := range index {
+		owner := s.canonicalProducer(k)
+		if v == nil || owner == nil ||
+			!bytes.Equal(owner.info.OwnerKey, v.info.OwnerKey) {
+			unresolved++
+			continue
+		}
+		index[k] = owner
+	}
+	return
+}
+
+// realignProducerAliases restores the pointer-aliasing invariant of the two
+// producer ALIAS INDEXES held by StateKeyFrame.
+//
+// DposV2EffectedProducers (state.go:1677, 2223) and PendingCanceledProducers
+// (state.go:1485, 1991) are additional indexes: they are populated with the
+// LIVE pointer already held by one of the five owning state maps, and they are
+// removed by key only.  At runtime the entries therefore alias the owning
+// object.  Both persistence primitives destroy that aliasing:
+//
+//   - DeserializeProducerMap allocates `producer := &Producer{}` fresh for each
+//     of the seven maps it reads (restore path);
+//   - copyProducerMap does `p := *v` fresh for each of the seven maps it copies
+//     (snapshot path).
+//
+// After either, mutating the producer - which replay only ever does through the
+// owning state map - no longer reaches the index entry, so the index freezes at
+// its restore/snapshot value while the real producer moves on.  That is the
+// mechanism behind the observed restore-baseline dependence of the serialized
+// dpos keyframe (drift confined to DposV2EffectedProducers, key set invariant).
+//
+// Calling this at the end of Deserialize and of snapshot() closes both paths.
+func (s *StateKeyFrame) realignProducerAliases() (unresolved int) {
+	unresolved += s.realignProducerIndex(s.DposV2EffectedProducers)
+	unresolved += s.realignProducerIndex(s.PendingCanceledProducers)
+	return
+}
+
 // copyProducerMap copy the src map's key, value pairs into dst map.
+//
+// NOTE (deliberate, documented, NOT changed by KS-ALIAS-01): `p := *v` is a SHALLOW
+// struct copy, so the copied producer keeps the *same* detailedDPoSV2Votes and
+// expiredNFTVotes map headers as the source producer.  A snapshot producer is
+// therefore frozen in its scalars but live in those two inner maps.  That is a
+// separate defect from the alias-index defect fixed here and it is deliberately
+// left alone: deep-copying two nested maps for every producer on every
+// SnapshotByHeight is a hot-path cost, and the only consumers of the snapshot
+// ring (blockchain/confirmvalidator.go:263,361 and the illegal-vote/illegal-
+// proposal checkers) read CurrentArbitrators[i].GetNodePublicKey() and nothing
+// from StateKeyFrame, while the persisted .dcp is built by
+// CheckPoint.initFromArbitrators from the LIVE keyframe, not from snapshot().
 func copyProducerMap(src map[string]*Producer) (dst map[string]*Producer) {
 	dst = map[string]*Producer{}
 	for k, v := range src {
