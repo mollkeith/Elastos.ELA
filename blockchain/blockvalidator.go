@@ -297,6 +297,7 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	nftDestroyIDs := make(map[Uint256]struct{})          // F-118: mempool slotNFTDestroyFromSideChainHash
 	producerCRKeys := make(map[string]struct{})          // F-100: mempool slotDPoSOwnerPublicKey/slotDPoSNodePublicKey (producer/CR overlap)
 	claimNodeDIDs := make(map[Uint168]struct{})          // F-083: mempool slotCRCouncilMemberDID
+	specialTxHashes := make(map[Uint256]struct{})        // F-030 closeout: mempool slotSpecialTxHash (illegal-evidence / inactive-arbitrators)
 	for _, txn := range block.Transactions {
 		switch txn.TxType() {
 		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
@@ -492,6 +493,36 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				return errors.New("[PowCheckBlockSanity] block contains conflicting producer/CR public key")
 			}
 			producerCRKeys[key] = struct{}{}
+		case common.IllegalProposalEvidence, common.IllegalVoteEvidence,
+			common.IllegalBlockEvidence, common.IllegalSidechainEvidence,
+			common.InactiveArbitrators:
+			// F-030 closeout (Track A): mirror mempool slotSpecialTxHash for the
+			// illegal-evidence / inactive-arbitrators special txs. The committed-state dedup
+			// GetState().SpecialTxExists reads pre-block state, so it never sees an earlier
+			// same-block evidence tx; CheckDuplicateTx keys on the full tx hash, which two
+			// AuxPow re-encodings of ONE logical illegal block (F-030) -- or any two txs
+			// wrapping one logical evidence payload with differing tx-level bytes -- do not
+			// share; and this switch had no illegal-evidence arm. So both txs pass and
+			// processIllegalEvidence / processEmergencyInactiveArbitrators runs twice,
+			// applying the illegal penalty twice (bounded by block size, deterministic and
+			// non-forking, but a genuine double-penalty on a guilty double-signer). Key by the
+			// SAME AuxPow-independent logical identity the committed dedup now uses
+			// (payload.SpecialTxDedupKey at StrictMoneyRangeHeight == gate) so the two
+			// encodings collide within the block. Reject the second. The mempool slot the
+			// guard mirrors (slotSpecialTxHash) covers all five special-tx types, so all five
+			// share this arm. Residual: evidence whose OWN BlockHeight is below the gate but
+			// included above it stays raw-keyed (AuxPow-malleable), matching SpecialTxExists /
+			// recordSpecialTx exactly -- read and write must agree, so the guard must not
+			// re-key independently; see the commit note.
+			illegalData, ok := txn.Payload().(payload.DPOSIllegalData)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid illegal-evidence special tx payload")
+			}
+			key := payload.SpecialTxDedupKey(illegalData, gate)
+			if _, exists := specialTxHashes[key]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains duplicate illegal-evidence special tx")
+			}
+			specialTxHashes[key] = struct{}{}
 		}
 	}
 	return nil
