@@ -505,6 +505,16 @@ func (a *Arbiters) ProcessSpecialTxPayload(p interfaces.Payload,
 
 func (a *Arbiters) RollbackSeekTo(height uint32) {
 	a.mtx.Lock()
+	// #2 (F-093 residual): History.commits is incremented by Commit and decremented
+	// ONLY by UndoTo; History.RollbackSeekTo pops change groups WITHOUT decrementing
+	// commits. An outstanding special-tx savepoint (captured at commits=C) that
+	// survived a seek would then let a later UndoTo's `h.commits > sp.commits` loop
+	// over-pop groups that predate the savepoint, double-rolling-back committed state
+	// below it. Reverse and clear any pending emergency change FIRST -- exactly as
+	// RollbackTo:518 already does -- so no savepoint can outlive a seek. No-op on the
+	// accepted path (pendingSpecialTx == nil). GATE: none (reorg/seek-only path;
+	// mirrors the ungated undoPendingSpecialTx in RollbackTo).
+	a.undoPendingSpecialTx()
 	a.History.RollbackSeekTo(height)
 	a.State.RollbackSeekTo(height)
 	a.mtx.Unlock()
