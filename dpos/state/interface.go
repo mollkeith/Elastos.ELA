@@ -22,6 +22,10 @@ type Arbitrators interface {
 	// rejected arbiter set.
 	CommitPendingSpecialTx()
 	UndoPendingSpecialTx()
+	// LockSpecialTx / UnlockSpecialTx (#4) serialize the whole special-tx bracket
+	// against every other one; the bracket boundaries hold them, not RollbackTo.
+	LockSpecialTx()
+	UnlockSpecialTx()
 	CheckCRCAppropriationTx(block *types.Block) error
 	CheckNextTurnDPOSInfoTx(block *types.Block) error
 	CheckCustomIDResultsTx(block *types.Block) error

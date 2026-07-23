@@ -852,6 +852,9 @@ func (b *BlockChain) ProcessIllegalBlock(payload *payload.DPOSIllegalBlocks) {
 		log.Info("received inactive tx when synchronizing")
 		return
 	}
+	// #4: hold specialTxMtx across the whole gossip bracket so it cannot interleave
+	// with a concurrent block-connect or reorg-detach bracket.
+	DefaultLedger.Arbitrators.LockSpecialTx()
 	if err := DefaultLedger.Arbitrators.ProcessSpecialTxPayload(payload,
 		b.BestChain.Height); err != nil {
 		log.Error("process illegal block error: ", err)
@@ -859,6 +862,7 @@ func (b *BlockChain) ProcessIllegalBlock(payload *payload.DPOSIllegalBlocks) {
 	// F-093: the gossip path is not bracketed by a block connect -- its emergency
 	// change is permanent, exactly as it was before the fix.
 	DefaultLedger.Arbitrators.CommitPendingSpecialTx()
+	DefaultLedger.Arbitrators.UnlockSpecialTx()
 }
 
 func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators) {
@@ -867,6 +871,9 @@ func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators
 		log.Info("received inactive tx when synchronizing")
 		return
 	}
+	// #4: hold specialTxMtx across the whole gossip bracket so it cannot interleave
+	// with a concurrent block-connect or reorg-detach bracket.
+	DefaultLedger.Arbitrators.LockSpecialTx()
 	if err := DefaultLedger.Arbitrators.ProcessSpecialTxPayload(payload,
 		b.BestChain.Height); err != nil {
 		log.Error("process illegal block error: ", err)
@@ -874,6 +881,7 @@ func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators
 	// F-093: the gossip path is not bracketed by a block connect -- its emergency
 	// change is permanent, exactly as it was before the fix.
 	DefaultLedger.Arbitrators.CommitPendingSpecialTx()
+	DefaultLedger.Arbitrators.UnlockSpecialTx()
 }
 
 type OrphanBlock struct {
@@ -1404,8 +1412,15 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		// roll back state about the last block before disconnect
 		if !recoverFromDefault &&
 			block.Height-1 >= b.chainParams.VoteStartHeight {
+			// #4: serialize this standalone reorg-detach rollback -- which reaches
+			// Arbiters.RollbackTo -> undoPendingSpecialTx -- against any concurrent
+			// gossip emergency bracket. It runs under b.mutex and is NOT nested in a
+			// connectBlock bracket (detach precedes the attach/connectBlock loop), and
+			// RollbackTo does not re-acquire specialTxMtx, so there is no deadlock.
+			DefaultLedger.Arbitrators.LockSpecialTx()
 			err = b.CkpManager.OnRollbackTo(
 				block.Height-1, b.state.ConsensusAlgorithm == state.POW)
+			DefaultLedger.Arbitrators.UnlockSpecialTx()
 			if err != nil {
 				return err
 			}
@@ -1528,12 +1543,20 @@ func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payloa
 	// Fail-path only -- a block that connects takes the commit branch, which is the
 	// pristine behaviour. Blocks in the retained history all connect, so replay is
 	// bit-identical and the change needs no height gate.
+	// #4: hold specialTxMtx across the WHOLE bracket (mark in PreProcessSpecialTx ->
+	// commit/undo in the defer), so no concurrent DPoS-gossip emergency can mark or
+	// commit its own savepoint into this open bracket. The confirm-failure path
+	// below reaches Arbiters.RollbackTo (checkBlockWithConfirmation -> OnRollbackTo),
+	// which intentionally does NOT re-acquire specialTxMtx, so there is no
+	// self-deadlock. Released at the very end of the deferred commit/undo.
+	DefaultLedger.Arbitrators.LockSpecialTx()
 	defer func() {
 		if err != nil {
 			DefaultLedger.Arbitrators.UndoPendingSpecialTx()
-			return
+		} else {
+			DefaultLedger.Arbitrators.CommitPendingSpecialTx()
 		}
-		DefaultLedger.Arbitrators.CommitPendingSpecialTx()
+		DefaultLedger.Arbitrators.UnlockSpecialTx()
 	}()
 	if err := PreProcessSpecialTx(block); err != nil {
 		return err

@@ -79,9 +79,21 @@ type Arbiters struct {
 	getBlockByHeight func(uint32) (*types.Block, error)
 	CkpManager       *checkpoint.Manager
 
-	mtx       sync.Mutex
-	started   bool
-	DutyIndex int
+	mtx sync.Mutex
+	// #4: specialTxMtx serializes the whole emergency special-tx bracket
+	// (markPendingSpecialTx -> mutate ForceChange -> Commit/UndoPendingSpecialTx)
+	// against every OTHER such bracket, so the block-connect goroutine (under
+	// blockchain b.mutex) and the DPoS-gossip goroutines (which take only a.mtx)
+	// can never interleave a mark/commit/undo. It is acquired OUTSIDE a.mtx by the
+	// bracket BOUNDARIES (connectBlock, the InitCheckpoint replay, the gossip
+	// callers and the standalone reorg-detach rollback), NOT inside RollbackTo /
+	// RollbackSeekTo -- connectBlock's confirm-failure path calls RollbackTo while
+	// already holding specialTxMtx, so re-acquiring there would self-deadlock.
+	// Lock order is [b.mutex ->] specialTxMtx -> a.mtx (a.mtx/b.IndexLock are the
+	// only locks taken while holding it), so there is no inversion.
+	specialTxMtx sync.Mutex
+	started      bool
+	DutyIndex    int
 
 	CurrentReward RewardData
 	NextReward    RewardData
@@ -252,6 +264,16 @@ func (a *Arbiters) CommitPendingSpecialTx() {
 	a.pendingSpecialTx = nil
 	a.mtx.Unlock()
 }
+
+// LockSpecialTx / UnlockSpecialTx (#4) are held by the bracket BOUNDARIES around
+// the whole mark -> mutate -> commit/undo sequence so no two special-tx brackets
+// (block-connect vs DPoS-gossip vs standalone reorg rollback) can interleave.
+// They wrap the a.mtx-guarded savepoint methods, acquired outside a.mtx; they are
+// deliberately NOT taken inside RollbackTo/RollbackSeekTo, whose undoPendingSpecialTx
+// runs either under connectBlock's already-held specialTxMtx or under the reorg
+// caller's, so re-acquiring would self-deadlock.
+func (a *Arbiters) LockSpecialTx()   { a.specialTxMtx.Lock() }
+func (a *Arbiters) UnlockSpecialTx() { a.specialTxMtx.Unlock() }
 
 // UndoPendingSpecialTx reverses the emergency ForceChange applied by
 // ProcessSpecialTxPayload for a block that failed to connect. It is a no-op for the

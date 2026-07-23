@@ -187,9 +187,12 @@ func (a *Arbitrator) OnInactiveArbitratorsTxReceived(
 			// precedent (blockchain.go:861/876). GATE: none (reorg-only-undo
 			// doctrine; the commit is a pointer-clear on the accepted path and the
 			// gossip handlers are not part of below-gate historical replay).
+			// #4: hold specialTxMtx across the whole gossip bracket.
+			a.cfg.Arbitrators.LockSpecialTx()
 			err := a.cfg.Arbitrators.ProcessSpecialTxPayload(p,
 				blockchain.DefaultLedger.Blockchain.GetHeight())
 			a.cfg.Arbitrators.CommitPendingSpecialTx()
+			a.cfg.Arbitrators.UnlockSpecialTx()
 			if err != nil {
 				log.Error("[OnInactiveArbitratorsTxReceived] force change "+
 					"arbitrators error: ", err)

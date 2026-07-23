@@ -779,10 +779,13 @@ func (p *ProposalDispatcher) tryEnterEmergencyState(signCount int) bool {
 		// N-001: live gossip/consensus emergency, no connectBlock bracket, so this
 		// ForceChange must be permanent. Commit the savepoint UNCONDITIONALLY
 		// (also on the error early-return) before branching. See arbitrator.go.
+		// #4: hold specialTxMtx across the whole gossip bracket.
+		p.cfg.Arbitrators.LockSpecialTx()
 		err := p.cfg.Arbitrators.ProcessSpecialTxPayload(
 			p.currentInactiveArbitratorTx.Payload(),
 			blockchain.DefaultLedger.Blockchain.GetHeight())
 		p.cfg.Arbitrators.CommitPendingSpecialTx()
+		p.cfg.Arbitrators.UnlockSpecialTx()
 		if err != nil {
 			log.Error("[tryEnterEmergencyState] force change arbitrators"+
 				" error: ", err.Error())
