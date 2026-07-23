@@ -445,7 +445,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 		Evidence:        *evidence,
 		CompareEvidence: *evidence,
 	}
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"blocks can not be same")
 
 	header2 := randomBlockHeader()
@@ -465,7 +465,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 		illegalBlocks.Evidence = *evidence
 		illegalBlocks.CompareEvidence = *cmpEvidence
 	}
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"evidence order error")
 
 	illegalBlocks.CoinType = payload.CoinType(1) //
@@ -476,16 +476,16 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 		illegalBlocks.Evidence = *cmpEvidence
 		illegalBlocks.CompareEvidence = *evidence
 	}
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"unknown coin type")
 
 	illegalBlocks.CoinType = payload.ELACoin
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"block header height should be same")
 
 	// compare evidence height is different from illegal block height
 	illegalBlocks.BlockHeight = header.Height
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"block header height should be same")
 
 	header2.Height = header.Height
@@ -501,7 +501,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 		illegalBlocks.Evidence = *cmpEvidence
 		illegalBlocks.CompareEvidence = *evidence
 	}
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"EOF")
 
 	// fill confirms of evidences
@@ -528,7 +528,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 		cmpConfirm.Proposal.Data())
 	s.updateIllegaBlocks(confirm, evidence, cmpConfirm, cmpEvidence, asc,
 		illegalBlocks)
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"[IllegalConfirmContextCheck] signers less than majority count")
 
 	// fill votes of confirms
@@ -552,7 +552,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 	}
 	s.updateIllegaBlocks(confirm, evidence, cmpConfirm, cmpEvidence, asc,
 		illegalBlocks)
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"confirm view offset should be same")
 
 	// correct view offset
@@ -575,7 +575,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 	}
 	s.updateIllegaBlocks(confirm, evidence, cmpConfirm, cmpEvidence, asc,
 		illegalBlocks)
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"block and related confirm do not match")
 
 	// correct block hash corresponding to header hash
@@ -598,7 +598,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 	}
 	s.updateIllegaBlocks(confirm, evidence, cmpConfirm, cmpEvidence, asc,
 		illegalBlocks)
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"signers count it not match the count of confirm votes")
 
 	// fill the same signers to evidences
@@ -608,7 +608,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 	}
 	s.updateIllegaBlocks(confirm, evidence, cmpConfirm, cmpEvidence, asc,
 		illegalBlocks)
-	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks),
+	s.EqualError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false),
 		"signers and confirm votes do not match")
 
 	// correct signers of compare evidence
@@ -619,7 +619,7 @@ func (s *txValidatorSpecialTxTestSuite) TestCheckDPOSIllegalBlocks() {
 	cmpEvidence.Signers = signers
 	s.updateIllegaBlocks(confirm, evidence, cmpConfirm, cmpEvidence, asc,
 		illegalBlocks)
-	s.NoError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks))
+	s.NoError(blockchain.CheckDPOSIllegalBlocks(illegalBlocks, false))
 }
 
 func (s *txValidatorSpecialTxTestSuite) TestCheckSidechainIllegalEvidence() {

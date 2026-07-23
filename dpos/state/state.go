@@ -1237,7 +1237,11 @@ func (s *State) SpecialTxExists(tx interfaces.Transaction) bool {
 		return false
 	}
 
-	hash := illegalData.Hash()
+	// F-030: illegal-block evidence at/above StrictMoneyRangeHeight is keyed by its
+	// LOGICAL block identity (AuxPow-independent) so two AuxPow encodings of one logical
+	// block collapse to a single dedup key; every other special-tx type and below-gate
+	// blocks keep the raw payload hash for byte-identical historical replay.
+	hash := payload.SpecialTxDedupKey(illegalData, s.ChainParams.StrictMoneyRangeHeight)
 	s.mtx.RLock()
 	_, ok = s.SpecialTxHashes[hash]
 	s.mtx.RUnlock()
@@ -1802,21 +1806,31 @@ func (s *State) processTransaction(tx interfaces.Transaction, height uint32) {
 		common2.IllegalBlockEvidence, common2.IllegalSidechainEvidence:
 		s.processIllegalEvidence(tx.Payload(), height)
 
-		payloadHash, err := tx.GetSpecialTxHash()
-		if err != nil {
-			log.Error(err.Error())
+		illegalData, ok := tx.Payload().(payload.DPOSIllegalData)
+		if !ok {
+			log.Error("special tx payload cast failed")
 			return
 		}
+		// F-030: fold the illegal-block evidence dedup key by the LOGICAL block identity
+		// (AuxPow-independent) at/above StrictMoneyRangeHeight; other illegal types and
+		// below-gate blocks keep the raw payload hash (byte-identical below-gate replay).
+		payloadHash := payload.SpecialTxDedupKey(illegalData,
+			s.ChainParams.StrictMoneyRangeHeight)
 		s.recordSpecialTx(payloadHash, height)
 
 	case common2.InactiveArbitrators:
 		s.processEmergencyInactiveArbitrators(
 			tx.Payload().(*payload.InactiveArbitrators), height)
-		payloadHash, err := tx.GetSpecialTxHash()
-		if err != nil {
-			log.Error(err.Error())
+		illegalData, ok := tx.Payload().(payload.DPOSIllegalData)
+		if !ok {
+			log.Error("special tx payload cast failed")
 			return
 		}
+		// F-030: fold the illegal-block evidence dedup key by the LOGICAL block identity
+		// (AuxPow-independent) at/above StrictMoneyRangeHeight; other illegal types and
+		// below-gate blocks keep the raw payload hash (byte-identical below-gate replay).
+		payloadHash := payload.SpecialTxDedupKey(illegalData,
+			s.ChainParams.StrictMoneyRangeHeight)
 		s.recordSpecialTx(payloadHash, height)
 
 	case common2.ReturnDepositCoin:

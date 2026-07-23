@@ -69,7 +69,9 @@ func (t *IllegalBlockTransaction) SpecialContextCheck() (elaerr.ELAError, bool) 
 		return elaerr.Simple(elaerr.ErrTxDuplicate, errors.New("tx already exists")), true
 	}
 
-	if err := blockchain.CheckDPOSIllegalBlocks(p); err != nil {
+	strictActive := t.parameters.BlockChain.IllegalEvidenceStrictActive(
+		t.parameters.BlockHeight)
+	if err := blockchain.CheckDPOSIllegalBlocks(p, strictActive); err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
 	}
 

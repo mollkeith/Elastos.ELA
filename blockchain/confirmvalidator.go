@@ -46,7 +46,8 @@ func ConfirmSanityCheck(confirm *payload.Confirm) error {
 	return nil
 }
 
-func IllegalConfirmContextCheck(confirm *payload.Confirm) error {
+func IllegalConfirmContextCheck(confirm *payload.Confirm, blockHeight uint32,
+	strictActive bool) error {
 	signers := make(map[string]struct{})
 	for _, vote := range confirm.Votes {
 		if !vote.Accept {
@@ -58,6 +59,30 @@ func IllegalConfirmContextCheck(confirm *payload.Confirm) error {
 	if len(signers) <= DefaultLedger.Arbitrators.GetArbitersMajorityCount() {
 		return errors.New("[IllegalConfirmContextCheck] signers less than " +
 			"majority count")
+	}
+
+	// F-082: at and above the coordinated StrictMoneyRangeHeight activation, validate
+	// the confirm sponsor and every vote signer against the DPoS arbiter set on duty
+	// at the evidenced height -- the correct voter universe, matching sibling
+	// illegal-proposal/vote evidence (which use ProposalContextCheckByHeight /
+	// VoteContextCheckByHeight). The legacy GetAllProducersPublicKey universe below
+	// admits signatures from any producer that ever registered -- not just the round's
+	// arbiters -- so off-duty producers could be counted toward the majority to
+	// fabricate evidence. Below the gate the legacy universe is kept so historical
+	// evidence replays byte-identically.
+	if strictActive {
+		if err := ProposalContextCheckByHeight(&confirm.Proposal,
+			blockHeight); err != nil {
+			return errors.New("[IllegalConfirmContextCheck] confirm contain invalid " +
+				"proposal: " + err.Error())
+		}
+		for _, vote := range confirm.Votes {
+			if err := VoteContextCheckByHeight(&vote, blockHeight); err != nil {
+				return errors.New("[IllegalConfirmContextCheck] confirm contain " +
+					"invalid vote: " + err.Error())
+			}
+		}
+		return nil
 	}
 
 	if err := IllegalProposalContextCheck(&confirm.Proposal); err != nil {

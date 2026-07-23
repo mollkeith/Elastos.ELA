@@ -644,7 +644,9 @@ func (d *DPOSManager) OnIllegalBlocksTxReceived(i *payload.DPOSIllegalBlocks) {
 	if !d.isCurrentArbiter() {
 		return
 	}
-	if err := blockchain.CheckDPOSIllegalBlocks(i); err != nil {
+	strictActive := blockchain.DefaultLedger.Blockchain.IllegalEvidenceStrictActive(
+		blockchain.DefaultLedger.Blockchain.GetHeight())
+	if err := blockchain.CheckDPOSIllegalBlocks(i, strictActive); err != nil {
 		log.Info("[OnIllegalProposalReceived] received error evidence: ", err)
 		return
 	}

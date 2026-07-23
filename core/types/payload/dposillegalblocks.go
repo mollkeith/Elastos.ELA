@@ -11,6 +11,7 @@ import (
 	"io"
 
 	"github.com/elastos/Elastos.ELA/common"
+	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/crypto"
 	"github.com/elastos/Elastos.ELA/elanet/pact"
 )
@@ -240,4 +241,69 @@ func (d *DPOSIllegalBlocks) GetBlockHeight() uint32 {
 
 func (d *DPOSIllegalBlocks) Type() IllegalDataType {
 	return IllegalBlock
+}
+
+// DedupHash returns the SpecialTxHashes dedup key for this illegal-block evidence.
+//
+// F-030: the legacy Hash() folds the RAW evidence-header bytes, but a block header's
+// consensus identity common2.Header.Hash() is SerializeNoAux -- it EXCLUDES the AuxPow
+// (and the trailing sentinel byte). The illegal-block validation path never calls
+// AuxPow.Check(), and even the canonical-AuxPow gate (AuxPow.IsCanonical) pins only two
+// of the AuxPow fields, so the remaining sub-fields (AuxMerkleBranch, ParBlockHeader,
+// ParCoinbaseTx, ParCoinBaseMerkle, AuxMerkleIndex) round-trip through
+// Serialize/Deserialize: an attacker can re-encode ONE logical illegal block into
+// unboundedly many raw byte strings, each with a distinct Hash(), bypassing the
+// SpecialTxExists dedup set.
+//
+// When strictActive (evidence at/above StrictMoneyRangeHeight) this folds each evidence
+// header by its LOGICAL identity (Header.Hash()) and canonically orders the two hashes,
+// so every AuxPow encoding of one logical illegal block -- and any reordering of the
+// evidence pair -- collapses to a SINGLE key. When !strictActive it returns the legacy
+// raw Hash() unchanged so below-gate history serializes byte-identically. If either
+// header fails to decode it falls back to the raw Hash() (a non-decodable header is
+// rejected upstream anyway).
+func (d *DPOSIllegalBlocks) DedupHash(strictActive bool) common.Uint256 {
+	if !strictActive {
+		return d.Hash()
+	}
+	h1, err1 := logicalHeaderHash(d.Evidence.Header)
+	h2, err2 := logicalHeaderHash(d.CompareEvidence.Header)
+	if err1 != nil || err2 != nil {
+		return d.Hash()
+	}
+	// Canonical order, independent of the payload's raw-bytes evidence ordering.
+	lo, hi := h1, h2
+	if bytes.Compare(lo[:], hi[:]) > 0 {
+		lo, hi = hi, lo
+	}
+	buf := new(bytes.Buffer)
+	_ = common.WriteUint32(buf, uint32(d.CoinType))
+	_ = common.WriteUint32(buf, d.BlockHeight)
+	_ = lo.Serialize(buf)
+	_ = hi.Serialize(buf)
+	return common.Hash(buf.Bytes())
+}
+
+// logicalHeaderHash decodes a raw evidence-header byte string and returns its logical
+// block identity (common2.Header.Hash() == SerializeNoAux, which excludes the AuxPow).
+func logicalHeaderHash(raw []byte) (common.Uint256, error) {
+	var hdr common2.Header
+	if err := hdr.Deserialize(bytes.NewReader(raw)); err != nil {
+		return common.Uint256{}, err
+	}
+	return hdr.Hash(), nil
+}
+
+// SpecialTxDedupKey returns the SpecialTxHashes dedup key for any DPOSIllegalData
+// payload, given the coordinated StrictMoneyRangeHeight gate. IllegalBlock evidence gets
+// the AuxPow-independent logical key at/above the gate (F-030); every other illegal-data
+// type, and below-gate blocks, keep the legacy raw payload Hash() so below-gate history
+// serializes byte-identically. The gate is read from the evidence's own BlockHeight so
+// the read (SpecialTxExists) and write (recordSpecialTx) paths always agree without
+// threading an external height.
+func SpecialTxDedupKey(d DPOSIllegalData, gateHeight uint32) common.Uint256 {
+	if blk, ok := d.(*DPOSIllegalBlocks); ok {
+		return blk.DedupHash(blk.BlockHeight >= gateHeight)
+	}
+	return d.Hash()
 }

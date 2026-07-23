@@ -1153,7 +1153,7 @@ func CheckDPOSIllegalVotes(d *payload.DPOSIllegalVotes) error {
 	return nil
 }
 
-func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks) error {
+func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks, strictActive bool) error {
 
 	if d.Evidence.BlockHash().IsEqual(d.CompareEvidence.BlockHash()) {
 		return errors.New("blocks can not be same")
@@ -1174,11 +1174,12 @@ func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks) error {
 		}
 
 		if confirm, compareConfirm, err = checkDPOSElaIllegalBlockConfirms(
-			d, header, compareHeader); err != nil {
+			d, header, compareHeader, strictActive); err != nil {
 			return err
 		}
 
-		if err := checkDPOSElaIllegalBlockSigners(d, confirm, compareConfirm); err != nil {
+		if err := checkDPOSElaIllegalBlockSigners(d, confirm, compareConfirm,
+			strictActive); err != nil {
 			return err
 		}
 	} else {
@@ -1190,7 +1191,7 @@ func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks) error {
 
 func checkDPOSElaIllegalBlockSigners(
 	d *payload.DPOSIllegalBlocks, confirm *payload.Confirm,
-	compareConfirm *payload.Confirm) error {
+	compareConfirm *payload.Confirm, strictActive bool) error {
 
 	signers := d.Evidence.Signers
 	compareSigners := d.CompareEvidence.Signers
@@ -1234,11 +1235,53 @@ func checkDPOSElaIllegalBlockSigners(
 		}
 	}
 
+	// F-029: at and above the coordinated StrictMoneyRangeHeight activation, bind the
+	// evidence Signers to the confirm's vote-signer set exactly -- reject duplicates and
+	// require set-equality. Without this the count-plus-forward-subset checks above admit
+	// a padded list (e.g. Signers=[A,A,C,D] against votes {A,B,C,D}): same count, still a
+	// subset, but not the real set -- letting the submitter steer processIllegalEvidence's
+	// punished-set intersection and shield a colluding double-signer. Below the gate the
+	// legacy checks are kept so historical evidence replays byte-identically.
+	if strictActive {
+		if err := checkIllegalSignerSetEquality(signers, confirmSigners); err != nil {
+			return err
+		}
+		if err := checkIllegalSignerSetEquality(compareSigners,
+			compareConfirmSigners); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// checkIllegalSignerSetEquality requires the evidence signer slice to be duplicate-free
+// and to cover exactly the confirm's (deduplicated) vote-signer set. Combined with the
+// caller's existing count and forward-subset checks this pins Signers to the real confirm
+// voters (F-029).
+func checkIllegalSignerSetEquality(signers [][]byte,
+	confirmSigners map[string]interface{}) error {
+	uniqueSigners := make(map[string]struct{}, len(signers))
+	for _, v := range signers {
+		key := common.BytesToHexString(v)
+		if _, dup := uniqueSigners[key]; dup {
+			return errors.New("duplicate signer within evidence")
+		}
+		uniqueSigners[key] = struct{}{}
+	}
+	if len(uniqueSigners) != len(confirmSigners) {
+		return errors.New("signers set does not equal confirm votes set")
+	}
+	for key := range confirmSigners {
+		if _, ok := uniqueSigners[key]; !ok {
+			return errors.New("signers set does not equal confirm votes set")
+		}
+	}
 	return nil
 }
 
 func checkDPOSElaIllegalBlockConfirms(d *payload.DPOSIllegalBlocks,
-	header *common2.Header, compareHeader *common2.Header) (*payload.Confirm,
+	header *common2.Header, compareHeader *common2.Header, strictActive bool) (*payload.Confirm,
 	*payload.Confirm, error) {
 
 	confirm := &payload.Confirm{}
@@ -1259,14 +1302,14 @@ func checkDPOSElaIllegalBlockConfirms(d *payload.DPOSIllegalBlocks,
 	if err := ConfirmSanityCheck(confirm); err != nil {
 		return nil, nil, err
 	}
-	if err := IllegalConfirmContextCheck(confirm); err != nil {
+	if err := IllegalConfirmContextCheck(confirm, d.BlockHeight, strictActive); err != nil {
 		return nil, nil, err
 	}
 
 	if err := ConfirmSanityCheck(compareConfirm); err != nil {
 		return nil, nil, err
 	}
-	if err := IllegalConfirmContextCheck(compareConfirm); err != nil {
+	if err := IllegalConfirmContextCheck(compareConfirm, d.BlockHeight, strictActive); err != nil {
 		return nil, nil, err
 	}
 

@@ -1063,6 +1063,18 @@ func (b *BlockChain) auxPowMalleationActive(blockHeight uint32) bool {
 	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
 }
 
+// IllegalEvidenceStrictActive reports whether the strict illegal-evidence
+// validation binds at the given height: true at and above the coordinated
+// StrictMoneyRangeHeight activation. It gates F-029 (evidence signer set-equality)
+// and F-082 (height-scoped confirm voter universe) inside CheckDPOSIllegalBlocks.
+// Shares the campaign gate so no third activation height is introduced; below it,
+// illegal-evidence transactions validate exactly as before and replay
+// byte-identically. (F-030's dedup-key canonicalization is gated separately, on the
+// evidence's own BlockHeight, in payload.SpecialTxDedupKey.)
+func (b *BlockChain) IllegalEvidenceStrictActive(blockHeight uint32) bool {
+	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
+}
+
 // coinbaseTotalReward computes totalTxFee + block issuance.
 //
 // This is the single shared entry point for BOTH the AuxPoW (PoW consensus) and
