@@ -157,6 +157,24 @@ func (b *BlockChain) ForceRollback() error {
 		}
 	}
 
+	// The per-iteration purge above walks only the accepted main chain (b.Nodes), so
+	// it reaches every discarded block that was ON the best chain -- including the
+	// exploit block. But a block can be StoreBlock'd above the target WITHOUT ever
+	// joining the main chain: an orphan / side block (e.g. a child of the discarded
+	// tip). Such blocks are absent from b.Nodes, so the loop structurally cannot reach
+	// them, yet they remain fetchable by hash (ffldb-blockidx) and would be served just
+	// like the main-chain residue. Sweep them with the SAME complete scan the offline
+	// cleaner uses (not-on-retained-main-chain AND header.height > target), so the
+	// in-line purge reaches exact clean-forward-sync parity on the raw block store
+	// rather than being off by the orphan count. DeleteBlockFromStore also evicts the
+	// RAM cache, so this is safe on the running node.
+	if swept, serr := PurgeForcedRollbackResidue(b.db.GetFFLDB(), target); serr != nil {
+		return fmt.Errorf("forced rollback: sweep above-target orphan residue: %w", serr)
+	} else if swept > 0 {
+		log.Warnf("FORCED ROLLBACK: swept %d above-target orphan/side block(s) that were "+
+			"stored but never on the main chain", swept)
+	}
+
 	log.Warnf("FORCED ROLLBACK: block store rewound to %d; derived state will be "+
 		"rebuilt by InitCheckpoint from a pre-target snapshot (asserted < target)",
 		len(b.Nodes)-1)

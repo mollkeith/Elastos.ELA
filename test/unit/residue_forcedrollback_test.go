@@ -23,6 +23,7 @@
 package unit
 
 import (
+	"bytes"
 	"path/filepath"
 	"testing"
 
@@ -39,6 +40,7 @@ import (
 	"github.com/elastos/Elastos.ELA/core/types/interfaces"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	crstate "github.com/elastos/Elastos.ELA/cr/state"
+	"github.com/elastos/Elastos.ELA/database"
 	"github.com/elastos/Elastos.ELA/dpos/state"
 	"github.com/elastos/Elastos.ELA/utils/test"
 
@@ -147,6 +149,32 @@ func TestResidue2ForcedRollbackPurgesBlockStore(t *testing.T) {
 
 	fdb := chain.GetDB().GetFFLDB()
 
+	// ORPHAN / side block above the target that never joins the main chain: a child
+	// of the tip written straight into the raw block store (ffldb-blockidx) via the
+	// low-level StoreBlock WITHOUT a main-chain height-index entry -- exactly the
+	// shape of the one real mainnet residue (height 2260595, a child of the discarded
+	// tip). The per-iteration ForceRollback purge walks only b.Nodes, so it cannot
+	// reach this; only the completeness sweep can. This orphan is what made the
+	// in-line purge off-by-one against a clean forward-synced node.
+	orphan := &types.Block{
+		Header: common2.Header{
+			Version:   0,
+			Height:    tip + 1,
+			Previous:  hashByHeight[tip],
+			Timestamp: 1600000000 + tip + 1,
+			Bits:      0x1d03ffff,
+		},
+		Transactions: []interfaces.Transaction{residueCoinbase(tip + 1)},
+	}
+	orphanHash := orphan.Hash()
+	orphanBuf := new(bytes.Buffer)
+	assert.NoError(t, (&types.DposBlock{Block: orphan}).Serialize(orphanBuf))
+	assert.NoError(t, fdb.Update(func(dbTx database.Tx) error {
+		return dbTx.StoreBlock(orphanHash, orphanBuf.Bytes())
+	}), "store orphan block directly into ffldb-blockidx")
+	assert.True(t, fdb.IsBlockInStore(&orphanHash),
+		"pre-rollback: orphan must be in the raw block store")
+
 	// Precondition: every block (including the to-be-discarded ones) is served by
 	// hash BEFORE the rollback. This proves the harness actually stored them.
 	for h := uint32(0); h <= tip; h++ {
@@ -180,6 +208,19 @@ func TestResidue2ForcedRollbackPurgesBlockStore(t *testing.T) {
 		assert.False(t, fdb.IsBlockInStore(&hash),
 			"RESIDUE #2: discarded block at height %d still reported present by "+
 				"IsBlockInStore/HasBlock after forced rollback", h)
+	}
+
+	// ORPHAN COMPLETENESS (fails on the per-iteration-only purge, passes with the
+	// sweep): the above-target orphan/side block must ALSO be purged, so a rolled-back
+	// node reaches exact clean-forward parity and serves no block above the target.
+	{
+		blk, gerr := fdb.GetBlock(orphanHash)
+		assert.Error(t, gerr,
+			"RESIDUE #2 orphan: an above-target side block stored off the main chain is "+
+				"still served by hash after forced rollback (the in-line purge is off-by-one)")
+		assert.Nil(t, blk, "RESIDUE #2 orphan: must not deserialize after rollback")
+		assert.False(t, fdb.IsBlockInStore(&orphanHash),
+			"RESIDUE #2 orphan: still reported present by IsBlockInStore after rollback")
 	}
 
 	// OVER-DELETION GUARD: retained blocks (<= target) must STILL be served by hash.
