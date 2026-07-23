@@ -2491,6 +2491,11 @@ func (s *State) returnDeposit(tx interfaces.Transaction, height uint32) {
 			}
 
 			returnAction := func(producer *Producer) {
+				// F-215: capture the true prior state so rollback restores it. The forward
+				// action only transitions Canceled->Returned, but the undo hard-set Canceled,
+				// leaving a non-Canceled producer (e.g. Inactive) wrongly Canceled after a
+				// reorg. Reorg revert-symmetry (ungated, forward state unchanged).
+				oriState := producer.state
 				s.History.Append(height, func() {
 					producer.totalAmount -= inputValue
 					if producer.state == Canceled &&
@@ -2500,7 +2505,7 @@ func (s *State) returnDeposit(tx interfaces.Transaction, height uint32) {
 					}
 				}, func() {
 					producer.totalAmount += inputValue
-					producer.state = Canceled
+					producer.state = oriState
 				})
 			}
 
@@ -3499,14 +3504,22 @@ func (s *State) updateInactiveCountV2(lastPosition, needReset, workedInRound boo
 	// if it's the last position and not working in Round then we should add inactiveCountV2++
 	if lastPosition && !needReset && !workedInRound {
 		originInactiveCountV2 := producer.inactiveCountV2
+		// F-064: drive the undo off whether the threshold ACTUALLY fired, captured in the
+		// forward closure. The old guard re-read producer.inactiveCountV2 (which the forward
+		// had zeroed on firing), so `>= 3` was always false on rollback and
+		// revertSettingInactiveProducer never ran -> producer stuck Inactive after a reorg
+		// across the threshold. Reorg revert-symmetry (ungated).
+		fired := false
 		s.History.Append(height, func() {
+			fired = false
 			producer.inactiveCountV2 += 1
 			if producer.inactiveCountV2 >= 3 {
 				s.setInactiveProducer(producer, key, height, false)
 				producer.inactiveCountV2 = 0
+				fired = true
 			}
 		}, func() {
-			if producer.state == Inactive && producer.inactiveCountV2 >= 3 {
+			if fired {
 				s.revertSettingInactiveProducer(producer, key, height, false)
 			}
 			producer.inactiveCountV2 = originInactiveCountV2

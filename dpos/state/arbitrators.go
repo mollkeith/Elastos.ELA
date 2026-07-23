@@ -397,6 +397,19 @@ func (a *Arbiters) RollbackTo(height uint32) error {
 	a.History.RollbackTo(height)
 	a.degradation.RollbackTo(height)
 	err := a.State.RollbackTo(height)
+	// F-109: prune height-keyed arbiter snapshots ABOVE the rollback target. SnapshotByHeight
+	// APPENDS (not replaces) on an existing key, so a reorg that left stale snapshots >height
+	// would corrupt later snapshot lookups. Reorg-only path (linear sync never calls
+	// RollbackTo), so committed state replays byte-identically.
+	newDesc := a.SnapshotKeysDesc[:0]
+	for _, k := range a.SnapshotKeysDesc {
+		if k > height {
+			delete(a.Snapshots, k)
+		} else {
+			newDesc = append(newDesc, k)
+		}
+	}
+	a.SnapshotKeysDesc = newDesc
 	a.mtx.Unlock()
 
 	return err
@@ -2348,11 +2361,13 @@ func (a *Arbiters) UpdateNextArbitrators(versionHeight, height uint32) error {
 	}
 
 	if a.DPoSV2ActiveHeight == math.MaxUint32 && a.isDposV2Active() {
-		oriHeight := height
 		a.History.Append(height, func() {
 			a.DPoSV2ActiveHeight = height + a.ChainParams.CRConfiguration.MemberCount + uint32(a.ChainParams.DPoSConfiguration.NormalArbitratorsCount)
 		}, func() {
-			a.DPoSV2ActiveHeight = oriHeight
+			// F-180: the guard above proved the prior value was MaxUint32; restore THAT on
+			// rollback, not `height`, so a reorg across activation does not pin
+			// DPoSV2ActiveHeight to a wrong (activated) height. Reorg revert-symmetry (F-168 class).
+			a.DPoSV2ActiveHeight = math.MaxUint32
 		})
 	}
 
