@@ -324,12 +324,18 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 			}
 
 			if e = PreProcessSpecialTx(block.Block); e != nil {
+				// F-093: the replay aborts here, so the emergency ForceChange this
+				// block's special tx just applied must not survive.
+				arbiters.UndoPendingSpecialTx()
 				err = e
 				break
 			}
 
 			b.CkpManager.OnBlockSaved(block, nil,
 				b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, true)
+			// F-093: the block is replayed from the retained main chain, so its
+			// special-tx effect is committed exactly as it historically was.
+			arbiters.CommitPendingSpecialTx()
 
 			// Notify process increase.
 			if increase != nil {
@@ -850,6 +856,9 @@ func (b *BlockChain) ProcessIllegalBlock(payload *payload.DPOSIllegalBlocks) {
 		b.BestChain.Height); err != nil {
 		log.Error("process illegal block error: ", err)
 	}
+	// F-093: the gossip path is not bracketed by a block connect -- its emergency
+	// change is permanent, exactly as it was before the fix.
+	DefaultLedger.Arbitrators.CommitPendingSpecialTx()
 }
 
 func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators) {
@@ -862,6 +871,9 @@ func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators
 		b.BestChain.Height); err != nil {
 		log.Error("process illegal block error: ", err)
 	}
+	// F-093: the gossip path is not bracketed by a block connect -- its emergency
+	// change is permanent, exactly as it was before the fix.
+	DefaultLedger.Arbitrators.CommitPendingSpecialTx()
 }
 
 type OrphanBlock struct {
@@ -1502,7 +1514,27 @@ func (b *BlockChain) disconnectBlock(node *BlockNode, block *Block, confirm *pay
 
 // connectBlock handles connecting the passed node/block to the end of the main
 // (best) chain.
-func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payload.Confirm) error {
+func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payload.Confirm) (err error) {
+	// F-093/F-094: PreProcessSpecialTx applies the emergency ForceChange (arbiter
+	// rotation, forceChanged flag, processed-payload marker, snapshot frame) BEFORE
+	// the block is context-checked, confirm-checked and stored -- and it commits that
+	// change at block.Height-1. History.RollbackTo is strictly-greater-than, so the
+	// rollback performed on failure (checkBlockWithConfirmation -> OnRollbackTo(H-1))
+	// could not reverse it: the node stayed rotated onto an arbiter set the network
+	// had rejected, and the payload hash stayed marked processed so the same special
+	// tx could never force-change again on the surviving chain. Bracket the whole
+	// connect: commit on success, undo on every failure exit.
+	//
+	// Fail-path only -- a block that connects takes the commit branch, which is the
+	// pristine behaviour. Blocks in the retained history all connect, so replay is
+	// bit-identical and the change needs no height gate.
+	defer func() {
+		if err != nil {
+			DefaultLedger.Arbitrators.UndoPendingSpecialTx()
+			return
+		}
+		DefaultLedger.Arbitrators.CommitPendingSpecialTx()
+	}()
 	if err := PreProcessSpecialTx(block); err != nil {
 		return err
 	}
@@ -1542,7 +1574,7 @@ func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payloa
 	// expensive connection logic.  It also has some other nice properties
 	// such as making blocks that never become part of the main chain or
 	// blocks that fail to connect available for further analysis.
-	err := b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
+	err = b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
 		return dbStoreBlock(dbTx, &DposBlock{
 			Block:       block,
 			HaveConfirm: confirm != nil,

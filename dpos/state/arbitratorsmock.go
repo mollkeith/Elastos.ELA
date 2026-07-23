@@ -119,6 +119,12 @@ func (a *ArbitratorsMock) GetNextRewardData() RewardData {
 	return a.NextReward
 }
 
+// CommitPendingSpecialTx is a no-op: the mock applies no history-backed ForceChange.
+func (a *ArbitratorsMock) CommitPendingSpecialTx() {}
+
+// UndoPendingSpecialTx is a no-op: the mock applies no history-backed ForceChange.
+func (a *ArbitratorsMock) UndoPendingSpecialTx() {}
+
 func (a *ArbitratorsMock) GetSnapshot(height uint32) []*CheckPoint {
 	return a.Snapshot
 }

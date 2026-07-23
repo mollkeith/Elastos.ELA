@@ -114,7 +114,28 @@ type Arbiters struct {
 
 	forceChanged bool
 
+	// pendingSpecialTx holds the state captured immediately before the emergency
+	// ForceChange of a block's special transactions was applied. It is non-nil only
+	// between PreProcessSpecialTx and the moment the carrying block is known to have
+	// connected (CommitPendingSpecialTx) or to have failed (UndoPendingSpecialTx).
+	pendingSpecialTx *specialTxSavepoint
+
 	History *utils.History
+}
+
+// specialTxSavepoint captures every piece of Arbiters state that the emergency
+// ForceChange driven by PreProcessSpecialTx mutates, so the whole effect can be
+// reversed when the block that carried the special transaction never connects.
+// The History part covers the arbiter rotation and the forceChanged flag; the rest
+// covers the bookkeeping that lives OUTSIDE History and therefore survives every
+// RollbackTo (F-094: degradation.inactiveTxs, illegalBlocksPayloadHashes; F-109
+// class: the height-keyed snapshot ring appended by SnapshotByHeight).
+type specialTxSavepoint struct {
+	history        utils.Savepoint
+	degradation    specialTxDegradationState
+	illegalHashes  map[common.Uint256]interface{}
+	snapshotKeys   []uint32
+	snapshotFrames map[uint32]int
 }
 
 func (a *Arbiters) Start() {
@@ -218,6 +239,96 @@ func (a *Arbiters) recoverFromCheckPoints(point *CheckPoint) {
 	// the newCheckPoint/initFromArbitrators capture discipline; copyInactiveTxs
 	// returns an empty map for a nil (legacy-checkpoint) source.
 	a.degradation.inactiveTxs = copyInactiveTxs(point.InactiveTxs)
+	// F-093: a restored checkpoint is a fresh, committed baseline; nothing is pending.
+	a.pendingSpecialTx = nil
+}
+
+// CommitPendingSpecialTx makes the emergency ForceChange applied by
+// ProcessSpecialTxPayload permanent. The block-connect boundary calls it once the
+// block is stored, and the gossip entry points call it immediately (they are not
+// tied to a block, so their effect is permanent exactly as it was before F-093).
+func (a *Arbiters) CommitPendingSpecialTx() {
+	a.mtx.Lock()
+	a.pendingSpecialTx = nil
+	a.mtx.Unlock()
+}
+
+// UndoPendingSpecialTx reverses the emergency ForceChange applied by
+// ProcessSpecialTxPayload for a block that failed to connect. It is a no-op for the
+// overwhelming majority of blocks, which carry no special transaction at all, and a
+// no-op for every block that connected (its effect was committed).
+func (a *Arbiters) UndoPendingSpecialTx() {
+	a.mtx.Lock()
+	a.undoPendingSpecialTx()
+	a.mtx.Unlock()
+}
+
+// markPendingSpecialTx captures the pre-special-tx state once per block. Multiple
+// InactiveArbitrators payloads in the same block share one savepoint, so all of
+// their ForceChanges are reversed together.
+func (a *Arbiters) markPendingSpecialTx() {
+	a.mtx.Lock()
+	if a.pendingSpecialTx == nil {
+		a.pendingSpecialTx = a.captureSpecialTxSavepoint()
+	}
+	a.mtx.Unlock()
+}
+
+// undoPendingSpecialTx restores the captured pre-special-tx state. Caller holds mtx.
+func (a *Arbiters) undoPendingSpecialTx() {
+	if a.pendingSpecialTx == nil {
+		return
+	}
+	sp := a.pendingSpecialTx
+	a.pendingSpecialTx = nil
+	a.restoreSpecialTxSavepoint(sp)
+}
+
+// captureSpecialTxSavepoint snapshots the mutable state reachable from
+// ProcessSpecialTxPayload. Caller holds mtx. Read-only: the accepted path is
+// byte-identical to the pristine one.
+func (a *Arbiters) captureSpecialTxSavepoint() *specialTxSavepoint {
+	sp := &specialTxSavepoint{
+		history:        a.History.Savepoint(),
+		degradation:    a.degradation.captureForSpecialTx(),
+		illegalHashes:  copyInactiveTxs(a.illegalBlocksPayloadHashes),
+		snapshotKeys:   append([]uint32(nil), a.SnapshotKeysDesc...),
+		snapshotFrames: make(map[uint32]int, len(a.Snapshots)),
+	}
+	for k, v := range a.Snapshots {
+		sp.snapshotFrames[k] = len(v)
+	}
+	return sp
+}
+
+// restoreSpecialTxSavepoint puts back the state captured by
+// captureSpecialTxSavepoint. Caller holds mtx.
+func (a *Arbiters) restoreSpecialTxSavepoint(sp *specialTxSavepoint) {
+	a.History.UndoTo(sp.history)
+	a.degradation.restoreForSpecialTx(sp.degradation)
+	a.illegalBlocksPayloadHashes = copyInactiveTxs(sp.illegalHashes)
+
+	// SnapshotByHeight APPENDS a frame for the force-change height; drop the frames
+	// and keys added after the savepoint. A key the ring evicted meanwhile cannot be
+	// resurrected, so rebuild the key list from what the map still holds -- the
+	// SnapshotKeysDesc/Snapshots invariant must not be broken by the undo.
+	for k, frames := range a.Snapshots {
+		n, ok := sp.snapshotFrames[k]
+		if !ok {
+			delete(a.Snapshots, k)
+			continue
+		}
+		if len(frames) > n {
+			a.Snapshots[k] = frames[:n]
+		}
+	}
+	keys := make([]uint32, 0, len(sp.snapshotKeys))
+	for _, k := range sp.snapshotKeys {
+		if _, ok := a.Snapshots[k]; ok {
+			keys = append(keys, k)
+		}
+	}
+	a.SnapshotKeysDesc = keys
 }
 
 func (a *Arbiters) ProcessBlock(block *types.Block, confirm *payload.Confirm) {
@@ -367,6 +478,13 @@ func (a *Arbiters) CheckCustomIDResultsTx(block *types.Block) error {
 
 func (a *Arbiters) ProcessSpecialTxPayload(p interfaces.Payload,
 	height uint32) error {
+	// F-093/F-094: the emergency ForceChange below is applied by PreProcessSpecialTx
+	// BEFORE block H is validated and stored, and it commits at height H-1 -- so a
+	// later failure inside connectBlock leaves the node rotated onto an arbiter set
+	// the network rejected, with the payload hash marked processed so the same tx can
+	// never force-change again. Capture the pre-state; the block-connect boundary then
+	// either commits it (block connected) or undoes it (block rejected).
+	a.markPendingSpecialTx()
 	switch obj := p.(type) {
 	case *payload.DPOSIllegalBlocks:
 		a.mtx.Lock()
@@ -394,6 +512,10 @@ func (a *Arbiters) RollbackSeekTo(height uint32) {
 
 func (a *Arbiters) RollbackTo(height uint32) error {
 	a.mtx.Lock()
+	// F-093: a rollback must never leave behind a special-tx effect whose carrying
+	// block has not connected. History.RollbackTo is strictly-greater-than, so the
+	// ForceChange committed at block.Height-1 is invisible to it.
+	a.undoPendingSpecialTx()
 	a.History.RollbackTo(height)
 	a.degradation.RollbackTo(height)
 	err := a.State.RollbackTo(height)
