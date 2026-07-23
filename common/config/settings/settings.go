@@ -185,6 +185,9 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 			break
 		}
 		configuration.StrictMoneyRangeHeight = config.DisabledStrictMoneyRangeHeight
+		// P4 symmetry: RevisedDPoSRewardHeight also disabled on non-mainnet (mainnet pins it;
+		// ArmIncidentGates arms it above). Parallel to the other incident gates.
+		configuration.RevisedDPoSRewardHeight = config.DisabledStrictMoneyRangeHeight
 		configuration.ForcedRollbackHeight = config.DisabledForcedRollbackHeight
 		configuration.ForcedRollbackTrigger = ""
 	}

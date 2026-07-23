@@ -3015,8 +3015,12 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 							// F-073: debit the CAPTURED credited amount, not a live lookup of the
 							// key the forward closure already deleted (which reads 0 -> owner keeps
 							// the credited reward = claimable reward inflation on reorg). oriRewardsInfo
-							// is captured before History.Append (which runs apply synchronously), so it
-							// equals what the forward `owner += DPoSV2RewardInfo[NFT]` added.
+							// is captured before History.Append. Append DEFERS apply to Commit
+							// (utils/history.go), so the capture is the PRE-BLOCK committed value, which
+							// equals what the forward `owner += DPoSV2RewardInfo[NFT]` added UNLESS a
+							// same-block same-key change intervenes. SOUND today only because F-104 + F-118
+							// make two destroys of the same NFT id in one block impossible at/above 2260451
+							// -- soundness by fix INTERACTION, not by apply timing.
 							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= oriRewardsInfo
 							s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
 							if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {

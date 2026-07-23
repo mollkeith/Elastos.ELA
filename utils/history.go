@@ -80,6 +80,11 @@ func (h *History) Changes() []HeightChanges {
 }
 
 // Append add a change and it's rollback into history.
+// Append does NOT execute the change: it only CACHES (execute, rollback). The execute
+// (forward) closure runs solely at Commit; rollback runs at RollbackTo/SeekTo. So a value
+// captured in the enclosing scope at Append-call time is the PRE-BLOCK committed state -- a
+// same-block same-key change is NOT reflected. Capture-outside revert patterns must ensure
+// no two same-block changes touch the same key, or capture inside the forward closure.
 func (h *History) Append(height uint32, execute func(), rollback func()) {
 	// if height==0 means this is a temporary change.
 	if height == 0 {
