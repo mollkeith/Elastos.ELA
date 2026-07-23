@@ -47,10 +47,13 @@ const (
 	// (Q-B6) these reward-rule changes must NOT reuse the incident-recovery gate
 	// (StrictMoneyRangeHeight=2260451) — they take a fresh future activation
 	// height (> the frozen tip 2260595). MaxUint32 = dormant.
-	// TODO(owner): set to the coordinated post-recovery activation height before
-	// deployment; while MaxUint32 the F-212 double-count fix stays inactive
-	// (F-011/086 is byte-identical on the ELA-only mainnet either way).
-	MainNetRevisedDPoSRewardHeight uint32 = math.MaxUint32
+	// Set (2026-07-22) to 2265000 — a coordinated post-recovery activation height:
+	// > the frozen tip 2260595 (a fresh height per Q-B6, NOT the incident gate), with a
+	// ~4405-block (~6-day at 120s) buffer above the tip so the rolled-back fleet fully
+	// converges before the reward-rule change binds. Realized F-212 exposure in the
+	// interim is a PROVEN ZERO (full mainnet scan), so the buffer costs nothing. MUST be
+	// identical on every node. ENGINEERS: confirm/adjust this single coordinated value.
+	MainNetRevisedDPoSRewardHeight uint32 = 2265000
 	// MainNetForcedRollbackHeight is the height the chain is rewound TO on first
 	// start of a patched node. The block at Height+1 is the value-overflow
 	// transaction's block; rewinding to 2260450 removes it and everything after.
