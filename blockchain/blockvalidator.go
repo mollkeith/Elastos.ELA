@@ -41,6 +41,18 @@ func (b *BlockChain) CheckBlockSanity(block *Block) error {
 	if !header.AuxPow.Check(&hash, AuxPowChainID) {
 		return errors.New("[PowCheckBlockSanity] block check aux pow failed")
 	}
+	// F-041/F-090: at and above the coordinated StrictMoneyRangeHeight activation,
+	// require the single canonical AuxPow encoding so Header.HashWithAux() (the
+	// DPoSV2 committee seed) cannot be malleated into a consensus split. ParentHash
+	// and the high bits of ParMerkleIndex are unvalidated by AuxPow.Check yet feed
+	// HashWithAux(), while the block identity Header.Hash() excludes the AuxPow --
+	// so two encodings of the same block can seed two different committees at zero
+	// PoW cost. Below the gate history replays byte-identically (mainnet census:
+	// every real block at/above the gate is already canonical; last non-canonical
+	// block was height 2,090,418).
+	if b.auxPowMalleationActive(header.Height) && !header.AuxPow.IsCanonical() {
+		return errors.New("[PowCheckBlockSanity] non-canonical (malleable) AuxPow encoding")
+	}
 	if CheckProofOfWork(&header, b.chainParams.PowConfiguration.PowLimit) != nil {
 		return errors.New("[PowCheckBlockSanity] block check proof of work failed")
 	}
@@ -933,6 +945,14 @@ func GetTxFeeMap(tx interfaces.Transaction, references map[*common.Input]common.
 
 // StrictMoneyActive reports whether strict monetary validation binds at height.
 func (b *BlockChain) StrictMoneyActive(blockHeight uint32) bool {
+	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
+}
+
+// auxPowMalleationActive reports whether the canonical-AuxPow requirement
+// (F-041/F-090) binds at the given height: true at and above the coordinated
+// StrictMoneyRangeHeight activation. Shares the campaign gate so no third
+// activation height is introduced.
+func (b *BlockChain) auxPowMalleationActive(blockHeight uint32) bool {
 	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
 }
 

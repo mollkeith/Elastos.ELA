@@ -231,6 +231,42 @@ func (ap *AuxPow) Check(hashAuxBlock *common.Uint256, chainID int) bool {
 	return true
 }
 
+// IsCanonical reports whether the AuxPow uses the single canonical encoding of
+// the two fields that Check() leaves unconstrained yet Header.Serialize folds
+// into Header.HashWithAux(). HashWithAux() seeds DPoSV2 committee selection
+// (dpos/state/arbitrators.go getRandomDposV2Producers); because the block's
+// consensus identity Header.Hash() is computed WITHOUT the AuxPow
+// (SerializeNoAux), two encodings of one block (identical Hash(), identical
+// PoW) that differ in these fields yield a divergent HashWithAux() -> a
+// zero-PoW-cost committee/seat split. Pinning them to their canonical value
+// makes HashWithAux() a deterministic function of block identity.
+//
+//   F-090: ParMerkleIndex must be 0. The parent coinbase is always the first
+//          (leftmost) leaf of the parent merkle tree, so its branch index is 0
+//          for every real block (mainnet census: 0 of 2,260,597 stored blocks
+//          are non-zero). GetMerkleRoot only consumes the low
+//          len(ParCoinBaseMerkle) bits, leaving the high bits free to malleate
+//          while Check() still passes; pinning to 0 removes them. Matches
+//          Bitcoin CAuxPow::check ("AuxPow is not a generate" when nIndex != 0).
+//   F-041: ParentHash must equal ParBlockHeader.Hash(). ParentHash is read by
+//          neither Check() nor CheckProofOfWork(), so any 32 bytes pass; the
+//          canonical value is the parent block hash the field names (mainnet
+//          census: every stored block at and above the StrictMoneyRangeHeight
+//          gate satisfies this; the last non-canonical block was height
+//          2,090,418, 170,033 blocks below the gate).
+//
+// Callers gate this at StrictMoneyRangeHeight so below-gate history -- which
+// carried non-canonical ParentHash values -- still replays byte-identically.
+func (ap *AuxPow) IsCanonical() bool {
+	if ap.ParMerkleIndex != 0 {
+		return false
+	}
+	if ap.ParentHash != ap.ParBlockHeader.Hash() {
+		return false
+	}
+	return true
+}
+
 func GetMerkleRoot(hash common.Uint256, merkleBranch []common.Uint256, index int) common.Uint256 {
 	if index == -1 {
 		return common.Uint256{}
