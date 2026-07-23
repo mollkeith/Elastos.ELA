@@ -163,6 +163,11 @@ func (tx *BaseTransaction) Serialize(w io.Writer) error {
 }
 
 // Serialize the BaseTransaction data without contracts
+// NOTE (F-205): these bytes carry NO chain identity -- no network magic, no
+// genesis hash, no chain id -- and no per-transaction anti-replay binding beyond
+// the inputs themselves. See the F-205 NOTE in updateproducertransaction.go for
+// the verified-real / refuted / deferred verdict and the mainnet measurements
+// that rule out the obvious fixes; do not add a binding here without reading it.
 func (tx *BaseTransaction) SerializeUnsigned(w io.Writer) error {
 	// Version
 	if tx.version >= common2.TxVersion09 {
