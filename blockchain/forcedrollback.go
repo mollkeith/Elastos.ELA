@@ -122,6 +122,28 @@ func (b *BlockChain) ForceRollback() error {
 			return fmt.Errorf("forced rollback: RollbackBlock %d: %w", i, err)
 		}
 
+		// Residue #2 purge -- MUST run AFTER RollbackBlock, not before. As shipped,
+		// DBRemoveBlockNode + RollbackBlock clear the block-header index, the
+		// main-chain height indexes and the tx-index siblings, but the raw by-hash
+		// block store (ffldb-blockidx) is left behind: a rolled-back node still
+		// deserialized and SERVED the discarded blocks by hash over P2P getdata /
+		// RPC getblock, and reported them present via HasBlock / IsBlockInStore.
+		//
+		// The delete cannot move earlier: ChainStore.handleRollbackBlockTask re-fetches
+		// the current block by hash (GetBlock(b.Hash())) as a precondition of the
+		// rollback, so removing the ffldb-blockidx entry before RollbackBlock would make
+		// the rollback itself fail. Running it here purges exactly the block that was
+		// just rewound; later iterations only re-fetch lower (still-present) blocks.
+		if err := b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
+			return DBRemoveBlockFromStore(dbTx, node.Hash)
+		}); err != nil {
+			return fmt.Errorf("forced rollback: purge block store at %d: %w", i, err)
+		}
+
+		// The GetBlock above populated the in-RAM block LRU with this now-purged
+		// hash; evict it so an in-process serve cannot return it before restart.
+		b.db.GetFFLDB().EvictBlockCache(*node.Hash)
+
 		// Reconcile the in-RAM index so no stale InMainChain=true node for a rewound
 		// hash survives for this process's lifetime (disconnectBlock2 omitted this).
 		b.index.RemoveNode(node)

@@ -310,6 +310,30 @@ func (c *ChainStoreFFLDB) GetBlock(hash Uint256) (*DposBlock, error) {
 	return b, nil
 }
 
+// EvictBlockCache drops a hash from the in-RAM block LRU (blocksCache /
+// blockHashesCache). GetBlock populates this small cache on every fetch, so a block
+// purged from the persistent store (DBRemoveBlockFromStore) must also be evicted
+// here -- otherwise an in-process serve could still return the purged block from
+// cache until the node restarts.
+func (c *ChainStoreFFLDB) EvictBlockCache(hash Uint256) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.blocksCache == nil {
+		return
+	}
+	if _, ok := c.blocksCache[hash]; !ok {
+		return
+	}
+	delete(c.blocksCache, hash)
+	for i, h := range c.blockHashesCache {
+		if h.IsEqual(hash) {
+			c.blockHashesCache = append(c.blockHashesCache[:i],
+				c.blockHashesCache[i+1:]...)
+			break
+		}
+	}
+}
+
 func (c *ChainStoreFFLDB) GetHeader(hash Uint256) (*common.Header, error) {
 	var headerBytes []byte
 	err := c.db.View(func(tx database.Tx) error {

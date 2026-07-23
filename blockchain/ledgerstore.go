@@ -80,6 +80,10 @@ type IFFLDBChainStore interface {
 	// return true.
 	IsBlockInStore(hash *Uint256) bool
 
+	// EvictBlockCache drops a hash from the in-RAM block LRU so a block whose
+	// raw-store entry was purged is not still served from cache in-process.
+	EvictBlockCache(hash Uint256)
+
 	// Get a transaction by transaction hash.
 	GetTransaction(txID Uint256) (interfaces.Transaction, uint32, error)
 

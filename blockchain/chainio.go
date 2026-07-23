@@ -643,3 +643,31 @@ func DBRemoveBlockIndex(dbTx database.Tx, hash *common.Uint256, height uint32) e
 	heightIndex := meta.Bucket(heightIndexBucketName)
 	return heightIndex.Delete(serializedHeight[:])
 }
+
+// blockLocIndexBucketName is the ffldb driver's internal by-hash block-location
+// index (driver bucket-ID 0x00000001). It is the single PERSISTENT chokepoint that
+// every by-hash serve path reads: FetchBlock/HasBlock -> GetBlock/IsBlockInStore,
+// RPC getblock, and P2P getdata (InvTypeBlock / InvTypeConfirmedBlock). It is named
+// here -- matching database/ffldb.blockIdxBucketName -- so this package references
+// the driver-internal name in exactly ONE place; precedent: upgrade.go
+// migrateBlockIndex hardcodes the same literal.
+var blockLocIndexBucketName = []byte("ffldb-blockidx")
+
+// DBRemoveBlockFromStore removes a block's raw-store LOCATION entry from the ffldb
+// by-hash block index, so the store returns ErrBlockNotFound for the hash and can no
+// longer deserialize or serve the block by hash. It parallels DBRemoveBlockNode (the
+// block-header index) and DBRemoveBlockIndex (the main-chain height indexes) but
+// targets the raw block STORE, which those two deliberately leave behind -- see the
+// IFFLDBChainStore.IsBlockInStore contract: "rollback will not remove from file DB".
+//
+// The flat-file (.fdb) bytes are intentionally NOT touched: once this index key is
+// gone the bytes are unreferenced and unfetchable. Rewriting/compacting the flat
+// files to reclaim them would risk the RETAINED blocks and is not required for a
+// rolled-back node to stop serving the discarded ones.
+func DBRemoveBlockFromStore(dbTx database.Tx, hash *common.Uint256) error {
+	idx := dbTx.Metadata().Bucket(blockLocIndexBucketName)
+	if idx == nil {
+		return fmt.Errorf("purge block store: bucket %q missing", blockLocIndexBucketName)
+	}
+	return idx.Delete(hash[:])
+}
