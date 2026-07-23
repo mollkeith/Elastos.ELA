@@ -3018,9 +3018,16 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 							// is captured before History.Append. Append DEFERS apply to Commit
 							// (utils/history.go), so the capture is the PRE-BLOCK committed value, which
 							// equals what the forward `owner += DPoSV2RewardInfo[NFT]` added UNLESS a
-							// same-block same-key change intervenes. SOUND today only because F-104 + F-118
-							// make two destroys of the same NFT id in one block impossible at/above 2260451
-							// -- soundness by fix INTERACTION, not by apply timing.
+							// same-block CROSS-KEY change intervenes. CORRECTION (fork round 2 / Fable finding I):
+							// F-104/F-118 close only a same-NFT-ID collision; the real hole is on the
+							// DPoSV2RewardInfo KEY with DISTINCT ids -- an attacker-chosen OwnerStakeAddresses[i]
+							// set to a DIFFERENT entry`s NFT stake address makes forwards compose while both
+							// reverts subtract pre-block captures, misallocating `a` claimable-reward sela on
+							// reorg. Mitigations: arbiter-signed + REORG-ONLY (linear InitCheckpoint replay runs
+							// apply only, so the recovery re-derive / keystone is UNAFFECTED). Closed at the
+							// validation layer by the F-073-guard in nftdestroytransaction.go (reject an
+							// NFTDestroy whose OwnerStakeAddresses intersect its own IDs` NFT stake-address set),
+							// gated at StrictMoneyRangeHeight. Empirically classified: dpos/state f073 cross-key test.
 							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= oriRewardsInfo
 							s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
 							if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {

@@ -14,6 +14,7 @@ import (
 
 	"github.com/elastos/Elastos.ELA/blockchain"
 	"github.com/elastos/Elastos.ELA/common"
+	"github.com/elastos/Elastos.ELA/core/contract"
 	"github.com/elastos/Elastos.ELA/core/contract/program"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	"github.com/elastos/Elastos.ELA/crypto"
@@ -120,6 +121,26 @@ func (t *NFTDestroyTransactionFromSideChain) SpecialContextCheck() (elaerr.ELAEr
 					errors.New("duplicate NFT id in NFTDestroy payload")), true
 			}
 			seen[id] = struct{}{}
+		}
+		// F-073 (fork round 2 / Fable finding I): reject an NFTDestroy whose
+		// OwnerStakeAddresses name any of its OWN NFTs` stake addresses. That cross-key
+		// aliasing makes the DPoSV2RewardInfo forward closures compose while both reverts
+		// subtract pre-block captures, misallocating claimable reward on a reorg
+		// (state.go processNFTDestroyFromSideChain). A legitimate new owner is a user stake
+		// address, never a derived NFT stake address, so this rejects only the attack.
+		nftStakeSet := make(map[common.Uint168]struct{}, len(nftDestroyPayload.IDs))
+		for _, id := range nftDestroyPayload.IDs {
+			ct, err := contract.CreateStakeContractByCode(id.Bytes())
+			if err != nil {
+				return elaerr.Simple(elaerr.ErrTxPayload, err), true
+			}
+			nftStakeSet[*ct.ToProgramHash()] = struct{}{}
+		}
+		for _, owner := range nftDestroyPayload.OwnerStakeAddresses {
+			if _, clash := nftStakeSet[owner]; clash {
+				return elaerr.Simple(elaerr.ErrTxPayload,
+					errors.New("NFTDestroy owner stake address aliases an NFT stake address in the same tx")), true
+			}
 		}
 	}
 	state := t.parameters.BlockChain.GetState()
