@@ -1641,6 +1641,13 @@ func (s *State) processTransactions(txs []interfaces.Transaction, height uint32)
 				s.UsedDposV2Votes[stakeAddress] += info.Votes
 			})
 			voteRights := producer.GetTotalDPoSV2VoteRights()
+			// F-181: capture the pre-block DposV2EffectedProducers membership so the revert
+			// restores it VERBATIM instead of re-deriving it from the post-restore vote total.
+			// The forward (accept) closure is unchanged, so below-gate replay stays byte-
+			// identical; only the reorg-undo becomes exact. Same Class-E reorg revert-asymmetry
+			// as the shipped F-064/109/180/215 (ungated, forward state unchanged).
+			effectedKey := hex.EncodeToString(producer.OwnerPublicKey())
+			_, wasEffected := s.DposV2EffectedProducers[effectedKey]
 			//if this vote create nft
 			exist, nftID := s.getNFTID(key)
 			s.History.Append(height, func() {
@@ -1672,9 +1679,15 @@ func (s *State) processTransactions(txs []interfaces.Transaction, height uint32)
 				}
 				producer.detailedDPoSV2Votes[stakeAddress][key] = detailVoteInfo
 				producer.dposV2Votes += info.Votes
-				voteRights := producer.GetTotalDPoSV2VoteRights()
-				if voteRights >= float64(s.ChainParams.DPoSV2EffectiveVotes) {
-					s.DposV2EffectedProducers[hex.EncodeToString(producer.OwnerPublicKey())] = producer
+				// F-181: restore the captured pre-block membership verbatim. The pristine revert
+				// re-derived membership from GetTotalDPoSV2VoteRights() >= threshold and only ever
+				// ADDED, never removed -- so a producer present pre-block with a total below the
+				// threshold (reachable via the forward delete-branch asymmetry above) was silently
+				// dropped from DposV2EffectedProducers on reorg. Restoring the boolean makes the undo exact.
+				if wasEffected {
+					s.DposV2EffectedProducers[effectedKey] = producer
+				} else {
+					delete(s.DposV2EffectedProducers, effectedKey)
 				}
 			})
 		}
