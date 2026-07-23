@@ -3057,6 +3057,11 @@ func (a *Arbiters) GetSnapshot(height uint32) []*CheckPoint {
 
 func (a *Arbiters) getSnapshot(height uint32) []*CheckPoint {
 	result := make([]*CheckPoint, 0)
+	// F-171: empty snapshot ring -> no valid snapshot answer; return the empty result
+	// instead of indexing SnapshotKeysDesc[-1] (crash-harden).
+	if len(a.SnapshotKeysDesc) == 0 {
+		return result
+	}
 	if height >= a.SnapshotKeysDesc[len(a.SnapshotKeysDesc)-1] {
 		// if height is in range of SnapshotKeysDesc, get the key with the same
 		// election as height

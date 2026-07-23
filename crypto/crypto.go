@@ -248,6 +248,12 @@ func Equal(e1 *PublicKey, e2 *PublicKey) bool {
 
 func CheckMultiSigSignatures(program program.Program, data []byte) error {
 	code := program.Code
+	// F-133: guard before indexing code[0]/code[len-2] so a <2-byte code cannot panic;
+	// the semantic length/format check stays with ParseMultisigScript below (unchanged
+	// error path for all len>=2 codes). Crash-harden only.
+	if len(code) < 2 {
+		return errors.New("invalid multi sign script code, length not enough")
+	}
 	// Get N parameter
 	n := int(code[len(code)-2]) - PUSH1 + 1
 	// Get M parameter

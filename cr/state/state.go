@@ -493,7 +493,9 @@ func (s *State) processVoteCRC(height uint32, candidate []byte, votes common.Fix
 		return
 	}
 	c := s.GetCandidate(*cid)
-	if candidate == nil {
+	// F-010: guard the GetCandidate result (nil when the candidate was removed), not the
+	// []byte param which is always non-nil here; else the History closure nil-derefs.
+	if c == nil {
 		return
 	}
 	s.History.Append(height, func() {
@@ -510,7 +512,9 @@ func (s *State) processCancelVoteCRC(height uint32, candidate []byte, votes comm
 		return
 	}
 	c := s.GetCandidate(*cid)
-	if candidate == nil {
+	// F-010: guard the GetCandidate result (nil when the candidate was removed), not the
+	// []byte param which is always non-nil here; else the History closure nil-derefs.
+	if c == nil {
 		return
 	}
 	s.History.Append(height, func() {

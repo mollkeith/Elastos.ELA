@@ -172,6 +172,11 @@ func (ap *AuxPow) Check(hashAuxBlock *common.Uint256, chainID int) bool {
 
 	auxRootHash := GetMerkleRoot(*hashAuxBlock, ap.AuxMerkleBranch, ap.AuxMerkleIndex)
 
+	// F-132: a valid AuxPoW parent coinbase always has >=1 input; a 0-input coinbase
+	// (BtcTx.Deserialize enforces no minimum) would panic here. Reject it (crash-harden).
+	if len(ap.ParCoinbaseTx.TxIn) == 0 {
+		return false
+	}
 	script := ap.ParCoinbaseTx.TxIn[0].SignatureScript
 	scriptStr := hex.EncodeToString(script)
 

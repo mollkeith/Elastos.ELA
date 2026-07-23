@@ -134,6 +134,12 @@ func CheckInactiveArbitrators(t interfaces.Transaction, blockHeight, gate uint32
 func checkCRCArbitratorsSignatures(t interfaces.Transaction, blockHeight, gate uint32) error {
 
 	code := t.Programs()[0].Code
+	// F-099: guard before indexing code[0]/code[len-2] so a <2-byte code cannot panic;
+	// the semantic checks (ParseMultisigScript etc.) stay downstream with their existing
+	// error paths for all len>=2 codes. Crash-harden only.
+	if len(code) < 2 {
+		return errors.New("invalid arbiter multisig code, length not enough")
+	}
 	// Get N parameter
 	// todo check
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1

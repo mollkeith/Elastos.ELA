@@ -855,6 +855,9 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 	if err != nil {
 		log.Debugf("Cannot create outbound peer %s: %v", c.Addr, err)
 		s.connManager.Disconnect(c.ID())
+		// F-153: p is nil on error; without this return the code falls through to
+		// sp.AssociateConnection(nil) and panics. Bail out on the failed dial.
+		return
 	}
 	sp.Peer = p
 	sp.connReq = c
