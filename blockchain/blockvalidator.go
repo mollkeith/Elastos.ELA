@@ -1032,7 +1032,41 @@ func (b *BlockChain) GetBlockDPOSReward(block *Block) Fixed64 {
 		b.chainParams.GetBlockReward(block.Height)) * 0.35))
 }
 
+// checkCoinbaseFrozenOutputs closes F-013: the coinbase (block tx index 0) is the one
+// transaction that never runs checkFrozenAddresses. checkTxsContext validates only
+// txs[1:], and the coinbase's own ContextCheck / SpecialContextCheck are DEAD on connect
+// (the same reason F-089 had to relocate the coinbase BIP30 guard into this file), so the
+// "no sends TO a frozen address" half of the frozen-address rule was entirely unenforced
+// on the coinbase path. The coinbase merge-miner output (Outputs[1]) carries no address
+// constraint in checkCoinbaseTransactionContext, so a producer could direct the block
+// reward into a quarantined exploit address. At/above the campaign gate any coinbase
+// output paying a frozen address is rejected; below the gate the check is skipped so
+// retained-history replay stays byte-identical.
+func checkCoinbaseFrozenOutputs(coinbase interfaces.Transaction, blockHeight, gate uint32,
+	frozenAddresses []config.FrozenAddress) error {
+	if blockHeight < gate {
+		return nil
+	}
+	for _, frozen := range frozenAddresses {
+		if frozen.ProgramHash == nil || blockHeight < frozen.DisableStartHeight {
+			continue
+		}
+		for _, output := range coinbase.Outputs() {
+			if output.ProgramHash.IsEqual(*frozen.ProgramHash) {
+				return fmt.Errorf("cannot send to the frozen address %s in coinbase", frozen.Address)
+			}
+		}
+	}
+	return nil
+}
+
 func (b *BlockChain) checkCoinbaseTransactionContext(blockHeight uint32, coinbase interfaces.Transaction, totalTxFee, dposReward Fixed64) error {
+	// F-013: enforce the frozen-address "no sends to" rule on the coinbase path, which
+	// otherwise bypasses checkFrozenAddresses entirely (see checkCoinbaseFrozenOutputs).
+	if err := checkCoinbaseFrozenOutputs(coinbase, blockHeight,
+		b.chainParams.StrictMoneyRangeHeight, b.chainParams.FrozenAddresses); err != nil {
+		return err
+	}
 	activeHeight := DefaultLedger.Arbitrators.GetDPoSV2ActiveHeight()
 	if activeHeight != math.MaxUint32 && blockHeight > activeHeight+1 {
 		totalReward, err := b.coinbaseTotalReward(blockHeight, totalTxFee)
