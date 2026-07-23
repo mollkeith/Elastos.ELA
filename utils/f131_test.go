@@ -34,14 +34,13 @@ func TestF131RollbackToResetsSeekHeight(t *testing.T) {
 		t.Fatalf("rollback: %v", err)
 	}
 
-	// Next accepted block at height 3. Pre-fix, Commit computes seek = 2 - 3 (underflow).
-	assert.NotPanics(t, func() {
-		h.Append(3, func() { v = 300 }, func() { v = -300 })
-		h.Commit(3)
-	}, "F-131: Commit after rollback must not underflow the seek computation")
-
-	assert.Equal(t, 300, v,
-		"F-131: after rollback+commit the tracked value must be the committed value, "+
-			"not corrupted by a stale seekHeight underflow")
-	assert.Equal(t, uint32(3), h.Height())
+	// After RollbackTo(2) the state is at height 2 (v==2). A subsequent SeekTo(1) computes
+	// seek := seekHeight - 1. Pre-fix seekHeight is the stale 3 -> seek=2 -> it rolls back
+	// TWO changes (over-rolls to v==0). With the fix seekHeight==2 -> seek=1 -> it rolls
+	// back exactly one change to view height 1 (v==1).
+	assert.Equal(t, 2, v, "after RollbackTo(2) the tracked value is 2")
+	h.SeekTo(1)
+	assert.Equal(t, 1, v,
+		"F-131: SeekTo(1) after a rollback must roll back exactly one change (v==1); a stale "+
+			"seekHeight over-rolls to 0")
 }
