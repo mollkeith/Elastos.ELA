@@ -176,7 +176,15 @@ func (mp *TxPool) appendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
 		tx.IsSmallTransfer(mp.chainParams.SmallCrossTransferThreshold) {
 		err := blockchain.DefaultLedger.Store.SaveSmallCrossTransferTx(tx)
 		if err != nil {
-			log.Warnf("failed to save small cross chain transaction %s", tx.Hash())
+			log.Warnf("failed to save small cross chain transaction %s: %s",
+				tx.Hash(), err)
+			// NX-07: this arm rejects the transaction, so it must leave the
+			// pool with it. It never could before -- SaveSmallCrossTransferTx
+			// swallowed leveldb errors and always returned nil -- but the
+			// bucket cap makes it reachable, and a transaction the caller was
+			// told was rejected must not stay in txnList, txFees and the
+			// conflict slots. Mirrors the doAddTransaction arm just above.
+			mp.doRemoveTransaction(tx)
 			return elaerr.Simple(elaerr.ErrTxValidation, nil)
 		}
 		mp.crossChainHeightList[tx.Hash()] = bestHeight
@@ -646,6 +654,7 @@ func (mp *TxPool) doRemoveTransaction(tx interfaces.Transaction) {
 		}
 		if _, ok := mp.crossChainHeightList[hash]; ok {
 			delete(mp.crossChainHeightList, hash)
+			mp.cleanSmallCrossTransferRecord(hash)
 		}
 		if _, ok := mp.txReceivingInfo[hash]; ok {
 			delete(mp.txReceivingInfo, hash)
@@ -670,9 +679,40 @@ func (mp *TxPool) onPopBack(hash Uint256) {
 	// not - so every fee-ordered eviction leaked one crossChainHeightList and
 	// one txReceivingInfo entry. Harmless only while F-060 kept this function
 	// unreachable; not harmless now that eviction is live.
-	delete(mp.crossChainHeightList, hash)
+	if _, ok := mp.crossChainHeightList[hash]; ok {
+		delete(mp.crossChainHeightList, hash)
+		mp.cleanSmallCrossTransferRecord(hash)
+	}
 	delete(mp.txReceivingInfo, hash)
 	mp.dealDelProposalTx(tx)
+}
+
+// cleanSmallCrossTransferRecord drops the PERSISTENT small-cross-transfer
+// record written on admission, for a transaction that is leaving the pool
+// without having been mined.
+//
+// NX-07: SaveSmallCrossTransferTx writes a leveldb record on mempool admission
+// and, until this change, CleanSmallCrossTransferTx had exactly ONE caller in
+// the whole tree - cleanTransactionList, i.e. the block path. Conflict eviction
+// (doRemoveTransaction, reached from cleanTransactions), fee-ordered eviction
+// (onPopBack) and the post-reorg re-check (checkAndCleanAllTransactions, which
+// funnels into doRemoveTransaction) each cleared only the IN-MEMORY twin, so
+// every transaction that was admitted and then evicted without being mined left
+// a permanent record. Nothing pruned it, node start re-injected all of it, and
+// every arbiter re-downloaded and re-parsed the whole bucket once per second.
+// This finishes what F-120 started: F-120 extended the eviction path to the two
+// in-memory maps, and this extends it to the persistent twin.
+//
+// The caller must already have established that a record exists, by finding the
+// transaction in crossChainHeightList - written in the same branch that writes
+// the leveldb record, so it is an exact predicate and costs ordinary
+// transactions nothing.
+func (mp *TxPool) cleanSmallCrossTransferRecord(hash Uint256) {
+	if err := blockchain.DefaultLedger.Store.
+		CleanSmallCrossTransferTx(hash); err != nil {
+		log.Warnf("failed to clean small cross chain transaction %s: %s",
+			hash, err)
+	}
 }
 
 func NewTxPool(params *config.Configuration, ckpManager *checkpoint.Manager) *TxPool {

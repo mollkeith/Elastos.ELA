@@ -15,10 +15,35 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/elastos/Elastos.ELA/dpos/p2p/msg"
 	"github.com/elastos/Elastos.ELA/p2p"
 )
+
+// handshakeTimeout bounds how long an accepted DPoS connection may take to
+// deliver its version message.
+//
+// FV-14: there is NO read deadline anywhere in production dpos/p2p. WrapConn
+// runs at the very top of server.inboundPeerConnected -- BEFORE the PID/
+// allowlist check and BEFORE the MaxNodePerHost accounting -- and does raw
+// io.ReadFull, bypassing p2p.ReadMessage and its ReadMessageTimeOut entirely.
+// The hub pipe's own idleTimer (pipeTimeout) cannot help either, because no
+// pipe exists yet. A peer that completes the TCP handshake and then sends
+// nothing therefore pinned a goroutine and a file descriptor FOREVER, with no
+// per-host limit yet in force, so a single IP could hold every descriptor the
+// process is allowed and starve an arbiter of DPoS connections.
+//
+// NOT a memory-amplification fix: an untouched Go allocation of the 32 MiB
+// readPayload ceiling costs tens of KB of RSS, so lowering that ceiling would
+// buy nothing. The deadline is the fix.
+//
+// 30s matches p2p/peer's negotiateTimeout, the equivalent bound on the
+// mainchain side.
+//
+// A var rather than a const ONLY so the fail-on-pristine test can shorten it;
+// nothing in production ever assigns to it.
+var handshakeTimeout = 30 * time.Second
 
 // Conn is a wrapper of the origin network connection.
 type Conn struct {
@@ -90,6 +115,19 @@ func readPayload(r io.Reader, hdr *p2p.Header) ([]byte, error) {
 // WrapConn warps the origin network connection and returns a hub connection
 // with the handshake information resolved from version message.
 func WrapConn(c net.Conn) (conn *Conn, err error) {
+	// FV-14: bound the whole pre-identity handshake. The deadline is cleared
+	// again on success so the connection's normal lifetime is governed by
+	// whoever takes it over -- p2p.ReadMessage's own deadline on the peer path,
+	// or the hub pipe's idleTimer on the pipe path -- exactly as before.
+	if derr := c.SetDeadline(time.Now().Add(handshakeTimeout)); derr != nil {
+		return nil, derr
+	}
+	defer func() {
+		if err == nil {
+			_ = c.SetDeadline(time.Time{})
+		}
+	}()
+
 	// Read message header
 	var headerBytes [p2p.HeaderSize]byte
 	if _, err = io.ReadFull(c, headerBytes[:]); err != nil {
