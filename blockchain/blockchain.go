@@ -1619,7 +1619,35 @@ func (b *BlockChain) disconnectBlock(node *BlockNode, block *Block, confirm *pay
 
 // connectBlock handles connecting the passed node/block to the end of the main
 // (best) chain.
-func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payload.Confirm) (err error) {
+//
+// G1: the ETBlockConnected notification is delivered here, OUTSIDE the special-tx
+// bracket that connectBlockBracketed opens and closes. events.Notify runs every
+// registered subscriber while holding the process-wide events.mtx, so notifying
+// while specialTxMtx is held creates a specialTxMtx -> events.mtx edge on EVERY
+// connected block; paired with a subscriber that blocks on specialTxMtx that is an
+// AB-BA deadlock that wedges both block connect and the whole event bus. The
+// bracket is not shortened by one instruction of state work -- everything
+// F-093/F-094/N-001 must keep atomic (mark -> mutate -> commit/undo) is inside
+// connectBlockBracketed, and its deferred commit/undo has already run by the time
+// this function resumes. No subscriber of ETBlockConnected reads the special-tx
+// savepoint (they clean the tx/block pools and push to websocket clients), so
+// committing before the broadcast rather than after is observationally identical.
+func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payload.Confirm) error {
+	if err := b.connectBlockBracketed(node, block, confirm); err != nil {
+		return err
+	}
+
+	// Notify the caller that the block was connected to the main chain.
+	// The caller would typically want to react with actions such as
+	// updating wallets.
+	events.Notify(events.ETBlockConnected, block)
+
+	return nil
+}
+
+// connectBlockBracketed is connectBlock's body: every step that must run inside the
+// F-093/F-094/N-001 special-tx bracket, and nothing else.
+func (b *BlockChain) connectBlockBracketed(node *BlockNode, block *Block, confirm *payload.Confirm) (err error) {
 	// F-093/F-094: PreProcessSpecialTx applies the emergency ForceChange (arbiter
 	// rotation, forceChanged flag, processed-payload marker, snapshot frame) BEFORE
 	// the block is context-checked, confirm-checked and stored -- and it commits that
@@ -1719,11 +1747,9 @@ func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payloa
 	b.BestChain = node
 	b.MedianTimePast = medianTime
 
-	// Notify the caller that the block was connected to the main chain.
-	// The caller would typically want to react with actions such as
-	// updating wallets.
-	events.Notify(events.ETBlockConnected, block)
-
+	// G1: ETBlockConnected is NOT notified here -- connectBlock notifies it after
+	// this function returns, i.e. after the deferred commit/undo registered at the
+	// top has released specialTxMtx.
 	return nil
 }
 

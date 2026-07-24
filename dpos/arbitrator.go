@@ -336,28 +336,67 @@ func NewArbitrator(account account.Account, cfg Config) (*Arbitrator, error) {
 		network:        network,
 	}
 
-	events.Subscribe(func(e *events.Event) {
-		switch e.Type {
-		case events.ETNewBlockReceived:
-			block := e.Data.(*types.DposBlock)
-			go a.OnBlockReceived(block.Block, block.HaveConfirm)
-
-		case events.ETConfirmAccepted:
-			go a.OnConfirmReceived(e.Data.(*mempool.ConfirmInfo))
-
-		case events.ETDirectPeersChanged:
-			peersInfo := e.Data.(*peer.PeersInfo)
-			a.OnPeersChanged(peersInfo.CurrentPeers, peersInfo.NextPeers)
-
-		case events.ETTransactionAccepted:
-			tx := e.Data.(interfaces.Transaction)
-			if tx.IsIllegalBlockTx() {
-				a.OnIllegalBlockTxReceived(tx.Payload().(*payload.DPOSIllegalBlocks))
-			} else if tx.IsInactiveArbitrators() {
-				a.OnInactiveArbitratorsTxReceived(tx.Payload().(*payload.InactiveArbitrators))
-			}
-		}
-	})
+	events.Subscribe(a.handleEvent)
 
 	return &a, nil
+}
+
+// handleEvent is the Arbitrator's event-bus subscriber.
+//
+// G1 (AB-BA deadlock): events.Notify runs EVERY registered callback while holding
+// the process-wide events.mtx, so a callback that blocks parks the whole event bus
+// -- and if it blocks on a lock whose holder is itself inside events.Notify, the
+// two deadlock. That is exactly what the ETTransactionAccepted arm used to do: it
+// ran inline and reached Arbiters.specialTxMtx through
+// OnInactiveArbitratorsTxReceived -> LockSpecialTx (arbitrator.go:191), while
+// blockchain's saveBlockCheckpoints / replayCheckpointBlock brackets hold
+// specialTxMtx across a synchronous events.Notify (CkpManager.OnBlockSaved ->
+// cr/state Checkpoint.OnBlockSaved -> Committee.ProcessBlock -> Notify of
+// ETCRCChangeCommittee). Publisher and subscriber are on different goroutines
+// (mempool/txpool.go:65 publishes with "go events.Notify"), so the two orders --
+// specialTxMtx -> events.mtx and events.mtx -> specialTxMtx -- close a cycle that
+// wedges block connect AND every event delivery in the process, including during
+// startup checkpoint replay.
+//
+// The arm now dispatches on its own goroutine, exactly as its ETNewBlockReceived
+// and ETConfirmAccepted siblings already did, which is also the discipline the rest
+// of the tree follows (dpos/state and mempool always publish with "go
+// events.Notify"; cr/state/committee.go releases c.mtx before it notifies). Nothing
+// observes completion -- the publisher is already a detached goroutine -- and the
+// emergency bracket stays fully serialized by specialTxMtx itself, so N-001/R2
+// atomicity is untouched: the bracket is not shortened, it is only taken off the
+// bus goroutine.
+//
+// The type assertions stay inline so a malformed event still panics on the
+// publishing path rather than on an anonymous goroutine.
+//
+// INVARIANT for future maintainers: no arm of this switch may acquire a lock that
+// an events.Notify caller can hold. Today that means specialTxMtx, a.mtx, s.mtx,
+// CkpManager.mtx, c.mtx and b.mutex. ETDirectPeersChanged is left synchronous on
+// purpose: it reaches only network.UpdatePeers -> BlockChain.GetHeight (IndexLock,
+// a leaf that never notifies), and delivering peer-set updates out of order would
+// be worse than the short hold.
+func (a *Arbitrator) handleEvent(e *events.Event) {
+	switch e.Type {
+	case events.ETNewBlockReceived:
+		block := e.Data.(*types.DposBlock)
+		go a.OnBlockReceived(block.Block, block.HaveConfirm)
+
+	case events.ETConfirmAccepted:
+		go a.OnConfirmReceived(e.Data.(*mempool.ConfirmInfo))
+
+	case events.ETDirectPeersChanged:
+		peersInfo := e.Data.(*peer.PeersInfo)
+		a.OnPeersChanged(peersInfo.CurrentPeers, peersInfo.NextPeers)
+
+	case events.ETTransactionAccepted:
+		tx := e.Data.(interfaces.Transaction)
+		if tx.IsIllegalBlockTx() {
+			p := tx.Payload().(*payload.DPOSIllegalBlocks)
+			go a.OnIllegalBlockTxReceived(p)
+		} else if tx.IsInactiveArbitrators() {
+			p := tx.Payload().(*payload.InactiveArbitrators)
+			go a.OnInactiveArbitratorsTxReceived(p)
+		}
+	}
 }
