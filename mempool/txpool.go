@@ -115,6 +115,21 @@ func (mp *TxPool) appendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
 		return elaerr.Simple(elaerr.ErrBlockIneffectiveCoinbase, nil)
 	}
 
+	// F-019: block assembly skips unfinalized transactions (pow.GenerateBlock)
+	// and block validation rejects any block carrying one (CheckBlockContext),
+	// but nothing checked finality on the way INTO the pool - so a
+	// future-LockTime transaction was admitted, relayed, and re-relayed by the
+	// outdated-tx timer while occupying pool capacity it could never spend.
+	// Admission policy only: a transaction that fails this test cannot be part
+	// of a valid block at this height anyway, so no block acceptance decision
+	// changes. The height used is the one every other caller uses.
+	if !blockchain.IsFinalizedTransaction(tx, bestHeight+1) {
+		log.Warnf("[TxPool] tx %s is not finalized, lock time %d, height %d",
+			tx.Hash(), tx.LockTime(), bestHeight+1)
+		return elaerr.SimpleWithMessage(elaerr.ErrTxValidation, nil,
+			"transaction is not finalized")
+	}
+
 	if err := chain.CheckTransactionSanity(bestHeight+1, tx); err != nil {
 		log.Warn("[TxPool CheckTransactionSanity] failed", tx.Hash())
 		return err
@@ -132,8 +147,16 @@ func (mp *TxPool) appendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
 		return err
 	}
 
+	// F-060: this gate used to reject on OverSize alone, which returned before
+	// txFees.AddTx could ever run - so the complete fee-ordered eviction path
+	// inside AddTx was dead code and a low-fee squatter could never be
+	// displaced. Ask the fee-ordered list the question it can actually answer:
+	// can this tx be admitted, evicting only the entries paying strictly less?
+	// It stays here, after CheckTransactionContext, because that is what sets
+	// the fee (blockchain.CheckTransactionFee -> tx.SetFee) - asked any earlier
+	// every relayed tx would price itself at zero.
 	size := tx.GetSize()
-	if mp.txFees.OverSize(uint64(size)) {
+	if !mp.txFees.CanAccept(uint64(size), float64(tx.Fee())/float64(size)) {
 		log.Warn("TxPool check transactions size failed", tx.Hash())
 		return elaerr.Simple(elaerr.ErrTxPoolOverCapacity, nil)
 	}
@@ -315,7 +338,15 @@ func (mp *TxPool) cleanTransactions(blockTxs []interfaces.Transaction) {
 			}
 		}
 
-		if err := mp.removeTx(blockTx); err != nil {
+		// F-193: a transaction with no inputs (every zero-input special tx)
+		// matches nothing in the loop above, so this used to clear only its
+		// conflict slots and leave the transaction itself stranded in txnList,
+		// txFees and txReceivingInfo. Anything that just appeared in a block
+		// must leave the pool outright.
+		if _, ok := mp.txnList[blockTx.Hash()]; ok {
+			mp.doRemoveTransaction(blockTx)
+			deleteCount++
+		} else if err := mp.removeTx(blockTx); err != nil {
 			log.Warnf("remove tx %s when delete", blockTx.Hash())
 		}
 
@@ -635,8 +666,13 @@ func (mp *TxPool) onPopBack(hash Uint256) {
 		return
 	}
 	delete(mp.txnList, hash)
+	// F-120: doRemoveTransaction clears these two maps, this eviction path did
+	// not - so every fee-ordered eviction leaked one crossChainHeightList and
+	// one txReceivingInfo entry. Harmless only while F-060 kept this function
+	// unreachable; not harmless now that eviction is live.
+	delete(mp.crossChainHeightList, hash)
+	delete(mp.txReceivingInfo, hash)
 	mp.dealDelProposalTx(tx)
-
 }
 
 func NewTxPool(params *config.Configuration, ckpManager *checkpoint.Manager) *TxPool {

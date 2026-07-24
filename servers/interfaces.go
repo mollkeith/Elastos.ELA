@@ -1017,6 +1017,12 @@ func DiscreteMining(param Params) map[string]interface{} {
 	if !ok {
 		return ResponsePack(InvalidParams, "")
 	}
+	// F-163: count is unvalidated wire input, and zero used to mine a block
+	// anyway. Reject it here too so the caller gets a parameter error rather
+	// than an execution error.
+	if count == 0 {
+		return ResponsePack(InvalidParams, "count must be greater than 0")
+	}
 
 	ret := make([]string, 0)
 

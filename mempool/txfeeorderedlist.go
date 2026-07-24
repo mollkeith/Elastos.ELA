@@ -46,11 +46,14 @@ func (l *txFeeOrderedList) AddTx(tx interfaces.Transaction) errors.ELAError {
 	}
 
 	feeRate := float64(tx.Fee()) / float64(size)
-	overSize := l.OverSize(uint64(size))
 
-	if overSize && len(l.list) > 0 &&
-		// if fee rate of this tx less than the last one, then return directly
-		feeRate < l.list[len(l.list)-1].FeeRate {
+	// F-060: the old admission guard only compared the incoming fee rate with
+	// the single lowest entry, which does not answer the question being asked.
+	// Eviction may only free the entries paying strictly less, so a tx could
+	// pass that guard, be inserted, evict paying entries and then be popped
+	// itself - leaving a hash in TxPool.txnList this list no longer accounts
+	// for. CanAccept decides exactly what the eviction loop can deliver.
+	if !l.CanAccept(uint64(size), feeRate) {
 		return addingTxExcluded
 	}
 
@@ -60,14 +63,41 @@ func (l *txFeeOrderedList) AddTx(tx interfaces.Transaction) errors.ELAError {
 		Size:    size,
 	})
 
-	for overSize {
+	for l.OverSize(0) && len(l.list) > 0 {
 		item := l.popBack()
 		l.totalSize -= uint64(item.Size)
 		l.onPopBack(item.Hash)
-
-		overSize = l.OverSize(0)
 	}
 	return nil
+}
+
+// CanAccept reports whether a tx of the given size and fee rate can be admitted
+// to the list, counting only the entries admission is allowed to evict - those
+// paying strictly less than the incoming tx. It is a pure query and mutates
+// nothing, so the pool can ask the same question before it starts validating.
+func (l *txFeeOrderedList) CanAccept(size uint64, feeRate float64) bool {
+	if size > l.maxSize {
+		return false
+	}
+	if !l.OverSize(size) {
+		return true
+	}
+
+	var evictable uint64
+	for i := len(l.list) - 1; i >= 0; i-- {
+		if l.list[i].FeeRate >= feeRate {
+			break
+		}
+		evictable += uint64(l.list[i].Size)
+	}
+
+	remaining := l.totalSize
+	if evictable >= remaining {
+		remaining = 0
+	} else {
+		remaining -= evictable
+	}
+	return remaining+size <= l.maxSize
 }
 
 func (l *txFeeOrderedList) RemoveTx(hash common.Uint256, txSize uint64,

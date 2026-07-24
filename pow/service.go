@@ -38,6 +38,10 @@ const (
 	maxNonce               = ^uint32(0) // 2^32 - 1
 	updateInterval         = 30 * time.Second
 	createAuxBlockInterval = 5 * time.Second
+
+	// maxDiscreteMiningAttempts bounds the block generation retries of a single
+	// DiscreteMining call. F-163: that retry used to be an unbounded `continue`.
+	maxDiscreteMiningAttempts = 100
 )
 
 type Config struct {
@@ -445,6 +449,14 @@ func (pow *Service) SubmitAuxBlock(hash *common.Uint256, auxPow *auxpow.AuxPow) 
 }
 
 func (pow *Service) DiscreteMining(n uint32) ([]*common.Uint256, error) {
+	// F-163: n comes straight off the RPC. Zero asks for no blocks at all, yet
+	// the loop below still mines one - the i == n test can only be reached after
+	// i has been incremented past zero - so "mine nothing" mined a block.
+	// Reject it before any state is touched.
+	if n == 0 {
+		return nil, errors.New("count must be greater than 0")
+	}
+
 	pow.mutex.Lock()
 
 	if pow.started || pow.discreteMining {
@@ -456,12 +468,24 @@ func (pow *Service) DiscreteMining(n uint32) ([]*common.Uint256, error) {
 	pow.discreteMining = true
 	pow.mutex.Unlock()
 
+	// F-163: every ordinary exit below cleared these two flags, but the
+	// GenerateBlock failure path did not - it looped back with `continue`, so a
+	// persistent generation failure spun forever holding pow.started, which
+	// wedges mining for the life of the process and burns a core. Release on
+	// every path, and bound the retries.
+	defer func() {
+		pow.mutex.Lock()
+		pow.started = false
+		pow.discreteMining = false
+		pow.mutex.Unlock()
+	}()
+
 	log.Debugf("Pow generating %d blocks", n)
 	i := uint32(0)
 	blockHashes := make([]*common.Uint256, 0)
 
 	log.Info("<================Discrete Mining==============>\n")
-	for {
+	for attempt := 0; attempt < maxDiscreteMiningAttempts; attempt++ {
 		msgBlock, err := pow.GenerateBlock(pow.PayToAddr, pact.MaxTxPerBlock)
 		if err != nil {
 			log.Warn("Generate block failed, ", err.Error())
@@ -476,10 +500,6 @@ func (pow *Service) DiscreteMining(n uint32) ([]*common.Uint256, error) {
 					Block: msgBlock,
 				})
 				if err != nil {
-					pow.mutex.Lock()
-					pow.started = false
-					pow.discreteMining = false
-					pow.mutex.Unlock()
 					return blockHashes, nil
 				}
 
@@ -487,21 +507,15 @@ func (pow *Service) DiscreteMining(n uint32) ([]*common.Uint256, error) {
 				blockHashes = append(blockHashes, &h)
 				i++
 				if i == n {
-					pow.mutex.Lock()
-					pow.started = false
-					pow.discreteMining = false
-					pow.mutex.Unlock()
 					return blockHashes, nil
 				}
 			}
 		}
 
-		pow.mutex.Lock()
-		pow.started = false
-		pow.discreteMining = false
-		pow.mutex.Unlock()
 		return blockHashes, nil
 	}
+
+	return nil, errors.New("failed to generate block")
 }
 
 func (pow *Service) SolveBlock(msgBlock *types.Block, lastBlockHash *common.Uint256) bool {

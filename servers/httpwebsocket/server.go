@@ -30,6 +30,28 @@ import (
 const (
 	// sessionTimeout is the duration of inactivity before we time out a session.
 	sessionTimeout = time.Minute
+
+	// F-162: net/http's ReadTimeout and WriteTimeout must NOT be set on this
+	// server. net/http installs those deadlines on the raw connection and they
+	// survive the websocket hijack, so they would silently kill every
+	// established session. readHeaderTimeout bounds the pre-upgrade request -
+	// net/http clears that deadline once the header is read - and idleTimeout
+	// only ever applies to a connection that is still HTTP. Both are safe here
+	// and both close the Slowloris window the server used to leave wide open.
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+
+	// maxMessageSize bounds one inbound websocket message. F-161: gorilla reads
+	// a whole message into memory before returning it and no SetReadLimit was
+	// called anywhere, so one unauthenticated client could make the node
+	// allocate without bound. The largest legitimate payload here is a raw
+	// transaction; the figure matches httpjsonrpc.MaxRPCRead.
+	maxMessageSize = 1024 * 1024 * 8
+
+	// defaultMaxSessions bounds concurrent websocket sessions. F-161: sessions
+	// were unbounded, and each one costs a connection, a goroutine and a slot in
+	// every broadcast.
+	defaultMaxSessions = 512
 )
 
 var instance *Server
@@ -49,15 +71,17 @@ type Server struct {
 	net.Listener
 	websocket.Upgrader
 
-	connCount int64
-	sessions  *sessions
-	handlers  map[string]Handler
+	connCount   int64
+	sessions    *sessions
+	handlers    map[string]Handler
+	maxSessions int
 }
 
 func Start() {
 	instance = &Server{
-		Upgrader: websocket.Upgrader{},
-		sessions: &sessions{},
+		Upgrader:    websocket.Upgrader{},
+		sessions:    &sessions{},
+		maxSessions: defaultMaxSessions,
 	}
 
 	events.Subscribe(func(e *events.Event) {
@@ -88,12 +112,32 @@ func (s *Server) Start() {
 		s.Listener, err = net.Listen("tcp", ":"+strconv.Itoa(config.Parameters.HttpWsPort))
 		if err != nil {
 			log.Fatal("net.Listen: ", err.Error())
+			return
 		}
+	}
+	// Same defect the F-036 fix removed from the REST server, still present
+	// here: common/log's Fatal does NOT exit, so both error paths above used to
+	// fall through to Serve() with a nil listener and panic - in a bare
+	// goroutine, outside net/http's per-connection recover, which takes the
+	// whole daemon down.
+	if s.Listener == nil {
+		log.Error("websocket listener is nil, not serving")
+		return
 	}
 	var done = make(chan bool)
 	go s.sessionHandler(done)
 
-	s.Server = &http.Server{Handler: http.HandlerFunc(s.Handler)}
+	// Publish the server pointer under the same lock Stop reads it with, so a
+	// Stop racing a slow Start sees a fully constructed pointer, not a torn one.
+	s.Lock()
+	s.Server = &http.Server{
+		Handler: http.HandlerFunc(s.Handler),
+		// F-162: ReadTimeout/WriteTimeout are deliberately left unset here,
+		// see the comment on readHeaderTimeout.
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+	s.Unlock()
 	err := s.Serve(s.Listener)
 
 	done <- true
@@ -126,7 +170,12 @@ func (s *Server) getSessionCount(cmd servers.Params) map[string]interface{} {
 }
 
 func (s *Server) Stop() {
-	s.Shutdown(context.Background())
+	s.RLock()
+	srv := s.Server
+	s.RUnlock()
+	if srv != nil {
+		srv.Shutdown(context.Background())
+	}
 	log.Info("Close websocket ")
 }
 
@@ -138,7 +187,7 @@ func (s *Server) sessionHandler(done chan bool) {
 		case <-ticker.C:
 			now := time.Now()
 			s.sessions.Foreach(func(v *session) {
-				if v.lastActive.Add(sessionTimeout).After(now) {
+				if !v.expired(now, sessionTimeout) {
 					return
 				}
 
@@ -154,6 +203,17 @@ func (s *Server) sessionHandler(done chan bool) {
 }
 
 func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
+	// F-161: refuse before the upgrade, so an over-cap client gets a plain HTTP
+	// error instead of a websocket that is torn down a moment later. Concurrent
+	// upgrades can overshoot the cap by the number of upgrades in flight, which
+	// is bounded and costs one session each.
+	if s.maxSessions > 0 && s.sessions.Count() >= s.maxSessions {
+		log.Warn("websocket session limit reached, rejecting connection")
+		http.Error(w, "too many websocket sessions",
+			http.StatusServiceUnavailable)
+		return
+	}
+
 	conn, err := s.Upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Error("websocket Upgrader: ", err)
@@ -161,12 +221,15 @@ func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// F-161: bound one inbound message, see maxMessageSize.
+	conn.SetReadLimit(maxMessageSize)
+
 	ss := &session{
 		id:         atomic.AddInt64(&s.connCount, 1),
 		conn:       conn,
 		lastActive: time.Now(),
 	}
-	s.sessions.Store(ss.id, ss)
+	s.sessions.Store(ss)
 
 	defer func() {
 		s.sessions.Delete(ss)
@@ -176,7 +239,7 @@ func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 		_, bysMsg, err := conn.ReadMessage()
 		if err == nil {
 			if s.handle(ss, bysMsg, r) {
-				ss.lastActive = time.Now()
+				ss.touch()
 			}
 			continue
 		}

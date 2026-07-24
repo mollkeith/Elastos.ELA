@@ -15,11 +15,31 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/elastos/Elastos.ELA/common/config"
 	"github.com/elastos/Elastos.ELA/common/log"
 	"github.com/elastos/Elastos.ELA/servers"
 	. "github.com/elastos/Elastos.ELA/servers/errors"
+)
+
+const (
+	// IOTimeout bounds reading and writing a REST request. F-162: the REST
+	// http.Server set no deadline of any kind, so an idle or dribbling client
+	// held its connection - and its goroutine - forever (Slowloris). This is the
+	// same budget httpjsonrpc already applies to the very same handlers.
+	IOTimeout = 60 * time.Second
+
+	// HeaderTimeout bounds the request line and headers on their own. A client
+	// with anything to say has said it well inside this, and it is the deadline
+	// that closes the classic Slowloris hold - see IOTimeout.
+	HeaderTimeout = 10 * time.Second
+
+	// MaxRESTRead bounds a REST request body. F-149: the POST handler read the
+	// body with ioutil.ReadAll and discarded the error, so a single
+	// unauthenticated request could allocate without bound. Same figure as
+	// httpjsonrpc.MaxRPCRead.
+	MaxRESTRead = 1024 * 1024 * 8
 )
 
 const (
@@ -51,9 +71,12 @@ type Action struct {
 type restServer struct {
 	router   *Router
 	listener net.Listener
-	server   *http.Server
-	postMap  map[string]Action
-	getMap   map[string]Action
+	// serverMtx publishes server to Stop(): Start() runs at boot and Stop() from
+	// an RPC handler, so the pointer must not be read while it is being written.
+	serverMtx sync.Mutex
+	server    *http.Server
+	postMap   map[string]Action
+	getMap    map[string]Action
 }
 
 type ApiServer interface {
@@ -105,7 +128,16 @@ func (rt *restServer) Start() {
 		log.Error("restful listener is nil, not serving")
 		return
 	}
-	rt.server = &http.Server{Handler: rt.router}
+	rt.serverMtx.Lock()
+	rt.server = &http.Server{
+		Handler: rt.router,
+		// F-162: see IOTimeout.
+		ReadTimeout:       IOTimeout,
+		ReadHeaderTimeout: HeaderTimeout,
+		WriteTimeout:      IOTimeout,
+		IdleTimeout:       IOTimeout,
+	}
+	rt.serverMtx.Unlock()
 	err := rt.server.Serve(rt.listener)
 
 	if err != nil {
@@ -250,11 +282,19 @@ func (rt *restServer) initPostHandler() {
 	for k, _ := range rt.postMap {
 		rt.router.Post(k, func(w http.ResponseWriter, r *http.Request) {
 
-			body, _ := ioutil.ReadAll(r.Body)
+			// F-149: bound the body, and stop discarding the read error.
+			body, err := ioutil.ReadAll(
+				http.MaxBytesReader(w, r.Body, MaxRESTRead))
 			defer r.Body.Close()
 
 			var req = make(map[string]interface{})
 			var resp map[string]interface{}
+
+			if err != nil {
+				log.Warn("[REST] request body rejected: ", err)
+				rt.response(w, servers.ResponsePack(IllegalDataFormat, ""))
+				return
+			}
 
 			url := rt.getPath(r.URL.Path)
 			if h, ok := rt.postMap[url]; ok {
@@ -297,8 +337,11 @@ func (rt *restServer) response(w http.ResponseWriter, resp map[string]interface{
 }
 
 func (rt *restServer) Stop() {
-	if rt.server != nil {
-		rt.server.Shutdown(context.Background())
+	rt.serverMtx.Lock()
+	srv := rt.server
+	rt.serverMtx.Unlock()
+	if srv != nil {
+		srv.Shutdown(context.Background())
 		log.Error("Close restful ")
 	}
 }
