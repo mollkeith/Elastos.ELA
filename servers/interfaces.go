@@ -871,8 +871,6 @@ func GetUsedVoteRight(voteType outputpayload.VoteType, stakeProgramHash *common.
 			}
 		}
 	case outputpayload.DposV2:
-		addr, _ := stakeProgramHash.ToAddress()
-		fmt.Println("addr", addr)
 		usedDposVote = state.UsedDposV2Votes[*stakeProgramHash]
 	default:
 		return 0, errors.New("unsupport vote type")

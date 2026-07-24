@@ -7,13 +7,16 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go: ["1.20"]
+        # F-210: pin the exact patch level, not just the minor. Kept in sync
+        # with .go-version by test/unit.TestF210BuildDeterminismPins.
+        go: ["1.20.14"]
     steps:
 
     - name: Set up Go ${{ matrix.go }}
       uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go }}
+        check-latest: false
       id: go
 
     - name: Check out code into the Go module directory
@@ -23,7 +26,11 @@ jobs:
       run: |
         go version
         go mod download
-        go mod tidy
+        # F-210: never rewrite the module graph during a build. The step that
+        # used to stand here re-resolved dependencies on every CI run; the
+        # build now verifies the downloaded modules instead of retidying them.
+        go mod verify
+        git diff --exit-code go.mod
 
     - name: Test
       run: |
@@ -48,6 +55,9 @@ jobs:
 
     - name: Make
       run: make dev
+
+    - name: Reproducible build check
+      run: make repro-check
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4

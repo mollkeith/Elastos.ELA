@@ -2479,14 +2479,21 @@ func (a *Arbiters) getCandidateIndexAtRandom(height uint32, unclaimedCount, vote
 	if !ok {
 		return 0, errors.New("invalid block hash")
 	}
-	rand.Seed(seed)
+	// F-202: draw from a private, block-seeded Source instead of the
+	// process-global math/rand generator. rand.Seed()+rand.Intn() shares one
+	// stream with every other global-rand consumer in the process (p2p,
+	// elanet), so a concurrent draw between the Seed and the Intn shifts the
+	// selected candidate. This is the same local-Source pattern already used
+	// by getRandomDposV2Producers above, and for an undisturbed stream it
+	// yields the identical index (see TestF202SeededDrawEquivalence).
+	r := rand.New(rand.NewSource(seed))
 	normalCount := a.ChainParams.DPoSConfiguration.NormalArbitratorsCount - 1
 	count := votedProducersCount - unclaimedCount - normalCount
 	if count < 1 {
 		return 0, errors.New("producers is not enough")
 	}
 	candidatesCount := minInt(count, a.ChainParams.DPoSConfiguration.CandidatesCount+1)
-	return rand.Intn(candidatesCount), nil
+	return r.Intn(candidatesCount), nil
 }
 
 func (a *Arbiters) isDposV2Active() bool {

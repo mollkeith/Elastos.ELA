@@ -83,7 +83,11 @@ func getAccount(L *lua.LState) int {
 	if err != nil {
 		fmt.Println(err.Error())
 	}
-	fmt.Println(sa)
+	// Print only non-secret account material: SchnorAccount embeds
+	// PrivateKeys, which fmt would otherwise render verbatim (F-158).
+	addr, _ := sa.ProgramHash.ToAddress()
+	fmt.Println("address", addr, "sumpublickey",
+		common.BytesToHexString(sa.SumPublicKey[:]), "keys", len(sa.PrivateKeys))
 
 	return 0
 }
