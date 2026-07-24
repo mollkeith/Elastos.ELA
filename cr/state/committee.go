@@ -2033,10 +2033,16 @@ func (c *Committee) RegisterFuncitons(cfg *CommitteeFuncsConfig) {
 	c.getCurrentArbiters = cfg.GetCurrentArbiters
 }
 
+// F-113: this function and the five below MUTATE CR member state
+// (MemberState, InactiveCount, InactiveCountingHeight, and the deposit Penalty
+// reached through c.state) yet each used to hold only c.mtx.RLock(), a SHARED
+// read lock, so they raced every concurrent Committee reader. They take the
+// write lock now. This changes lock strength only - the mutations, their order
+// and the History undo pairing are untouched, so no acceptance decision moves.
 func (c *Committee) TryUpdateCRMemberInactivity(did common.Uint168,
 	needReset bool, height uint32) {
-	c.mtx.RLock()
-	defer c.mtx.RUnlock()
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	crMember := c.getMember(did)
 	if crMember == nil {
 		log.Error("tryUpdateCRMemberInactivity did %+v not exist", did.String())
@@ -2082,21 +2088,21 @@ func (c *Committee) TryUpdateCRMemberInactivity(did common.Uint168,
 }
 
 func (c *Committee) UpdateCRInactivePenalty(cid common.Uint168, height uint32) {
-	c.mtx.RLock()
-	defer c.mtx.RUnlock()
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	c.state.UpdateCRInactivePenalty(cid, height)
 }
 
 func (c *Committee) RevertUpdateCRInactivePenalty(cid common.Uint168, height uint32) {
-	c.mtx.RLock()
-	defer c.mtx.RUnlock()
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	c.state.RevertUpdateCRInactivePenalty(cid, height)
 }
 
 func (c *Committee) TryRevertCRMemberInactivity(did common.Uint168,
 	oriState MemberState, oriInactiveCount uint32, height uint32) {
-	c.mtx.RLock()
-	defer c.mtx.RUnlock()
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	crMember := c.getMember(did)
 	if crMember == nil {
 		log.Error("tryRevertCRMemberInactivity did %+v not exist", did.String())
@@ -2119,8 +2125,8 @@ func (c *Committee) TryRevertCRMemberInactivity(did common.Uint168,
 }
 
 func (c *Committee) TryUpdateCRMemberIllegal(did common.Uint168, height uint32, illegalPenalty common.Fixed64) {
-	c.mtx.RLock()
-	defer c.mtx.RUnlock()
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	crMember := c.getMember(did)
 	if crMember == nil {
 		log.Errorf("TryUpdateCRMemberIllegal did %+v not exist", did.String())
@@ -2132,8 +2138,8 @@ func (c *Committee) TryUpdateCRMemberIllegal(did common.Uint168, height uint32, 
 }
 
 func (c *Committee) TryRevertCRMemberIllegal(did common.Uint168, oriState MemberState, height uint32, illegalPenalty common.Fixed64) {
-	c.mtx.RLock()
-	defer c.mtx.RUnlock()
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	crMember := c.getMember(did)
 	if crMember == nil {
 		log.Errorf("TryRevertCRMemberIllegal did %+v not exist", did.String())

@@ -2155,7 +2155,9 @@ func (a *Arbiters) IsSameWithNextArbitrators() bool {
 		return false
 	}
 	for index, v := range a.CurrentArbitrators {
-		if bytes.Equal(v.GetNodePublicKey(), a.nextArbitrators[index].GetNodePublicKey()) {
+		// F-179: the comparison was inverted - it reported "not same" when the
+		// keys WERE equal. A difference in any position means not the same set.
+		if !bytes.Equal(v.GetNodePublicKey(), a.nextArbitrators[index].GetNodePublicKey()) {
 			return false
 		}
 	}
