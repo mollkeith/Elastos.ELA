@@ -323,6 +323,61 @@ func (m *Manager) MaxHeight() uint32 {
 	return height
 }
 
+// DiscardStaleCheckpoints throws away every checkpoint whose height is ABOVE
+// bestHeight and rebuilds it from the genesis defaults, so the caller's replay can
+// derive it again from the retained chain.
+//
+// FV-01: a checkpoint's Height is never LOWERED. Manager.OnRollbackTo forwards to
+// each ICheckPoint.OnRollbackTo and never calls SetHeight; no OnReset implementation
+// zeroes it either (dpos/state and cr/state rebuild through
+// initFromArbitrators/initFromCommittee, neither of which touches Height); and
+// loadCheckpointFile writes the FILE's height straight into the live object. So after
+// reorganizeChain's deep-reset branch restores a default snapshot that was written on
+// an ABANDONED branch, the live checkpoint can carry a height ABOVE the post-detach
+// best height. onBlockSaved then skips every block with
+// `block.Height <= v.GetHeight()`, which makes BOTH the InitCheckpoint replay AND the
+// subsequent attach loop complete no-ops for that checkpoint: derived DPoS/CR state
+// FREEZES at the abandoned-branch snapshot while the UTXO/block store follows the
+// canonical chain, and stays frozen until the new chain climbs back above the
+// restored height. That is a durable local consensus divergence, recoverable only by
+// a full resync.
+//
+// Conditioning on `GetHeight() > bestHeight` is deliberate: an unconditional
+// SetHeight(0) would force a replay from StartHeight (~2M blocks on mainnet, hours,
+// under the chain lock) on EVERY deep reorg. This pays that cost only for a
+// checkpoint that is provably ahead of the chain it is supposed to describe.
+//
+// GATE: none. The only caller is the reorg deep-reset path; linear replay of retained
+// history never reaches it, so historical derivation is unchanged.
+func (m *Manager) DiscardStaleCheckpoints(bestHeight uint32) error {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	var failures []string
+	for _, v := range m.getOrderedCheckpoints() {
+		staleHeight := v.GetHeight()
+		if staleHeight <= bestHeight {
+			continue
+		}
+		log.Warnf("checkpoint %s restored at height %d is ABOVE the best height %d "+
+			"(abandoned-branch snapshot); discarding it and rebuilding from height %d",
+			v.Key(), staleHeight, bestHeight, v.StartHeight())
+		if err := v.OnReset(); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %s", v.Key(), err.Error()))
+			continue
+		}
+		// After the reset the checkpoint describes the genesis baseline, so its height
+		// must say so -- otherwise onBlockSaved keeps skipping the very blocks that
+		// would rebuild it.
+		v.SetHeight(0)
+	}
+	if len(failures) != 0 {
+		return errors.New("discarding stale checkpoints failed -> " +
+			strings.Join(failures, "; "))
+	}
+	return nil
+}
+
 // Close will clean all related resources.
 func (m *Manager) Close() {
 	m.mtx.Lock()

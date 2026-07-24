@@ -105,8 +105,17 @@ func f093Chain(t *testing.T) uint32 {
 // rotation, the reward books and the emergency bookkeeping. It deliberately leaves
 // out StateKeyFrame: State.ProcessSpecialTxPayload records its emergency-inactive
 // marking as a height==0 TEMPORARY change (utils.History.tempChanges), which is
-// by-design reversed when the next block arrives, not by RollbackTo. That is the
 // separate, already-reviewed F-097 behaviour and is not what F-093 is about.
+//
+// FV-05 UPDATE -- the second half of the original note ("reversed when the next block
+// arrives, NOT by RollbackTo") is no longer true, and was the defect: RollbackSeekTo
+// discarded those closures outright, making the marking PERMANENT, and RollbackTo
+// only reached them on the branch the block-connect failure path does NOT take. Both
+// now reverse the preview, so the State-level marking is covered by the rollback
+// paths as well as by the next Append. What is still NOT covered is the
+// captureSpecialTxSavepoint / UndoTo bracket, which does not read tempChanges at all
+// -- deliberately left to the rollback paths above rather than made atomic across
+// both History objects.
 func f093ArbiterViewEqual(x, y *state.CheckPoint) bool {
 	return x.ForceChanged == y.ForceChanged &&
 		x.DutyIndex == y.DutyIndex &&

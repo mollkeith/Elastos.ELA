@@ -54,6 +54,22 @@ type callSite struct {
 // the G2 review ran (or to the parent link that would disarm one).
 var requiredCallSites = []callSite{
 	{
+		finding: "FV-01",
+		file:    "blockchain/blockchain.go", fn: "reorganizeChain",
+		callee: "InitCheckpointAfterDeepReset",
+		why: "the deep-reset branch must use the entry point that DISCARDS a restored " +
+			"checkpoint sitting above the post-detach tip; plain InitCheckpoint freezes " +
+			"derived DPoS/CR state on abandoned-branch state",
+	},
+	{
+		finding: "FV-01",
+		file:    "blockchain/blockchain.go", fn: "initCheckpoint",
+		callee:   "discardStaleCheckpoints",
+		mustArgs: []string{"bestHeight"},
+		why: "the discard must run against the POST-DETACH best height, between the " +
+			"restore and the replay; a constant here would be wired but inert",
+	},
+	{
 		finding: "F-016/017/028/030/047/051/066/067/068/071/072/078/083/100/118",
 		file:    "blockchain/blockvalidator.go", fn: "CheckBlockSanity",
 		callee:   "CheckSameBlockConflicts",

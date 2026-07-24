@@ -2910,13 +2910,93 @@ func (s *State) getClaimedCRMemberDPOSPublicKeyMap() map[string]*state.CRMember 
 func (s *State) processEmergencyInactiveArbitrators(
 	inactivePayload *payload.InactiveArbitrators, height uint32) {
 
+	// FV-11: capture-and-restore instead of compute-the-inverse -- the lesson already
+	// applied twice in this file (F-064 at updateInactiveCountV2, F-168 at
+	// countArbitratorsInactivityV3).
+	//
+	// Two independent defects lived in the shipped pair:
+	//
+	//  (1) ROLLBACK SYMMETRY (fixed UNGATED, below). CheckInactiveArbitrators admits a
+	//      target that is merely IsDisabledProducer -- which includes a producer
+	//      already in InactiveProducers -- and revertSettingInactiveProducer is
+	//      unconditional, so undoing the marking of an ALREADY-INACTIVE producer set
+	//      it Active and re-inserted it into ActivityProducers: a reorg promoted a
+	//      producer INTO the arbiter-eligible set, and debited a penalty that was
+	//      never credited. Three further fields were lost on EVERY revert, including
+	//      the legitimate Active->Inactive->revert path: `selected` was cleared by
+	//      setInactiveProducer and never restored, `activateRequestHeight` was set to
+	//      MaxUint32 by BOTH functions (destroying a pending ActivateProducer request
+	//      rather than restoring it), and `inactiveSince` was reset to 0 instead of to
+	//      its captured original.
+	//
+	//  (2) APPLY IDEMPOTENCY (gated, see below). Re-marking an already-inactive
+	//      producer adds EmergencyInactivePenalty a SECOND time and overwrites
+	//      inactiveSince, which is forward derived state. Stated precisely: the
+	//      shipped mainnet default for EmergencyInactivePenalty is 0
+	//      (config.go: "there will be no penalty in this version"), so today the
+	//      double charge is zero-valued and the live forward difference is the
+	//      overwritten inactiveSince (which gates how long the producer must wait
+	//      before an ActivateProducer request is accepted). The penalty half becomes
+	//      material the moment that parameter is configured non-zero.
+	//
+	// GATE: the undo closure is UNGATED -- it executes only on live reorgs, never
+	// during linear replay, so retained history derives byte-identically. The forward
+	// skip reuses GATE 1 (StrictMoneyRangeHeight); no new height is introduced. A
+	// census of the block store found only 6 InactiveArbitrators transactions in all
+	// history (heights 408476..434811), ZERO at or above gate 1 and zero naming any
+	// producer twice within one block, so the gated forward change is a no-op on
+	// retained history.
+	//
+	// height == 0 is the height-0 GOSSIP PREVIEW (State.ProcessSpecialTxPayload), not
+	// a block height; it is deliberately left on the legacy forward path so the gate
+	// is evaluated against real block heights only. The preview is reversed by the
+	// next Append and re-applied at the real height by processTransactions, so the
+	// committed state is always decided by the gated branch.
 	addEmergencyInactiveArbitrator := func(key string, producer *Producer) {
+		var (
+			oriState                 ProducerState
+			oriPenalty               common.Fixed64
+			oriInactiveSince         uint32
+			oriSelected              bool
+			oriActivateRequestHeight uint32
+			wasInactive              bool
+			hadEmergencyEntry        bool
+		)
 		s.History.Append(height, func() {
-			s.setInactiveProducer(producer, key, height, true)
+			// Captured inside the forward: Append only CACHES the closures (see the
+			// contract on History.Append), so an enclosing-scope capture would read
+			// pre-block state and a producer named by two payloads in the same block
+			// would restore the wrong origin.
+			oriState = producer.state
+			oriPenalty = producer.penalty
+			oriInactiveSince = producer.inactiveSince
+			oriSelected = producer.selected
+			oriActivateRequestHeight = producer.activateRequestHeight
+			wasInactive = producer.state == Inactive
+			_, hadEmergencyEntry = s.EmergencyInactiveArbiters[key]
+
+			if !wasInactive || height < s.ChainParams.StrictMoneyRangeHeight {
+				s.setInactiveProducer(producer, key, height, true)
+			}
 			s.EmergencyInactiveArbiters[key] = struct{}{}
 		}, func() {
-			s.revertSettingInactiveProducer(producer, key, height, true)
-			delete(s.EmergencyInactiveArbiters, key)
+			// Only move the producer back between the maps when this payload is what
+			// took it out of ActivityProducers. If it was already Inactive the maps
+			// were never changed, and calling the inverse would PROMOTE it.
+			if !wasInactive {
+				s.revertSettingInactiveProducer(producer, key, height, true)
+			}
+			// Restore every field the pair computed rather than captured. This also
+			// repairs revertSettingInactiveProducer's clamped penalty subtraction and
+			// its unconditional activateRequestHeight = MaxUint32.
+			producer.state = oriState
+			producer.penalty = oriPenalty
+			producer.inactiveSince = oriInactiveSince
+			producer.selected = oriSelected
+			producer.activateRequestHeight = oriActivateRequestHeight
+			if !hadEmergencyEntry {
+				delete(s.EmergencyInactiveArbiters, key)
+			}
 		})
 	}
 
@@ -3527,7 +3607,35 @@ func (s *State) updateCRMemberInactiveCountV2(lastPosition, needReset, workedInR
 	// if it's the last position and not working in Round then we should add inactiveCountV2++
 	if lastPosition && !needReset && !workedInRound {
 		originInactiveCountV2 := member.InactiveCountV2
+		// FV-10: the CR twin of F-064. The shipped undo guard re-read
+		// member.InactiveCountV2 -- which the forward ZEROES on firing -- so
+		// `>= 3` was false in every reachable state and the undo was dead by
+		// construction: on the firing path the count is 0, on the non-firing path it
+		// is 1 or 2, a later history entry cannot raise it (utils.History rollback is
+		// strictly LIFO, so every later undo has already restored its origin), and a
+		// count that was already >= 3 on entry still fires and still zeroes. A reorg
+		// across the firing block therefore left the member stuck MemberInactive --
+		// i.e. removed from the CRC arbiter set -- with the CR inactivity penalty
+		// against its deposit never reverted.
+		//
+		// Drive the undo off a `fired` flag captured INSIDE the forward, exactly as
+		// F-064 does for the producer sibling, and restore the CAPTURED oriState
+		// rather than hard-coding MemberElected: the caller guarantees Elected today
+		// (countArbitratorsInactivityV3 skips MemberState != MemberElected), but that
+		// is precisely the assumption F-168 was shipped in this file to remove.
+		//
+		// GATE: none. Rollback closures execute only on live reorgs and never during
+		// linear replay, so retained history <= gate 1 derives byte-identically. Same
+		// doctrine as F-064/F-109/F-168/F-180/F-181/F-215.
+		fired := false
+		oriState := member.MemberState
 		s.History.Append(height, func() {
+			fired = false
+			// Captured inside the forward: Append only CACHES the closures, so an
+			// enclosing-scope capture would read pre-block state (see the contract on
+			// History.Append), and a member touched twice in one block would restore
+			// the wrong origin.
+			oriState = member.MemberState
 			member.InactiveCountV2 += 1
 			if member.InactiveCountV2 >= 3 {
 				member.MemberState = state.MemberInactive
@@ -3535,10 +3643,11 @@ func (s *State) updateCRMemberInactiveCountV2(lastPosition, needReset, workedInR
 					s.updateCRInactivePenalty(member.Info.CID, height)
 				}
 				member.InactiveCountV2 = 0
+				fired = true
 			}
 		}, func() {
-			if member.MemberState == state.MemberInactive && member.InactiveCountV2 >= 3 {
-				member.MemberState = state.MemberElected
+			if fired {
+				member.MemberState = oriState
 				if height >= s.ChainParams.CRConfiguration.ChangeCommitteeNewCRHeight {
 					s.revertUpdateCRInactivePenalty(member.Info.CID, height)
 				}
@@ -3901,6 +4010,16 @@ func (s *State) RollbackTo(height uint32) error {
 
 // GetHistory returns a History state instance storing the producers and votes
 // on the historical height.
+//
+// FV-27 -- READ THIS BEFORE WIRING IT TO ANYTHING. This is NOT a read-only query: it
+// is the only production reference to History.SeekTo in the tree, and SeekTo MUTATES
+// the live state by executing the top groups' rollback closures, then leaves the
+// history rewound (seekHeight below height, the groups retained). The caller gets a
+// snapshot; the live producer/vote state stays seeked until the next Commit walks it
+// forward again. RollbackTo no longer double-rolls those groups (see the re-commit at
+// the top of utils.History.RollbackTo), but the mutation itself remains, so exposing
+// this over RPC would let an unauthenticated query rewind consensus state.
+// It has no production caller today; keep it that way, or make it snapshot-only first.
 func (s *State) GetHistory(height uint32) (*StateKeyFrame, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()

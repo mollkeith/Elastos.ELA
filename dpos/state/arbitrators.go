@@ -223,6 +223,32 @@ func (a *Arbiters) recoverFromCheckPoints(point *CheckPoint) {
 	a.History = utils.NewHistory(maxHistoryCapacity)
 	a.State.History = utils.NewHistory(maxHistoryCapacity)
 
+	// FV-12 (F-109 class, third site): reset the height-keyed arbiter snapshot ring
+	// alongside History. recoverFromCheckPoints replaces the WHOLE derived state from
+	// a checkpoint, but the live Arbiters keeps its own Snapshots/SnapshotKeysDesc --
+	// so after a deep reset (reorganizeChain's forkCount >= 720 branch, or an
+	// OnRollbackTo below StartHeight) the ring still carries frames written by the
+	// ABANDONED branch, at exactly the heights the canonical replay will write again.
+	// SnapshotByHeight APPENDS to an existing key rather than replacing it, and
+	// GetSnapshot returns the whole frame slice, so the two arbiter universes are
+	// UNIONED: ProposalContextCheckByHeight / VoteContextCheckByHeight
+	// (blockchain/confirmvalidator.go) and the illegal-proposal / illegal-vote
+	// transaction validators then accept a signer present in ANY frame at that height,
+	// and can mix signers across frames within one confirm. F-082 makes GetSnapshot the
+	// AUTHORITATIVE voter universe for illegal-confirm evidence at and above gate 1,
+	// which increases -- not decreases -- reliance on this ring.
+	//
+	// Both fields are pure in-RAM caches: CheckPoint has no Snapshots field, so
+	// initFromArbitrators can neither transfer nor clear them, and SnapshotByHeight
+	// rebuilds them as the replay proceeds. Nothing is lost.
+	//
+	// GATE: none, same doctrine as the F-109 prune in RollbackTo -- the ring is only
+	// ever polluted on the reorg / deep-reset path, and linear replay of retained
+	// history never calls recoverFromCheckPoints with a populated ring (at startup the
+	// map is empty, so the Restore -> OnInit path is a no-op here).
+	a.Snapshots = make(map[uint32][]*CheckPoint)
+	a.SnapshotKeysDesc = make([]uint32, 0)
+
 	a.DutyIndex = point.DutyIndex
 	a.LastArbitrators = point.LastArbitrators
 	a.CurrentArbitrators = point.CurrentArbitrators
@@ -3328,9 +3354,12 @@ func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
 		a.LastDPoSRewards = make(map[string]map[string]common.Fixed64)
 	}
 
-	// NOT planted by recoverFromCheckPoints (the live Arbiters keeps its own), but
-	// SnapshotByHeight index-writes a.Snapshots[height] unguarded, so a nil here is
-	// the same latent trap one refactor away.
+	// The CheckPoint carries no Snapshots field, so this ring is not planted FROM a
+	// checkpoint -- but the earlier claim that the live Arbiters simply "keeps its
+	// own" was WRONG as a safety argument: surviving the rebuild is precisely the
+	// defect (FV-12), and recoverFromCheckPoints now clears the ring for that reason.
+	// Independently, SnapshotByHeight index-writes a.Snapshots[height] unguarded, so a
+	// nil here is a crash one refactor away.
 	if a.Snapshots == nil {
 		a.Snapshots = make(map[uint32][]*CheckPoint)
 	}

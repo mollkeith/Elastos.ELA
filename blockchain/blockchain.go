@@ -356,6 +356,17 @@ func (b *BlockChain) resetCheckpoints() {
 	b.CkpManager.OnReset()
 }
 
+// discardStaleCheckpoints is the special-tx BOUNDARY for
+// CkpManager.DiscardStaleCheckpoints (FV-01), which reaches ICheckPoint.OnReset and
+// therefore rebuilds the Arbiters wholesale exactly as resetCheckpoints does. Same
+// lock, same [b.mutex ->] specialTxMtx order, and nothing inside re-acquires it.
+func (b *BlockChain) discardStaleCheckpoints(bestHeight uint32) error {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	return b.CkpManager.DiscardStaleCheckpoints(bestHeight)
+}
+
 // replayCheckpointBlock replays ONE retained-history block into the checkpoints.
 //
 // #4 (R2): this is a special-tx BRACKET -- PreProcessSpecialTx marks the savepoint
@@ -418,10 +429,29 @@ func (b *BlockChain) saveBlockCheckpoints(block *DposBlock) {
 		b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, false)
 }
 
-// InitCheckpoint go through all blocks since the genesis block
-// to initialize all checkpoint.
+// InitCheckpoint goes through all blocks since the genesis block to initialize all
+// checkpoints: it restores the checkpoints from disk and replays the retained chain
+// forward into them. STARTUP entry point: it keeps a restored checkpoint exactly as
+// found, which is what the forced-rollback safety net in main.go then inspects
+// through CkpManager.MaxHeight().
 func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
-	barStart func(total uint32), increase func()) (err error) {
+	barStart func(total uint32), increase func()) error {
+	return b.initCheckpoint(interrupt, barStart, increase, false)
+}
+
+// InitCheckpointAfterDeepReset is the reorg deep-reset entry point. It is identical
+// to InitCheckpoint except that a restored checkpoint sitting ABOVE the post-detach
+// best height is discarded and rebuilt rather than trusted -- see
+// Manager.DiscardStaleCheckpoints (FV-01). The distinction is deliberate: only the
+// reorg branch can restore a snapshot written on a branch the node just abandoned,
+// and blanket-discarding at startup would silently convert main.go's
+// forced-rollback refusal into a multi-hour full replay.
+func (b *BlockChain) InitCheckpointAfterDeepReset() error {
+	return b.initCheckpoint(nil, nil, nil, true)
+}
+
+func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
+	barStart func(total uint32), increase func(), discardStale bool) (err error) {
 	bestHeight := b.GetHeight()
 	log.Info("current block height ->", bestHeight)
 	arbiters := DefaultLedger.Arbitrators
@@ -434,6 +464,20 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 			log.Warn(err)
 			err = nil
 		}
+
+		// FV-01: the restore above just wrote the on-disk default snapshots into the
+		// live checkpoints, height included. On the deep-reset path that file may
+		// belong to the branch this reorg is abandoning, and nothing ever lowers a
+		// checkpoint height, so a checkpoint left above bestHeight would make both the
+		// replay below and the caller's attach loop no-ops for it.
+		if discardStale {
+			if e := b.discardStaleCheckpoints(bestHeight); e != nil {
+				err = e
+				done <- struct{}{}
+				return
+			}
+		}
+
 		safeHeight := b.CkpManager.SafeHeight()
 		if startHeight < safeHeight {
 			startHeight = safeHeight + 1
@@ -1698,7 +1742,14 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		// same per-block granularity connectBlock already uses -- so the lock is
 		// released before InitCheckpoint and there is no self-deadlock.
 		b.resetCheckpoints()
-		b.InitCheckpoint(nil, nil, nil)
+		// FV-01: (a) discard any restored checkpoint that is ahead of the post-detach
+		// chain instead of freezing derived state on it, and (b) stop DISCARDING the
+		// rebuild error -- a failed derived-state rebuild must fail the reorg rather
+		// than let it continue with unknown DPoS/CR state.
+		if err := b.InitCheckpointAfterDeepReset(); err != nil {
+			log.Error("[reorganizeChain] deep-reset checkpoint rebuild failed: ", err)
+			return err
+		}
 	}
 
 	// Connect the new best chain blocks.
