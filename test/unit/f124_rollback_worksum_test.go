@@ -135,7 +135,7 @@ func TestF124RollbackPersistsParentWorkSum(t *testing.T) {
 
 	// Run the real forced rollback (tip 3 -> target 1). The LAST RollbackBlock call
 	// rolls back height target+1, whose parent is the new tip at height target.
-	assert.NoError(t, chain.ForceRollback(), "forced rollback must succeed")
+	assert.NoError(t, chain.ForceRollback(nil), "forced rollback must succeed")
 	assert.Equal(t, target, uint32(len(chain.Nodes)-1), "tip must be rewound to target")
 
 	var raw []byte

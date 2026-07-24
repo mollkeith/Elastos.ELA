@@ -184,6 +184,43 @@ var requiredCallSites = []callSite{
 		why: "without the orphan sweep a rolled-back node still SERVES the exploit block by " +
 			"hash over RPC and P2P (PROVEN live)",
 	},
+	{
+		finding: "ROLLBACK-ATOMICITY",
+		file:    "blockchain/forcedrollback.go", fn: "ForceRollback",
+		callee: "rollbackOneBlock",
+		why: "the per-block rewind must go through the phase-probed, header-row-last " +
+			"sequence; inlining the three raw transactions again restores the restart ratchet",
+	},
+	{
+		finding: "ROLLBACK-ATOMICITY (exactly-once)",
+		file:    "blockchain/forcedrollback.go", fn: "rollbackOneBlock",
+		callee:   "forcedRollbackPhase",
+		mustArgs: []string{"node.Hash"},
+		why: "without the persisted-store phase probe a resumed rewind re-runs the " +
+			"per-transaction rollback processors of a block whose rollback already committed",
+	},
+	{
+		finding: "ROLLBACK-ATOMICITY (safety net)",
+		file:    "blockchain/forcedrollback.go", fn: "ForceRollback",
+		callee: "VerifyForcedRollbackComplete",
+		why: "the shipped post-condition compared chain.GetHeight() against the target, " +
+			"which restates the rewind loop's own exit condition and can never fail",
+	},
+	{
+		finding: "ROLLBACK-ATOMICITY (ratchet safety net)",
+		file:    "main.go", fn: "startNode",
+		callee: "CheckForcedRollbackResidue",
+		why: "this is the ONLY check that runs on the boot a ratcheted node comes up on: " +
+			"not armed, tip at the target, exploit block still main-chain indexed and served",
+	},
+	{
+		finding: "PURGE-GUARD",
+		file:    "blockchain/residuecleaner.go", fn: "PurgeForcedRollbackResidue",
+		callee:   "ScanForcedRollbackStore",
+		mustArgs: []string{"target"},
+		why: "the cleaner must decide on the block's OWN header height, not on main-chain " +
+			"membership -- the index an interrupted rollback leaves stale",
+	},
 }
 
 // funcBody finds the (possibly method) declaration named fn in file.

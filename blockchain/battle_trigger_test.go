@@ -153,7 +153,7 @@ func TestBattleForcedRollbackDepthGuard(t *testing.T) {
 	})
 	t.Run("depth-at-capacity-720-refuses-with-sentinel", func(t *testing.T) {
 		b := armChain(t, int(target)+720, target, trigger) // depth == 720
-		e := b.ForceRollback()
+		e := b.ForceRollback(nil)
 		if e == nil {
 			t.Fatal("expected capacity refusal at depth 720")
 		}
@@ -163,14 +163,14 @@ func TestBattleForcedRollbackDepthGuard(t *testing.T) {
 	})
 	t.Run("depth-over-capacity-refuses-with-sentinel", func(t *testing.T) {
 		b := armChain(t, int(target)+5000, target, trigger)
-		e := b.ForceRollback()
+		e := b.ForceRollback(nil)
 		if !errors.Is(e, ErrForcedRollbackExceedsCapacity) {
 			t.Fatalf("depth 5000 must return the non-fatal sentinel, got %v", e)
 		}
 	})
 	t.Run("error-text-names-a-remedy", func(t *testing.T) {
 		b := armChain(t, int(target)+800, target, trigger)
-		e := b.ForceRollback()
+		e := b.ForceRollback(nil)
 		if e == nil || (!contains(e.Error(), "ela-cli rollback") && !contains(e.Error(), "forcedrollbacktrigger")) {
 			t.Fatalf("capacity error must name a remedy, got: %v", e)
 		}

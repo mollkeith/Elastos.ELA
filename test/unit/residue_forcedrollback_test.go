@@ -187,7 +187,7 @@ func TestResidue2ForcedRollbackPurgesBlockStore(t *testing.T) {
 	}
 
 	// Run the REAL forced rollback (tip 3 -> target 1). depth = 2 < maxHistoryCapacity.
-	assert.NoError(t, chain.ForceRollback(), "forced rollback must succeed")
+	assert.NoError(t, chain.ForceRollback(nil), "forced rollback must succeed")
 
 	// The in-RAM tip is now the target.
 	assert.Equal(t, target, uint32(len(chain.Nodes)-1),

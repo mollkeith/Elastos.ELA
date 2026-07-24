@@ -6,95 +6,128 @@
 package blockchain
 
 import (
-	"bytes"
 	"fmt"
 
-	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/common/log"
-	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/database"
 )
 
-// PurgeForcedRollbackResidue removes forced-rollback block-store residue
-// (residue #2) from an ALREADY-rolled-back node, which the in-line ForceRollback
-// purge cannot reach. ForceRollback is idempotent and never re-fires once the tip
-// is at/below the target, so any ffldb-blockidx entry a node kept from a prior
-// rollback -- shipped code that never purged the store, or a crash between the
-// rollback transaction and the in-line purge -- would otherwise be deserialized and
-// served by hash forever (P2P getdata / RPC getblock / HasBlock / IsBlockInStore).
+// PurgeForcedRollbackResidue removes forced-rollback residue that lives ABOVE the
+// rollback target: raw by-hash block-store entries (residue #2), orphaned
+// block-header-index rows, and the stale main-chain index entries an INTERRUPTED
+// rollback leaves behind. ForceRollback is idempotent and never re-fires once the
+// tip is at/below the target, so without this a node keeps deserializing and
+// serving discarded blocks by hash forever (P2P getdata / RPC getblock / HasBlock /
+// IsBlockInStore).
 //
-// It enumerates the raw by-hash block store (ffldb-blockidx) and deletes an entry
-// iff BOTH:
+// GUARD ORDERING -- this is the PURGE-GUARD fix. The shipped version kept an entry
+// whenever `dbFetchHeightByHash` resolved, i.e. whenever the block was still in the
+// main-chain hash->height index. But that is the very index RollbackBlock is
+// responsible for deleting, so an above-target block whose entry survived -- which
+// is EXACTLY the residue an interrupted rollback produces -- was classified
+// "retained" and kept, and the sound height guard below it was never reached. On
+// the live harness that ordering purged 0 of 7. The main-chain lookup is now a
+// SKIP FILTER for retained history (height <= target) rather than a keep-decision,
+// so the height guard is always the one that decides. See ScanForcedRollbackStore.
 //
-//	(1) it is NOT on the retained main chain (absent from the hash->height index), AND
-//	(2) the block's own header height is strictly greater than target.
+// Over-deletion is still impossible: every deletion below is driven by a ref whose
+// height the scan read from the block's OWN header (or, for header rows, from the
+// index key), and every category is filtered on `height > target`.
 //
-// The double guard removes exactly the discarded blocks above the rollback height
-// (including the exploit block) and PROVABLY never touches a <= target entry: guard
-// (2) keeps everything at/below target even if guard (1) somehow matched, and blocks
-// still on the main chain are kept by guard (1). The flat-file (.fdb) bytes are left
-// orphaned/unfetchable (see DBRemoveBlockFromStore).
+// PRECONDITION -- it refuses to run when the retained chain itself extends above
+// the target, i.e. when a block above the target still has BOTH a header-index row
+// and a fetchable block, which is what startup requires to load it into b.Nodes.
+// That is what keeps this safe for the offline `ela-cli purgeresidue` command: run
+// against a node that simply synced forward past the target, it now reports the
+// mistake instead of dismantling a live chain. The old guard (1) provided that
+// protection as a side effect; the precondition provides it explicitly, and unlike
+// guard (1) it does not also protect the residue.
 //
-// It MUST be run with the node STOPPED (single ffldb/leveldb writer). It returns the
-// number of entries purged. It never rewrites the flat files or moves the write
-// cursor, so ffldb reconcileDB stays satisfied and the node resumes normally.
+// It MUST be run with the node STOPPED (single ffldb/leveldb writer) unless it is
+// called from the in-line ForceRollback sweep, which holds the only writer. It
+// returns the number of raw-store entries purged. It never rewrites the flat files
+// or moves the write cursor, so ffldb reconcileDB stays satisfied and the node
+// resumes normally.
 func PurgeForcedRollbackResidue(fflDB IFFLDBChainStore, target uint32) (int, error) {
-	var toDelete []common.Uint256
-
-	// Read pass: collect the residue hashes. Deleting during ForEach iteration is
-	// unsafe, so nothing is mutated here.
-	err := fflDB.View(func(dbTx database.Tx) error {
-		idx := dbTx.Metadata().Bucket(blockLocIndexBucketName)
-		if idx == nil {
-			return fmt.Errorf("purge residue: bucket %q missing", blockLocIndexBucketName)
-		}
-		return idx.ForEach(func(k, v []byte) error {
-			// Block-location entries are keyed by the 32-byte block hash; ignore
-			// anything else that may live in the bucket.
-			if len(k) != HashSize {
-				return nil
-			}
-			var hash common.Uint256
-			copy(hash[:], k)
-
-			// Guard (1): still on the retained main chain -> keep.
-			if _, herr := dbFetchHeightByHash(dbTx, &hash); herr == nil {
-				return nil
-			}
-
-			// Guard (2): read the block's own header height from the raw store
-			// (FetchBlockHeader resolves via ffldb-blockidx, not the main-chain
-			// index, so it works for a rolled-back block).
-			headerBytes, ferr := dbTx.FetchBlockHeader(&hash)
-			if ferr != nil {
-				// Height indeterminable -> conservatively keep (never over-delete).
-				log.Warnf("[PurgeForcedRollbackResidue] header unreadable for %s, "+
-					"keeping: %v", hash.String(), ferr)
-				return nil
-			}
-			var header common2.Header
-			if derr := header.DeserializeNoAux(bytes.NewReader(headerBytes)); derr != nil {
-				log.Warnf("[PurgeForcedRollbackResidue] header undecodable for %s, "+
-					"keeping: %v", hash.String(), derr)
-				return nil
-			}
-			if header.Height > target {
-				toDelete = append(toDelete, hash)
-			}
-			return nil
-		})
-	})
+	scan, err := ScanForcedRollbackStore(fflDB, target)
 	if err != nil {
 		return 0, err
 	}
 
-	// Write pass: delete the collected residue entries.
-	for _, hash := range toDelete {
-		if derr := fflDB.DeleteBlockFromStore(hash); derr != nil {
-			return 0, fmt.Errorf("purge residue: delete %s: %w", hash.String(), derr)
-		}
-		log.Warnf("[PurgeForcedRollbackResidue] purged residual block %s (height > %d)",
-			hash.String(), target)
+	if len(scan.LiveAbove) > 0 {
+		return 0, fmt.Errorf("purge residue: refusing to run -- the retained chain "+
+			"extends above the rollback target %d: %d block(s) above it still have "+
+			"both a header-index row and a stored block, so this node is NOT rolled "+
+			"back to that target (%s). Purging here would dismantle a live chain",
+			target, len(scan.LiveAbove), refsString(scan.LiveAbove))
 	}
-	return len(toDelete), nil
+
+	// Stale main-chain index entries. These can only exist above the target when a
+	// rollback was interrupted before its transaction committed; the derived state
+	// for those blocks was never reverted, so a caller that has not already
+	// diagnosed that (CheckForcedRollbackResidue) must not reach here. The removal
+	// is still performed so the offline cleaner can finish the job on a node whose
+	// state is being rebuilt from scratch anyway.
+	if len(scan.MainChainAbove) > 0 {
+		log.Warnf("[PurgeForcedRollbackResidue] %d stale main-chain index entr(ies) "+
+			"above target %d -- the signature of an interrupted rollback: %s",
+			len(scan.MainChainAbove), target, refsString(scan.MainChainAbove))
+		if err := fflDB.Update(func(dbTx database.Tx) error {
+			meta := dbTx.Metadata()
+			hashIdx := meta.Bucket(hashIndexBucketName)
+			heightIdx := meta.Bucket(heightIndexBucketName)
+			if hashIdx == nil || heightIdx == nil {
+				return fmt.Errorf("purge residue: main-chain index bucket missing")
+			}
+			for _, ref := range scan.MainChainAbove {
+				hash := ref.Hash
+				if derr := hashIdx.Delete(hash[:]); derr != nil {
+					return derr
+				}
+				// Only drop the height->hash row when it actually names this block,
+				// so a retained entry can never be collaterally removed.
+				var serializedHeight [4]byte
+				byteOrder.PutUint32(serializedHeight[:], ref.Height)
+				if cur := heightIdx.Get(serializedHeight[:]); cur != nil &&
+					len(cur) == HashSize && hash.IsEqual(refHash(cur)) {
+					if derr := heightIdx.Delete(serializedHeight[:]); derr != nil {
+						return derr
+					}
+				}
+			}
+			return nil
+		}); err != nil {
+			return 0, err
+		}
+	}
+
+	// Orphaned block-header-index rows. A row whose block is no longer in the store
+	// is inert at startup (initChainState skips it), but leaving it behind means the
+	// index that b.Nodes is rebuilt from disagrees with the retained chain.
+	if len(scan.HeaderRowsAbove) > 0 {
+		if err := fflDB.Update(func(dbTx database.Tx) error {
+			for _, ref := range scan.HeaderRowsAbove {
+				hash := ref.Hash
+				if derr := dbRemoveBlockNodeKey(dbTx, &hash, ref.Height); derr != nil {
+					return derr
+				}
+			}
+			return nil
+		}); err != nil {
+			return 0, fmt.Errorf("purge residue: remove header rows: %w", err)
+		}
+		log.Warnf("[PurgeForcedRollbackResidue] removed %d orphaned block-header index "+
+			"row(s) above target %d", len(scan.HeaderRowsAbove), target)
+	}
+
+	// Raw by-hash store entries. The flat-file (.fdb) bytes are left orphaned and
+	// unfetchable on purpose (see DBRemoveBlockFromStore).
+	for _, ref := range scan.StoredAbove {
+		if derr := fflDB.DeleteBlockFromStore(ref.Hash); derr != nil {
+			return 0, fmt.Errorf("purge residue: delete %s: %w", ref.Hash.String(), derr)
+		}
+		log.Warnf("[PurgeForcedRollbackResidue] purged residual block %s (height %d > %d)",
+			ref.Hash.String(), ref.Height, target)
+	}
+	return len(scan.StoredAbove), nil
 }

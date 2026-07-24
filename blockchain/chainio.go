@@ -583,14 +583,29 @@ func DBStoreBlockNode(dbTx database.Tx, header *common2.Header,
 	return blockIndexBucket.Put(key, value)
 }
 
-// DBRemoveBlockNode stores the block header to the block index bucket.
-// This overwrites the current entry if there exists one.
+// DBRemoveBlockNode removes a block's row from the block index bucket.
 func DBRemoveBlockNode(dbTx database.Tx, header *common2.Header) error {
 	// Write block header data to block index bucket.
 	blockHash := header.Hash()
+	return dbRemoveBlockNodeKey(dbTx, &blockHash, header.Height)
+}
+
+// dbRemoveBlockNodeKey removes a block-index row addressed by hash and height
+// directly, without needing the block body.
+//
+// The forced rollback needs this because it now removes a block's header row LAST,
+// after the raw by-hash store entry is already gone (see rollbackOneBlock), so the
+// header can no longer be re-fetched at that point. It is exactly equivalent:
+// blockIndexKey is built from nothing but the hash and the height, and a BlockNode
+// carries both -- node.Hash is the header hash it was loaded with, node.Height its
+// header height.
+func dbRemoveBlockNodeKey(dbTx database.Tx, blockHash *common.Uint256,
+	height uint32) error {
 	blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
-	key := blockIndexKey(&blockHash, header.Height)
-	return blockIndexBucket.Delete(key)
+	if blockIndexBucket == nil {
+		return fmt.Errorf("remove block node: bucket %q missing", blockIndexBucketName)
+	}
+	return blockIndexBucket.Delete(blockIndexKey(blockHash, height))
 }
 
 // blockIndexKey generates the binary key for an entry in the block index

@@ -195,7 +195,7 @@ func startNode(cfg *config.Configuration) {
 	if forcedRollbackFired {
 		log.Warnf("forced rollback armed: this node holds block %s; rewinding to %d",
 			cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight)
-		if e := chain.ForceRollback(); e != nil {
+		if e := chain.ForceRollback(interrupt.C); e != nil {
 			if errors.Is(e, blockchain.ErrForcedRollbackExceedsCapacity) {
 				// Late-upgrade cohort: tip is beyond the incremental-rewind window.
 				// Do NOT brick the node into a permanent boot loop; log the remedy and
@@ -204,11 +204,35 @@ func startNode(cfg *config.Configuration) {
 					"chain; recover via wipe+resync under the strict binary, or a manual "+
 					"`ela-cli rollback %d` then restart.", e, cfg.ForcedRollbackHeight)
 			} else {
+				// Includes ErrForcedRollbackInterrupted, which is NOT a corruption
+				// report: the rewind stops at a block boundary and continues on the
+				// next start, because a block's header-index row -- the row b.Nodes is
+				// rebuilt from, and therefore the row that both the arming predicate
+				// and the rewind bound depend on -- is now deleted only after all of
+				// that block's destructive work is durably committed.
 				printErrorAndExit(e)
 			}
-		} else if h := chain.GetHeight(); h != cfg.ForcedRollbackHeight {
-			printErrorAndExit(fmt.Errorf(
-				"forced rollback: block store tip is %d, expected exactly %d", h, cfg.ForcedRollbackHeight))
+		}
+		// The post-condition that used to sit here compared chain.GetHeight() against
+		// the target. GetHeight() is len(b.Nodes)-1 and the rewind loop's exit
+		// condition is exactly len(b.Nodes)-1 <= target, so the check restated the
+		// loop and could not fail for any store contents whatsoever. ForceRollback now
+		// asserts the PERSISTED store (VerifyForcedRollbackComplete: no main-chain
+		// entry, no header-index row, no raw by-hash entry and no best-chain state
+		// above the target) and surfaces the failure through the error above.
+	} else if cfg.ForcedRollbackTrigger != "" && cfg.ForcedRollbackHeight != 0 &&
+		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight {
+		// The boot a RATCHETED node comes up on. Under the shipped ordering each
+		// interrupted rewind destroyed one block-header-index row before its rollback
+		// transaction committed, so after (tip-target) restarts the arming predicate
+		// went false at exactly the target while every discarded block -- including
+		// block 2,260,451 -- was still main-chain indexed, still in the raw store and
+		// still served by hash, with none of its UTXO/derived-state rollback applied.
+		// Neither shipped safety net could see it: the height assertion was
+		// tautological and the checkpoint assertion was guarded by
+		// `if forcedRollbackFired`, which is false on precisely this boot.
+		if e := chain.CheckForcedRollbackResidue(); e != nil {
+			printErrorAndExit(e)
 		}
 	}
 
@@ -344,7 +368,17 @@ func startNode(cfg *config.Configuration) {
 	// NOTE: this asserts the replay BASELINE, not the rebuilt CONTENT. A byte-level
 	// comparison of the derived arbiter/CR set at the target against a freshly-synced
 	// reference is the definitive check and is gated on the testnet reproduction.
-	if forcedRollbackFired {
+	//
+	// The condition is deliberately NOT `forcedRollbackFired` alone. That made the
+	// assertion skip exactly the boot on which an already-rewound node comes up --
+	// the rewind having happened in an earlier process -- so a snapshot that drifted
+	// to/above the target between runs was never caught. It now also runs whenever a
+	// forced rollback is configured and this node is sitting at or below the target,
+	// which is the state in which the pre-target-baseline property is load-bearing.
+	if forcedRollbackFired || (cfg.ForcedRollbackTrigger != "" &&
+		cfg.ForcedRollbackHeight != 0 &&
+		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight &&
+		chain.GetHeight() <= cfg.ForcedRollbackHeight) {
 		mh := chain.CkpManager.MaxHeight()
 		if mh >= cfg.ForcedRollbackHeight {
 			printErrorAndExit(fmt.Errorf(

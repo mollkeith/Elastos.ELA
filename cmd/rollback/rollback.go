@@ -94,22 +94,31 @@ func rollbackAction(c *cli.Context) error {
 		if err != nil {
 			return err
 		}
-		if err = removeBlockNode(chainStore.GetFFLDB(), &block.Header); err != nil {
-			return err
-		}
 		fmt.Println("block hash before rollback:", block.Hash())
+		// ORDERING: the rollback transaction FIRST, the block-header index row LAST.
+		// removeBlockNode used to run first, and it deletes the row that b.Nodes is
+		// rebuilt from at startup -- so an interruption or an error before
+		// RollbackBlock committed left that block permanently un-rollbackable while
+		// it stayed main-chain indexed and served by hash. Same defect, and same fix,
+		// as blockchain.rollbackOneBlock: keeping the header row until every
+		// destructive step is durably committed makes the rewind resumable, because
+		// the block is still in nodes on the next run.
 		err = chainStore.RollbackBlock(block.Block, nodes[i], nil, blockchain.CalcPastMedianTime(nodes[i-1]))
 		if err != nil {
 			fmt.Println("rollback block failed, ", block.Height, err)
 			return err
 		}
 
-		// Residue #2 parity: RollbackBlock/removeBlockNode clear the header, height and
-		// tx indexes but NOT the raw by-hash entry in ffldb-blockidx, so without this the
-		// manually rolled-back node keeps serving the discarded blocks by hash (same defect
-		// the forced-rollback path fixes). Purge the raw-store location entry too.
+		// Residue #2 parity: RollbackBlock clears the height and tx indexes but NOT
+		// the raw by-hash entry in ffldb-blockidx, so without this the manually
+		// rolled-back node keeps serving the discarded blocks by hash (same defect the
+		// forced-rollback path fixes). Purge the raw-store location entry too.
 		if err = chainStore.GetFFLDB().DeleteBlockFromStore(*nodes[i].Hash); err != nil {
 			fmt.Println("purge block store failed, ", block.Height, err)
+			return err
+		}
+
+		if err = removeBlockNode(chainStore.GetFFLDB(), &block.Header); err != nil {
 			return err
 		}
 
