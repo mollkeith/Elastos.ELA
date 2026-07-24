@@ -1870,6 +1870,68 @@ func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payloa
 // connectBlockBracketed is connectBlock's body: every step that must run inside the
 // F-093/F-094/N-001 special-tx bracket, and nothing else.
 func (b *BlockChain) connectBlockBracketed(node *BlockNode, block *Block, confirm *payload.Confirm) (err error) {
+	var revertToPOW bool
+	for _, tx := range block.Transactions {
+		if tx.IsRevertToPOW() {
+			revertToPOW = true
+			break
+		}
+	}
+
+	// confirmValidated is the SINGLE expression that decides whether a peer-supplied
+	// Confirm is membership/quorum-checked (checkBlockWithConfirmation -> ConfirmContextCheck)
+	// before it is persisted and served. It is computed once here and consumed twice: by
+	// the NX-06 refusal immediately below and by the check itself further down, so the two
+	// can never drift apart.
+	confirmValidated := confirm != nil &&
+		block.Height >= b.chainParams.CRCOnlyDPOSHeight && !revertToPOW &&
+		b.state.ConsensusAlgorithm != state.POW
+
+	// NX-06: on the legs where confirmValidated is false, a Confirm that arrives with the
+	// block is stored and served WITHOUT any membership or quorum check. ConfirmSanityCheck
+	// (mempool/blockpool.go:192) is pure self-signature -- a wholly fresh keypair satisfies
+	// it at 0, 1 or 25 votes -- and ConfirmContextCheck, the only membership/quorum check on
+	// the block path, is reached from exactly one call site (checkBlockWithConfirmation)
+	// behind this same predicate. The Confirm is outside Block.Hash(), so an attacker needs
+	// no hashpower and no keys: he takes an honest block off the wire, staples any Confirm to
+	// it and serves it to peers that have not stored that block yet. connectBlockBracketed
+	// then persists it (dbStoreBlock below, SaveBlock after it) and Arbiters.ProcessBlock
+	// reads confirm.Proposal.Sponsor out of it. One block later the RecordSponsor rule in
+	// CheckBlockContext (live since RecordSponsorStartHeight) splits on Confirm presence:
+	// poisoned nodes then either halt (no valid successor exists) or partition.
+	//
+	// POW-mode and revertToPOW blocks legitimately carry NO confirm -- that is the
+	// confirm-exempt rescue-block design -- so refusing the block is the faithful reading of
+	// the exemption: exempt from REQUIRING a confirm is not licence to accept an unchecked
+	// one. Refusing is safe for liveness: the node is not marked bad (the block node is only
+	// added to the index after a successful connect, and nothing sets statusValidateFailed),
+	// so the honest confirm-less copy of the very same block is still accepted afterwards.
+	//
+	// CENSUS (executed over the read-only retained mainnet copy, 2,260,597 records, 0 crc
+	// and 0 parse failures): ZERO stored blocks carry a confirm on ANY of the three legs --
+	// 0 confirms below CRCOnlyDPOSHeight (lowest confirm anywhere is exactly 343400), 0 of
+	// the 30 RevertToPOW-carrying blocks have one, and the four maximal no-confirm runs above
+	// CRCOnlyDPOSHeight ([1184559..1184571], [1405191..1405965], [1407423..1407542],
+	// [2128711..2129101], 1299 blocks) cover every height at which the dpos state was POW. In
+	// all 46 RevertToDPOS cases the block AT DPOSWorkHeight -- the last block validated while
+	// ConsensusAlgorithm is still POW, because State.ProcessBlock flips it only after that
+	// block is connected (saveBlockCheckpoints runs after connectBestChain) -- carries no
+	// confirm; the first confirm-carrying block is DPOSWorkHeight+1, validated in DPOS mode.
+	// So this rule rejects nothing the real chain ever produced, and in particular it does
+	// NOT fire at the POW->DPoS transition the recovery fork has to cross.
+	//
+	// Gate 1 (StrictMoneyRangeHeight), the existing coordinated activation -- no third gate.
+	// Below the gate the legs stay open for replay-safety; see the residual note in the
+	// batch report (a malicious sync peer can still poison a node replaying the historical
+	// POW windows, all of which sit below 2129102).
+	if confirm != nil && !confirmValidated &&
+		block.Height >= b.chainParams.StrictMoneyRangeHeight {
+		return fmt.Errorf("block %s at height %d carries a confirm on an acceptance "+
+			"leg that performs no membership or quorum check (revertToPOW=%v, "+
+			"consensus is POW=%v): refusing the block", block.Hash(), block.Height,
+			revertToPOW, b.state.ConsensusAlgorithm == state.POW)
+	}
+
 	// F-093/F-094: PreProcessSpecialTx applies the emergency ForceChange (arbiter
 	// rotation, forceChanged flag, processed-payload marker, snapshot frame) BEFORE
 	// the block is context-checked, confirm-checked and stored -- and it commits that
@@ -1907,16 +1969,7 @@ func (b *BlockChain) connectBlockBracketed(node *BlockNode, block *Block, confir
 		log.Error("PowCheckBlockContext error!", err)
 		return err
 	}
-	var revertToPOW bool
-	for _, tx := range block.Transactions {
-		if tx.IsRevertToPOW() {
-			revertToPOW = true
-			break
-		}
-	}
-
-	if block.Height >= b.chainParams.CRCOnlyDPOSHeight && !revertToPOW &&
-		b.state.ConsensusAlgorithm != state.POW && confirm != nil {
+	if confirmValidated {
 		if err := checkBlockWithConfirmation(block, confirm,
 			b.CkpManager, b.state.ConsensusAlgorithm == state.POW); err != nil {
 			return fmt.Errorf("block confirmation validate failed: %s", err)

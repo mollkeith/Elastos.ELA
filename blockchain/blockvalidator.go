@@ -864,7 +864,10 @@ func checkCoinbaseBIP30(coinbaseHash Uint256, height, gate uint32, isDuplicate f
 	return nil
 }
 
-func (b *BlockChain) checkTxsContext(block *Block) error {
+// checkTxsContext validates every non-coinbase transaction of block in the context
+// of the chain ENDING AT prevNode -- the block's own parent, not the validating
+// node's best tip (FV-22).
+func (b *BlockChain) checkTxsContext(block *Block, prevNode *BlockNode) error {
 	if len(block.Transactions) > 0 {
 		if err := checkCoinbaseBIP30(block.Transactions[0].Hash(), block.Height,
 			b.chainParams.StrictMoneyRangeHeight, b.db.IsTxHashDuplicate); err != nil {
@@ -875,8 +878,8 @@ func (b *BlockChain) checkTxsContext(block *Block) error {
 
 	var proposalsUsedAmount Fixed64
 	for i := 1; i < len(block.Transactions); i++ {
-		references, errCode := b.CheckTransactionContext(block.Height,
-			block.Transactions[i], proposalsUsedAmount, block.Timestamp)
+		references, errCode := b.CheckTransactionContextWithPrev(prevNode,
+			block.Height, block.Transactions[i], proposalsUsedAmount, block.Timestamp)
 		if errCode != nil {
 			return elaerr.SimpleWithMessage(elaerr.ErrBlockValidation, errCode,
 				"CheckTransactionContext failed when verify block")
@@ -1091,7 +1094,7 @@ func (b *BlockChain) CheckBlockContext(block *Block, prevNode *BlockNode) error 
 	if err := DefaultLedger.Arbitrators.CheckCustomIDResultsTx(block); err != nil {
 		return err
 	}
-	return b.checkTxsContext(block)
+	return b.checkTxsContext(block, prevNode)
 }
 
 func (b *BlockChain) CheckTransactions(block *Block) error {

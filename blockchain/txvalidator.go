@@ -72,13 +72,52 @@ func (b *BlockChain) CheckTransactionSanity(blockHeight uint32,
 	return txn.SanityCheck(para)
 }
 
-// CheckTransactionContext verifies a transaction with history transaction in ledger
+// CheckTransactionContext verifies a transaction with history transaction in ledger.
+//
+// FV-22: the parent is taken to be the current best tip. That is correct for the
+// mempool and mining callers -- a transaction admitted now is destined for
+// BestChain+1 -- and it is what this function used implicitly before. The BLOCK
+// path must NOT use it; it calls CheckTransactionContextWithPrev with the parent of
+// the block actually being validated.
 func (b *BlockChain) CheckTransactionContext(blockHeight uint32,
 	tx interfaces.Transaction, proposalsUsedAmount common.Fixed64, timeStamp uint32) (
 	map[*common2.Input]common2.Output, elaerr.ELAError) {
 
+	return b.CheckTransactionContextWithPrev(b.BestChain, blockHeight, tx,
+		proposalsUsedAmount, timeStamp)
+}
+
+// CheckTransactionContextWithPrev is CheckTransactionContext with the parent of the
+// block under validation made explicit.
+//
+// FV-22 (UNGATED): RevertToPOWTransaction.SpecialContextCheck decides block
+// acceptance on "how long since the previous block", and read that from
+// BlockChain.BestChain.Timestamp -- the VALIDATING NODE'S CURRENT TIP. For any block
+// arriving on a competing branch BestChain is not that block's ancestor, so the
+// decision was taken against a timestamp from an unrelated chain: two nodes with
+// different tips could reach opposite verdicts on the same block. Binding it to the
+// block's own parent makes the decision a pure function of the block's ancestry.
+//
+// UNGATED on measured evidence, not on assumption: over the retained mainnet copy
+// every one of the 2,260,596 stored heights links to a stored parent (one linear
+// chain, one fork point at 1832750), so during linear replay the tip when block H is
+// validated IS its parent; and evaluating the production NoBlock rule against each
+// block's OWN parent, all 29 NoBlock-type RevertToPOW transactions in history still
+// pass, with margins from +12s to +42040s. Zero retained blocks change verdict, so no
+// coordinated activation is needed and no third gate is introduced.
+func (b *BlockChain) CheckTransactionContextWithPrev(prevNode *BlockNode,
+	blockHeight uint32, tx interfaces.Transaction,
+	proposalsUsedAmount common.Fixed64, timeStamp uint32) (
+	map[*common2.Input]common2.Output, elaerr.ELAError) {
+
 	para := functions.GetTransactionParameters(
 		tx, blockHeight, timeStamp, b.chainParams, b, proposalsUsedAmount)
+
+	if prevNode != nil {
+		if pa, ok := para.(interfaces.PrevBlockAware); ok {
+			pa.SetPrevBlockTimestamp(prevNode.Timestamp)
+		}
+	}
 
 	references, contextErr := tx.ContextCheck(para)
 	if contextErr != nil {

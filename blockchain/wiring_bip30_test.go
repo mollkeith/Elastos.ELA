@@ -145,7 +145,7 @@ func TestWiringBIP30BaselineAcceptsCleanCoinbase(t *testing.T) {
 	b := bip30Chain(t, store)
 	for _, h := range []uint32{wiringBelowGate, wiringGate, wiringGate + 1} {
 		blk := bip30Block(t, b, h, []byte{1, 2, 3})
-		if err := b.checkTxsContext(blk); err != nil {
+		if err := b.checkTxsContext(blk, nil); err != nil {
 			t.Fatalf("baseline block at height %d must pass checkTxsContext, got: %v", h, err)
 		}
 	}
@@ -166,7 +166,7 @@ func TestWiringBIP30ReachedFromCheckTxsContext(t *testing.T) {
 		blk := bip30Block(t, b, h, []byte{9, byte(h & 0xff)})
 		store.dup[blk.Transactions[0].Hash()] = true
 
-		err := b.checkTxsContext(blk)
+		err := b.checkTxsContext(blk, nil)
 		if err == nil {
 			t.Fatalf("INFLATION-CLASS WIRING SEVERED at height %d: checkTxsContext accepted a "+
 				"block whose coinbase txid already exists in the ledger — the F-089 BIP30 "+
@@ -203,7 +203,7 @@ func TestWiringBIP30BelowGateStaysLegacy(t *testing.T) {
 	for _, h := range []uint32{wiringBelowGate - 1_000_000, wiringBelowGate} {
 		blk := bip30Block(t, b, h, []byte{7, byte(h & 0xff)})
 		store.dup[blk.Transactions[0].Hash()] = true
-		if err := b.checkTxsContext(blk); err != nil {
+		if err := b.checkTxsContext(blk, nil); err != nil {
 			t.Fatalf("REPLAY BREAK at height %d: a duplicate coinbase below the gate must be "+
 				"accepted (legacy behaviour), got: %v", h, err)
 		}
@@ -222,13 +222,13 @@ func TestWiringBIP30GateArgumentIsTheCampaignGate(t *testing.T) {
 
 	below := bip30Block(t, b, moved-1, []byte{5, 1})
 	store.dup[below.Transactions[0].Hash()] = true
-	if err := b.checkTxsContext(below); err != nil {
+	if err := b.checkTxsContext(below, nil); err != nil {
 		t.Fatalf("below the moved gate a duplicate coinbase must be accepted, got: %v", err)
 	}
 
 	at := bip30Block(t, b, moved, []byte{5, 2})
 	store.dup[at.Transactions[0].Hash()] = true
-	if err := b.checkTxsContext(at); err == nil {
+	if err := b.checkTxsContext(at, nil); err == nil {
 		t.Fatal("at the moved gate a duplicate coinbase must be rejected: the call site does " +
 			"not pass b.chainParams.StrictMoneyRangeHeight")
 	}

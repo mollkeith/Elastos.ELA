@@ -217,6 +217,32 @@ var requiredCallSites = []callSite{
 		why:    "an in-place checkpoint write leaves a short file that is still promoted to default",
 	},
 	{
+		finding: "FV-22 (change 1) — block path",
+		file:    "blockchain/blockvalidator.go", fn: "checkTxsContext",
+		callee:   "CheckTransactionContextWithPrev",
+		mustArgs: []string{"prevNode"},
+		why: "the block path must context-check transactions against the parent of the block " +
+			"under validation; reverting to CheckTransactionContext re-binds the RevertToPOW " +
+			"no-block rule to the validating node's current tip, which is not that block's " +
+			"ancestor on a competing branch",
+	},
+	{
+		finding: "FV-22 (change 1) — parent link",
+		file:    "blockchain/blockvalidator.go", fn: "CheckBlockContext",
+		callee:   "checkTxsContext",
+		mustArgs: []string{"prevNode"},
+		why: "CheckBlockContext holds the real parent; dropping it from this call silently " +
+			"restores the tip-relative behaviour one level up",
+	},
+	{
+		finding: "FV-22 (change 1) — parameter handover",
+		file:    "blockchain/txvalidator.go", fn: "CheckTransactionContextWithPrev",
+		callee:   "SetPrevBlockTimestamp",
+		mustArgs: []string{"prevNode.Timestamp"},
+		why: "without this handover the parent is accepted by the signature and then ignored, " +
+			"which is the FV-25 pattern: a call that is wired but inert",
+	},
+	{
 		finding: "Residue #2",
 		file:    "blockchain/forcedrollback.go", fn: "ForceRollback",
 		callee:   "PurgeForcedRollbackResidue",

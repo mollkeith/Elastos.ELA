@@ -23,6 +23,16 @@
 // call from checkCoinbaseTransactionContext -> the at/above-gate cases return nil -> these
 // tests FAIL. Restoring the pin ONLY in the coinbase's SpecialContextCheck (i.e. reverting
 // to the shipped F-031 shape) does NOT make them pass, which is the whole point.
+//
+// FV-22 REBASE NOTE (why these call sites pass nil). checkTxsContext now takes the block's
+// own parent as a second argument, so the RevertToPOW no-block rule is evaluated against
+// the block's ancestry instead of the validating node's tip. nil here is DELIBERATE, not
+// convenience: fv19Block builds a block whose ONLY transaction is the coinbase, and
+// prevNode is consumed exclusively inside the `for i := 1; i < len(block.Transactions)`
+// loop in checkTxsContext, which therefore never executes for these blocks. Neither
+// checkCoinbaseBIP30 nor checkCoinbaseLockTimePin -- the two guards every assertion below
+// keys on -- takes a parent. So no FV-19 assertion can read prevNode and nil cannot
+// silently weaken one; a synthetic parent would be unreachable dead weight.
 package blockchain
 
 import (
@@ -85,7 +95,7 @@ func TestFV19BaselineHonestCoinbaseAccepted(t *testing.T) {
 	store := &bip30Store{dup: map[common.Uint256]bool{}}
 	b := bip30Chain(t, store)
 	for _, h := range []uint32{wiringBelowGate, wiringGate, wiringGate + 1} {
-		if err := b.checkTxsContext(fv19Block(t, b, h, h)); err != nil {
+		if err := b.checkTxsContext(fv19Block(t, b, h, h), nil); err != nil {
 			t.Fatalf("baseline: an honest coinbase (LockTime == height) at %d must be "+
 				"accepted, got: %v", h, err)
 		}
@@ -109,7 +119,7 @@ func TestFV19ImmatureCoinbaseRejectedOnTheConnectPath(t *testing.T) {
 			"LockTime>height (uint32 underflow)":  h + 1000,
 			"LockTime<height (stale, not pinned)": h - 1,
 		} {
-			err := b.checkTxsContext(fv19Block(t, b, h, lock))
+			err := b.checkTxsContext(fv19Block(t, b, h, lock), nil)
 			if err == nil {
 				t.Fatalf("FV-19 at height %d, %s: checkTxsContext ACCEPTED a coinbase whose "+
 					"LockTime is not its block height — the pin is not enforced on the "+
@@ -131,7 +141,7 @@ func TestFV19BelowGateStaysLegacy(t *testing.T) {
 	store := &bip30Store{dup: map[common.Uint256]bool{}}
 	b := bip30Chain(t, store)
 	for _, h := range []uint32{wiringBelowGate - 1_000_000, wiringBelowGate} {
-		if err := b.checkTxsContext(fv19Block(t, b, h, 0)); err != nil {
+		if err := b.checkTxsContext(fv19Block(t, b, h, 0), nil); err != nil {
 			t.Fatalf("REPLAY BREAK at height %d: a LockTime=0 coinbase below the gate must be "+
 				"accepted (legacy behaviour), got: %v", h, err)
 		}
@@ -148,10 +158,10 @@ func TestFV19GateArgumentIsTheCampaignGate(t *testing.T) {
 	moved := uint32(900_000)
 	b.chainParams.StrictMoneyRangeHeight = moved
 
-	if err := b.checkTxsContext(fv19Block(t, b, moved-1, 0)); err != nil {
+	if err := b.checkTxsContext(fv19Block(t, b, moved-1, 0), nil); err != nil {
 		t.Fatalf("below the moved gate a LockTime=0 coinbase must be accepted, got: %v", err)
 	}
-	if err := b.checkTxsContext(fv19Block(t, b, moved, 0)); err == nil {
+	if err := b.checkTxsContext(fv19Block(t, b, moved, 0), nil); err == nil {
 		t.Fatal("at the moved gate a LockTime=0 coinbase must be rejected: the call site does " +
 			"not pass b.chainParams.StrictMoneyRangeHeight")
 	}
