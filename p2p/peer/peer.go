@@ -41,6 +41,11 @@ const (
 	// negotiateTimeout is the duration of inactivity before we timeout a
 	// peer that hasn't completed the initial version negotiation.
 	negotiateTimeout = 30 * time.Second
+
+	// queueMessageTimeout is the maximum duration QueueMessage waits for room
+	// in the output queue before it gives up on the peer.  See QueueMessage
+	// for why an unbounded wait is not acceptable (F-150).
+	queueMessageTimeout = 30 * time.Second
 )
 
 // outMsg is used to house a message to be sent along with a channel to signal
@@ -1008,14 +1013,55 @@ func (p *Peer) QueueMessage(msg p2p.Message, doneChan chan<- struct{}) {
 	// we will be sending to hangs around until it knows for a fact that
 	// it is marked as disconnected and *then* it drains the channels.
 	if !p.Connected() {
-		if doneChan != nil {
-			go func() {
-				doneChan <- struct{}{}
-			}()
-		}
+		p.signalDone(doneChan)
 		return
 	}
-	p.outputQueue <- outMsg{msg: msg, doneChan: doneChan}
+
+	// Fast path, there is room in the output queue.
+	select {
+	case p.outputQueue <- outMsg{msg: msg, doneChan: doneChan}:
+		return
+	default:
+	}
+
+	// F-150/F-116: the output queue is full, so never wait on it forever.
+	// AssociateConnection marks the peer connected and the server registers it
+	// (OnVersion -> AddPeer) before start() launches queueHandler, so there is
+	// a window in which nothing drains outputQueue at all; and once the peer
+	// is disconnected queueHandler never runs again to drain it either.  An
+	// unguarded send therefore blocks the caller forever - and the caller is
+	// frequently the single peerHandler goroutine (handleBroadcastMsg) or the
+	// relay handler, so one peer that stops reading takes down peer management
+	// server wide.  Give up on the peer instead: dropping a queued message to
+	// a peer whose queue is already full is always safe, it is exactly what
+	// the not connected branch above already does.
+	timer := time.NewTimer(queueMessageTimeout)
+	defer timer.Stop()
+
+	select {
+	case p.outputQueue <- outMsg{msg: msg, doneChan: doneChan}:
+
+	case <-p.quit:
+		p.signalDone(doneChan)
+
+	case <-timer.C:
+		log.Warnf("Peer %s output queue full for %v -- disconnecting", p,
+			queueMessageTimeout)
+		p.Disconnect()
+		p.signalDone(doneChan)
+	}
+}
+
+// signalDone notifies the given done channel without blocking the caller, it
+// is used when a message will not be delivered so whoever waits on the channel
+// is not left hanging.
+func (p *Peer) signalDone(doneChan chan<- struct{}) {
+	if doneChan == nil {
+		return
+	}
+	go func() {
+		doneChan <- struct{}{}
+	}()
 }
 
 // Connected returns whether or not the peer is currently connected.
@@ -1110,9 +1156,20 @@ func (p *Peer) localVersionMsg() (*msg.Version, error) {
 	// Generate a unique nonce for this peer so self connections can be
 	// detected.  This is accomplished by adding it to a size-limited map of
 	// recently seen nonces.
-
-	var nonce [8]byte
-	rand.Read(nonce[:])
+	//
+	// F-154: the nonce must come from the configured provider when there is
+	// one, because that is what records it in the caller's sent nonce cache.
+	// Generating a private nonce here left that cache permanently empty, so
+	// IsSelfConnection could never return true and self connection detection
+	// was entirely inert.
+	var versionNonce uint64
+	if p.cfg.GetVersionNonce != nil {
+		versionNonce = p.cfg.GetVersionNonce()
+	} else {
+		var nonce [8]byte
+		rand.Read(nonce[:])
+		versionNonce = binary.BigEndian.Uint64(nonce[:])
+	}
 
 	var m *msg.Version
 	bestHeight := p.cfg.BestHeight()
@@ -1121,11 +1178,13 @@ func (p *Peer) localVersionMsg() (*msg.Version, error) {
 	if bestHeight >= p.cfg.NewVersionHeight {
 		nodeVersion = p.cfg.NodeVersion
 		ver = pact.CRProposalVersion
-		p.cfg.ProtocolVersion = ver
+		// F-157: do not write the negotiated version back into the config.
+		// ver is used locally below and the assignment is a side effect on
+		// state that other goroutines read.
 	}
 	// Version message.
 	m = msg.NewVersion(ver, p.cfg.DefaultPort,
-		p.cfg.Services, binary.BigEndian.Uint64(nonce[:]), bestHeight, p.cfg.DisableRelayTx, nodeVersion)
+		p.cfg.Services, versionNonce, bestHeight, p.cfg.DisableRelayTx, nodeVersion)
 
 	return m, nil
 }

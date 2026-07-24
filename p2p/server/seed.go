@@ -124,6 +124,10 @@ func (s *seed) discover(host string, addrChan chan []*p2p.NetAddress,
 	conn, err := net.Dial("tcp", host)
 	if err != nil {
 		log.Debugf("Can not connect to host %s, %s", host, err)
+		// F-152: fromDNS blocks on addrChan and only removes the host from
+		// the seeding set once it receives, so returning without a send
+		// disables this DNS seed for the lifetime of the process.
+		addrChan <- nil
 		return
 	}
 
@@ -132,6 +136,8 @@ func (s *seed) discover(host string, addrChan chan []*p2p.NetAddress,
 	if err != nil {
 		log.Debugf("Cannot create outbound peer %s: %v", host, err)
 		conn.Close()
+		// F-152: same as above, the caller must be released.
+		addrChan <- nil
 		return
 	}
 	p.AssociateConnection(conn)
