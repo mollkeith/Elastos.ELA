@@ -127,7 +127,12 @@ func (msg *FilterLoad) Deserialize(r io.Reader) error {
 		var txType byte
 		err = common.ReadElement(r, &txType)
 		if err != nil {
-			return nil
+			// F-184: this returned nil, so a peer that declared N tx types and
+			// then truncated the list got a silently shortened filter installed
+			// instead of a decode failure. The io.EOF tolerance above is the
+			// intended back-compat for peers that omit the TxTypes field
+			// entirely; a short read mid-list is simply malformed.
+			return err
 		}
 		msg.TxTypes = append(msg.TxTypes, common2.TxType(txType))
 	}

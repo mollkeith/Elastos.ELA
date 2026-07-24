@@ -355,11 +355,58 @@ func ReadVarBytes(r io.Reader, maxAllowed uint32, fieldName string) ([]byte, err
 		return nil, FuncError("ReadVarBytes", str)
 	}
 
-	b := make([]byte, count)
-	_, err = io.ReadFull(r, b)
-	if err != nil {
-		return nil, err
+	return readFullAlloc(r, count)
+}
+
+// maxPreallocBytes bounds how many bytes a single ReadVarBytes field may
+// allocate up front. A declared length above this is read in chunks, so a peer
+// has to actually deliver the bytes before the node allocates them.
+//
+// F-053: ReadVarBytes used to do make([]byte, count) before reading anything,
+// so a ~10 byte wire fragment declaring MaxVarStringLength (16MB) forced a 16MB
+// allocation that was then thrown away on the ReadFull error. The call sites
+// that decode attacker-supplied fields (transaction attributes among them) reach
+// this from a few bytes of input.
+//
+// This is an allocation-strategy change only. The bytes accepted, the bytes
+// rejected and the errors returned are identical to make()+io.ReadFull, so no
+// acceptance decision moves.
+const maxPreallocBytes = 64 * 1024
+
+// readFullAlloc reads exactly count bytes from r without pre-allocating count
+// bytes up front. Error semantics match make([]byte, count) + io.ReadFull:
+// io.EOF when nothing at all could be read, io.ErrUnexpectedEOF on a partial
+// read, and the underlying error otherwise.
+func readFullAlloc(r io.Reader, count uint64) ([]byte, error) {
+	if count <= maxPreallocBytes {
+		b := make([]byte, count)
+		if _, err := io.ReadFull(r, b); err != nil {
+			return nil, err
+		}
+		return b, nil
 	}
+
+	b := make([]byte, 0, maxPreallocBytes)
+	chunk := make([]byte, maxPreallocBytes)
+	for uint64(len(b)) < count {
+		size := count - uint64(len(b))
+		if size > maxPreallocBytes {
+			size = maxPreallocBytes
+		}
+
+		n, err := io.ReadFull(r, chunk[:size])
+		b = append(b, chunk[:n]...)
+		if err != nil {
+			// make()+io.ReadFull would have seen the whole field as one read,
+			// so a short chunk after some bytes already landed is an
+			// unexpected EOF, not a clean EOF.
+			if err == io.EOF && len(b) > 0 {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+
 	return b, nil
 }
 

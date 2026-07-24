@@ -37,8 +37,10 @@ func (s *ConsensusStatus) Serialize(w io.Writer) error {
 		return err
 	}
 
+	// F-183: this returned nil, so a failed count write reported success and
+	// emitted a status message truncated at the accept-vote list.
 	if err := common.WriteVarUint(w, uint64(len(s.AcceptVotes))); err != nil {
-		return nil
+		return err
 	}
 	for _, v := range s.AcceptVotes {
 		if err := v.Serialize(w); err != nil {
@@ -93,8 +95,11 @@ func (s *ConsensusStatus) Deserialize(r io.Reader) error {
 	s.ViewStartTime = time.Unix(0, int64(startTimeUnix))
 
 	var arrayLength uint64
+	// F-183: this returned nil, so a status message truncated right after the
+	// view start time decoded "successfully" into an empty status, and DPoS
+	// view recovery then treated that empty status as a real peer answer.
 	if arrayLength, err = common.ReadVarUint(r, 0); err != nil {
-		return nil
+		return err
 	}
 	s.AcceptVotes = make([]payload.DPOSProposalVote, 0)
 	for i := uint64(0); i < arrayLength; i++ {
