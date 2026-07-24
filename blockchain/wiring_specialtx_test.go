@@ -59,12 +59,6 @@ type recArbiters struct {
 	calls []string
 
 	// F-032 capture (see wiring_recordsponsor_test.go).
-	sponsorErr         error
-	sponsorCalls       int
-	sponsorRecorded    []byte
-	sponsorLastHeight  uint32
-	sponsorActual      []byte
-	sponsorBlockHeight uint32
 
 	// Set to stop CheckBlockContext immediately AFTER the F-032 call site, so the
 	// argument assertions do not depend on the rest of block-context validation.
@@ -95,20 +89,8 @@ func (a *recArbiters) ProcessSpecialTxPayload(p interfaces.Payload, height uint3
 	return nil
 }
 
-// F-032: capture every argument the CheckBlockContext call site passes.
-func (a *recArbiters) CheckRecordSponsorBinding(recordedSponsor []byte, lastBlockHeight uint32,
-	actualSponsor []byte, blockHeight uint32) error {
-	a.record("checkRecordSponsorBinding")
-	a.sponsorCalls++
-	a.sponsorRecorded = recordedSponsor
-	a.sponsorLastHeight = lastBlockHeight
-	a.sponsorActual = actualSponsor
-	a.sponsorBlockHeight = blockHeight
-	return a.sponsorErr
-}
-
-// The remaining CheckBlockContext hooks: accept, so the F-032 result is the only
-// thing that can reject the block.
+// NX-01: the CheckRecordSponsorBinding hook is gone with the guard it recorded. The
+// remaining CheckBlockContext hooks accept, so nothing but the sentinel below can reject.
 func (a *recArbiters) CheckDPOSIllegalTx(block *types.Block) error      { return a.illegalTxErr }
 func (a *recArbiters) CheckCRCAppropriationTx(block *types.Block) error { return nil }
 func (a *recArbiters) CheckNextTurnDPOSInfoTx(block *types.Block) error { return nil }

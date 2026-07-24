@@ -82,11 +82,6 @@ func (a *ArbitratorsMock) IsDPoSV2Run(blockHeight uint32) bool {
 	return false
 }
 
-func (a *ArbitratorsMock) CheckRecordSponsorBinding(recordedSponsor []byte, lastBlockHeight uint32,
-	lastConfirmSponsor []byte, height uint32) error {
-	return nil
-}
-
 func (a *ArbitratorsMock) GetDPoSV2ActiveHeight() uint32 {
 	return 2000000
 }

@@ -874,21 +874,57 @@ func (b *BlockChain) CheckBlockContext(block *Block, prevNode *BlockNode) error 
 			return errors.New("confirmed block must have record sponsor transaction")
 		}
 
-		// F-032: bind the RecordSponsor tx's Sponsor to the ACTUAL sponsor of the
-		// confirmed previous block. recordsponsortransaction.go SpecialContextCheck only
-		// checks the Sponsor is SOME current/last arbiter (membership), so a block
-		// producer could name any arbiter and redirect the DPoS sponsor-reward
-		// (a.LastDPoSRewards[recordedSponsor] in accumulateReward) away from the true
-		// sponsor -- conserved between arbiters, no inflation. The confirm-presence check
-		// above guarantees lastBlock.Confirm != nil whenever a RecordSponsor tx is
-		// present, so reading its sponsor is safe. Override-aware (operator sponsors file)
-		// and gated at RevisedDPoSRewardHeight -> below-gate byte-identical.
-		if recordSponsorExist {
-			if err := DefaultLedger.Arbitrators.CheckRecordSponsorBinding(
-				recordedSponsor, lastBlock.Height,
-				lastBlock.Confirm.Proposal.Sponsor, block.Height); err != nil {
-				return err
-			}
+		// NX-01 (Tier 0 release-shape decision) -- F-032's block-VALIDITY binding is
+		// WITHDRAWN, deliberately and permanently. It rejected a block whose in-block
+		// RecordSponsor payload differed from lastBlock.Confirm.Proposal.Sponsor. That
+		// comparand is not a function of the chain:
+		//   * nothing commits to it. Block.Hash() covers only the header; the Confirm
+		//     rides alongside in types.DposBlock and is persisted per node by
+		//     dbStoreBlock (blockchain.go connectBlockBracketed).
+		//   * producer and validator derived it by DIFFERENT rules. The miner reads it
+		//     RAW (pow/service.go GenerateBlock -> bestBlock.Confirm.Proposal.Sponsor);
+		//     the validator resolved it through the operator-local
+		//     BlockConfirmProposalSponsors override map. Any override entry for a height
+		//     at/above the gate was therefore a deterministic, self-inflicted halt: every
+		//     node holding the file rejects the block every miner produces. (NX-05)
+		//   * honest nodes legitimately disagree about it. On a DPoS view change
+		//     DPOSOnDutyHandler.ChangeView re-proposes the SAME block hash under a new
+		//     Sponsor (proposaldispatcher.go StartProposal), and
+		//     IllegalBehaviorMonitor.isProposalsIllegal returns false the instant the two
+		//     proposals share a BlockHash -- so two valid confirms with different sponsors
+		//     can exist, mempool/blockpool.go appendConfirm keeps whichever arrived last,
+		//     and each node then re-serves its own via pushConfirmedBlockMsg.
+		// Armed at RevisedDPoSRewardHeight (~4,400 blocks past the restart tip) this was a
+		// permanent, unrecoverable consensus split.
+		//
+		// It is NOT re-expressed as a reward rule either. Upstream's RecordSponsor design
+		// (live from RecordSponsorStartHeight) exists precisely to move sponsor
+		// attribution OFF the node-local confirm and INTO the block: above that height
+		// accumulateReward keys on the in-block payload, and only the pre-RecordSponsor
+		// branch still reads confirm.Proposal.Sponsor with the override applied. Crediting
+		// from the confirm again would push node-local state back into DPoSV2RewardInfo,
+		// which DPoSV2ClaimRewardTransaction validates against -- trading a fast fork for
+		// a slow one. So the residual F-032 exposure is ACCEPTED: a block producer may
+		// name any current/last arbiter (recordsponsortransaction.go SpecialContextCheck
+		// still enforces membership) and redistribute a CONSERVED, non-inflationary
+		// sponsor reward between arbiters. No supply effect is claimed or implied.
+		//
+		// The confirm-PRESENCE checks above are upstream (d8488bf) and stay: presence is
+		// agreed by every node in the view-change case (both competing confirms are
+		// present), whereas identity is not. Forged-confirm presence in POW mode is a
+		// separate finding (NX-06) and is not touched here.
+		//
+		// What is left is a pure DIAGNOSTIC. It returns no error, is reached on every
+		// block, and can never reject one -- but it is the only fleet-visible signal that
+		// this node's stored confirm disagrees with the block producer's, which is the
+		// partition symptom nothing surfaced before.
+		if recordSponsorExist && !bytes.Equal(recordedSponsor, lastBlock.Confirm.Proposal.Sponsor) {
+			log.Warnf("[CheckBlockContext] RECORD SPONSOR DIVERGENCE at height %d: the block "+
+				"records sponsor %s for height %d, but this node's stored confirm names %s. "+
+				"This is NOT a validity failure (NX-01) and the block is accepted; if it "+
+				"persists, this node holds a different confirm from the block producer.",
+				block.Height, BytesToHexString(recordedSponsor),
+				lastBlock.Height, BytesToHexString(lastBlock.Confirm.Proposal.Sponsor))
 		}
 	}
 

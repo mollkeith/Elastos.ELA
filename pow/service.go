@@ -312,7 +312,19 @@ func (pow *Service) GenerateBlock(minerAddr string,
 		if err != nil {
 			return nil, err
 		}
-		if bestBlock.HaveConfirm {
+		// NX-01/NX-05 producer side. This raw read is now the ONLY derivation of the
+		// recorded sponsor anywhere in the system: the validator no longer derives one at
+		// all (blockchain/blockvalidator.go CheckBlockContext), so the producer/validator
+		// asymmetry that made an operator sponsors-file entry a deterministic block
+		// rejection at/above the gate cannot arise. Do NOT reintroduce an override lookup
+		// here or a binding there without making both sides read the same committed data.
+		// The Confirm nil-check is crash-hardening (ungated): HaveConfirm and Confirm are
+		// independent wire fields on types.DposBlock, so a stored or peer-supplied record
+		// can set the flag with no payload and nil-deref the miner here. A node whose own
+		// store is that corrupt then omits the RecordSponsor tx and its block is refused
+		// by the presence check in CheckBlockContext -- which is a rejected block instead
+		// of a dead miner, and a panic is not an acceptance decision, so this rides no gate.
+		if bestBlock.HaveConfirm && bestBlock.Confirm != nil {
 			recordSponsorTx, err := pow.CreateRecordSponsorTx(bestBlock.Confirm.Proposal.Sponsor, nextBlockHeight)
 			if err != nil {
 				return nil, err

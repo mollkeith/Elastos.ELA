@@ -33,6 +33,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -84,13 +85,11 @@ var requiredCallSites = []callSite{
 		callee: "checkTxsContext",
 		why:    "severing this link disarms F-089 and every per-transaction context check at once",
 	},
-	{
-		finding: "F-032",
-		file:    "blockchain/blockvalidator.go", fn: "CheckBlockContext",
-		callee:   "CheckRecordSponsorBinding",
-		mustArgs: []string{"recordedSponsor", "lastBlock.Confirm.Proposal.Sponsor", "block.Height"},
-		why:      "binds the RecordSponsor tx to the true sponsor of the confirmed previous block",
-	},
+	// F-032's CheckRecordSponsorBinding call site was REMOVED, not weakened — see
+	// forbiddenCallSites below, which asserts it stays removed. NX-01 proved it keyed block
+	// validity on lastBlock.Confirm.Proposal.Sponsor, a per-node stored value nothing
+	// commits to, that the miner and the validator derived by different rules, and that
+	// honest nodes legitimately disagree about after a DPoS view change.
 	{
 		finding: "F-013",
 		file:    "blockchain/blockvalidator.go", fn: "checkCoinbaseTransactionContext",
@@ -285,4 +284,169 @@ func renderArg(fset *token.FileSet, root, rel string, a ast.Expr) string {
 		return ""
 	}
 	return renderCall(fset, src, a)
+}
+
+// -----------------------------------------------------------------------------
+// NX-01 / NX-05 — the NEGATIVE inventory.
+//
+// Some guards are wrong to have. F-032's block-validity binding was one: withdrawing it is
+// the Tier 0 release-shape decision, and the failure mode is that it comes BACK — inline,
+// under a new name, or as a restored interface method — because "bind the sponsor" reads
+// like a tightening rather than the chain split it is. The behavioural proof lives in
+// blockchain/nx01_recordsponsor_nofork_test.go; this is the cheap structural backstop over
+// the same property, and it is the layer that survives someone deleting that test file.
+// -----------------------------------------------------------------------------
+
+// forbiddenCallSite is a production edge that must NOT exist.
+type forbiddenCallSite struct {
+	finding string
+	file    string
+	fn      string // "" means: anywhere in the file, including as a declaration
+	callee  string
+	why     string
+}
+
+var forbiddenCallSites = []forbiddenCallSite{
+	{
+		finding: "NX-01",
+		file:    "blockchain/blockvalidator.go", fn: "CheckBlockContext",
+		callee: "CheckRecordSponsorBinding",
+		why: "block validity must not be a function of lastBlock.Confirm.Proposal.Sponsor: " +
+			"no hash or signature commits to it, pow/service.go reads it raw while the " +
+			"validator resolved it through the operator sponsors file, and two honest nodes " +
+			"hold different values after a view change — this is a permanent chain split at " +
+			"RevisedDPoSRewardHeight, not a tightening",
+	},
+	{
+		finding: "NX-01",
+		file:    "dpos/state/arbitrators.go", fn: "",
+		callee: "CheckRecordSponsorBinding",
+		why: "the guard is DELETED, not merely unwired — a method with no production caller " +
+			"reads as armed while enforcing nothing",
+	},
+}
+
+// TestWiringForbiddenCallSitesAreAbsent fails if a withdrawn guard is reintroduced.
+func TestWiringForbiddenCallSitesAreAbsent(t *testing.T) {
+	root := repoRoot(t)
+
+	for _, fs := range forbiddenCallSites {
+		fs := fs
+		name := fs.finding + "__" + strings.ReplaceAll(fs.file, "/", "_")
+		if fs.fn != "" {
+			name += "__" + fs.fn
+		}
+		t.Run(name+"__no_"+fs.callee, func(t *testing.T) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, filepath.Join(root, fs.file), nil, parser.AllErrors)
+			if err != nil {
+				t.Fatalf("[%s] cannot parse %s: %v", fs.finding, fs.file, err)
+			}
+
+			var scope ast.Node = f
+			if fs.fn != "" {
+				var fd *ast.FuncDecl
+				for _, d := range f.Decls {
+					if x, ok := d.(*ast.FuncDecl); ok && x.Name.Name == fs.fn && x.Body != nil {
+						fd = x
+						break
+					}
+				}
+				if fd == nil {
+					t.Fatalf("[%s] %s: function %s not found — the negative inventory is stale",
+						fs.finding, fs.file, fs.fn)
+				}
+				scope = fd.Body
+			}
+
+			ast.Inspect(scope, func(n ast.Node) bool {
+				var name string
+				switch x := n.(type) {
+				case *ast.Ident:
+					name = x.Name
+				case *ast.SelectorExpr:
+					name = x.Sel.Name
+				default:
+					return true
+				}
+				if name == fs.callee {
+					pos := fset.Position(n.Pos())
+					t.Fatalf("WITHDRAWN GUARD REINTRODUCED [%s]: %s references %s at %s.\n%s",
+						fs.finding, fs.file, fs.callee, pos, fs.why)
+				}
+				return true
+			})
+		})
+	}
+}
+
+// sponsorsOverrideAllowedFuncs are the ONLY functions permitted to read the operator
+// sponsors file's override map. Both are upstream (d8488bf) and neither decides whether a
+// block is accepted: Arbiters.ProcessBlock feeds countArbitratorsInactivity*, and
+// accumulateReward reads it only on the pre-RecordSponsorStartHeight branch, i.e. for
+// retained history. NewArbitrators merely installs the loaded map.
+var sponsorsOverrideAllowedFuncs = map[string]string{
+	"ProcessBlock":     "upstream: selects the sponsor handed to countArbitratorsInactivity*",
+	"accumulateReward": "upstream: pre-RecordSponsorStartHeight reward attribution only",
+	"NewArbitrators":   "installs the loaded map; does not consult it",
+}
+
+// TestNX05SponsorsOverrideIsNotABlockValidityInput pins the NX-05 half of the decision: an
+// operator-local, unversioned, unauthenticated file must never decide whether a BLOCK is
+// valid. Above RecordSponsorStartHeight upstream deliberately moved sponsor attribution off
+// the node-local confirm and into the block; the override map is a legacy correction for
+// the era before that and must not leak forward into acceptance.
+func TestNX05SponsorsOverrideIsNotABlockValidityInput(t *testing.T) {
+	root := repoRoot(t)
+	const rel = "dpos/state/arbitrators.go"
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filepath.Join(root, rel), nil, parser.AllErrors)
+	if err != nil {
+		t.Fatalf("cannot parse %s: %v", rel, err)
+	}
+
+	seen := map[string]bool{}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok || id.Name != "BlockConfirmProposalSponsors" {
+				return true
+			}
+			if _, allowed := sponsorsOverrideAllowedFuncs[fd.Name.Name]; !allowed {
+				t.Fatalf("NX-05 REGRESSION: %s reads BlockConfirmProposalSponsors at %s. The "+
+					"operator sponsors file is unversioned, unauthenticated and node-local; "+
+					"the only functions allowed to consult it are %v, none of which decides "+
+					"block acceptance.", fd.Name.Name, fset.Position(id.Pos()),
+					sortedKeys(sponsorsOverrideAllowedFuncs))
+			}
+			seen[fd.Name.Name] = true
+			return true
+		})
+	}
+
+	// The inventory must not rot in the other direction either: if a listed site
+	// disappears, someone changed the override's reach and this test must be re-reasoned.
+	for fn := range sponsorsOverrideAllowedFuncs {
+		if fn == "NewArbitrators" {
+			continue // installs the map by field name in a composite literal
+		}
+		if !seen[fn] {
+			t.Fatalf("NX-05: %s no longer reads BlockConfirmProposalSponsors — the override's "+
+				"reach changed; re-verify which sites remain before trusting this test", fn)
+		}
+	}
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

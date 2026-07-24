@@ -7,12 +7,14 @@ package state
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -975,28 +977,15 @@ func (a *Arbiters) getDPoSV2RewardsV2(dposReward common.Fixed64, sponsor []byte,
 	return rewards
 }
 
-// CheckRecordSponsorBinding (F-032) verifies a block's RecordSponsor tx names the true
-// sponsor of the confirmed previous block. Membership-only validation
-// (recordsponsortransaction.go SpecialContextCheck) let a block producer name any
-// current/last arbiter and redirect the deferred DPoS sponsor-reward
-// (LastDPoSRewards[recordedSponsor]) to a wrong arbiter -- conserved, no inflation.
-// Override-aware: BlockConfirmProposalSponsors (loaded from an optional operator
-// sponsors file, immutable after init) corrects specific heights. Gated at
-// RevisedDPoSRewardHeight so retained history below the rollback stays byte-identical.
-func (a *Arbiters) CheckRecordSponsorBinding(recordedSponsor []byte, lastBlockHeight uint32,
-	lastConfirmSponsor []byte, height uint32) error {
-	if height < a.ChainParams.RevisedDPoSRewardHeight {
-		return nil
-	}
-	realSponsor := lastConfirmSponsor
-	if sp, ok := a.BlockConfirmProposalSponsors[lastBlockHeight]; ok {
-		realSponsor = sp
-	}
-	if !bytes.Equal(recordedSponsor, realSponsor) {
-		return errors.New("record sponsor does not match the confirmed block sponsor")
-	}
-	return nil
-}
+// NX-01: CheckRecordSponsorBinding (F-032) is DELETED, not merely unwired. It made block
+// validity a function of lastBlock.Confirm.Proposal.Sponsor -- a per-node stored value no
+// block hash or signature commits to, which the miner reads raw while this function
+// resolved it through BlockConfirmProposalSponsors, and which honest nodes legitimately
+// disagree about after a DPoS view change. See blockchain/blockvalidator.go
+// CheckBlockContext for the full rationale and for the diagnostic that replaced it.
+// It is deleted rather than left in place because a guard with no production caller reads
+// as armed while enforcing nothing; if a sponsor-binding rule is ever wanted again it must
+// be derived from data the chain commits to, never from the stored confirm.
 
 func (a *Arbiters) accumulateReward(block *types.Block, confirm *payload.Confirm) {
 	if block.Height < a.ChainParams.PublicDPOSHeight {
@@ -3412,6 +3401,121 @@ func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
 	return nil
 }
 
+// LoadBlockConfirmProposalSponsors reads the optional operator "sponsors" file into the
+// BlockConfirmProposalSponsors override map.
+//
+// NX-05. This file is consensus-bearing: Arbiters.ProcessBlock substitutes its entry for
+// the sponsor handed to State.ProcessBlock -> countArbitratorsInactivity*, and the
+// pre-RecordSponsorStartHeight branch of accumulateReward credits rewards through it. Yet
+// it was read from a BARE RELATIVE PATH against the process working directory, so two
+// nodes started from different directories loaded different consensus inputs; every read
+// failure was swallowed with a single log.Warn; and one malformed line PANICKED the node
+// during startup (the old parser indexed field [1] without checking the field count).
+//
+// It can no longer decide BLOCK VALIDITY at all: NX-01 deleted CheckRecordSponsorBinding,
+// which was the map's only validity site, and blockchain/blockvalidator.go
+// CheckBlockContext now derives nothing from it. The producer never consulted it
+// (pow/service.go GenerateBlock reads the confirm raw), so with the validity site gone
+// producer and validator are symmetric by construction -- neither applies the override
+// when deciding whether a block is acceptable. What remains here is determinism hardening
+// for the two upstream reward/inactivity sites:
+//
+//  1. a relative path resolves against the configured data directory first, and only
+//     then against the working directory, so the CWD stops choosing the file;
+//  2. a file that EXISTS but cannot be read or parsed is a hard startup error rather
+//     than a warning followed by a silently empty map;
+//  3. the byte count, entry count and SHA-256 of the exact bytes loaded are logged, so a
+//     fleet can prove every node loaded the same overrides before a coordinated restart.
+//
+// A genuinely absent file remains a warning, not an error: mainnet ships no sponsors file
+// (none exists under the retained chain's data directory and the mainnet config sets no
+// path), so an empty map is the correct, and the overwhelmingly common, configuration.
+func LoadBlockConfirmProposalSponsors(chainParams *config.Configuration) (map[uint32][]byte, error) {
+	sponsors := make(map[uint32][]byte)
+
+	path, data, err := resolveSponsorsFile(chainParams)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		log.Warn("sponsors file not exist! block confirm proposal sponsors: 0 -- this node " +
+			"applies NO sponsor overrides; every node in the fleet must be configured alike")
+		return sponsors, nil
+	}
+
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("sponsors file %s line %d: want \"<height>,<sponsorHex>\", "+
+				"got %q", path, i+1, line)
+		}
+		height, err := strconv.ParseUint(strings.TrimSpace(fields[0]), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("sponsors file %s line %d: bad height %q: %v",
+				path, i+1, fields[0], err)
+		}
+		sponsorBytes, err := common.HexStringToBytes(strings.TrimSpace(fields[1]))
+		if err != nil {
+			return nil, fmt.Errorf("sponsors file %s line %d: bad sponsor %q: %v",
+				path, i+1, fields[1], err)
+		}
+		if prev, ok := sponsors[uint32(height)]; ok && !bytes.Equal(prev, sponsorBytes) {
+			return nil, fmt.Errorf("sponsors file %s line %d: height %d declared twice with "+
+				"different sponsors", path, i+1, height)
+		}
+		sponsors[uint32(height)] = sponsorBytes
+	}
+
+	digest := sha256.Sum256(data)
+	log.Infof("block confirm proposal sponsors: %d entries, %d bytes, loaded from %s "+
+		"(sha256 %s) -- every node in the fleet MUST report this same digest and count",
+		len(sponsors), len(data), path, hex.EncodeToString(digest[:]))
+	return sponsors, nil
+}
+
+// resolveSponsorsFile locates the sponsors file deterministically. A relative
+// SponsorsFilePath is tried against the configured data directory before the process
+// working directory, so nodes started from different directories with the same data
+// directory read the same bytes. A nil payload with a nil error means "no sponsors file
+// anywhere", which is the mainnet configuration; an existing-but-unreadable file is an
+// error, never a silent empty map.
+func resolveSponsorsFile(chainParams *config.Configuration) (string, []byte, error) {
+	configured := chainParams.DPoSConfiguration.SponsorsFilePath
+	if configured == "" {
+		return "", nil, nil
+	}
+
+	candidates := []string{configured}
+	if !filepath.IsAbs(configured) {
+		// Mirror main.go's own data-directory resolution exactly (cfg.DataDir when set,
+		// otherwise the config.DataDir default), so "the data directory" means the same
+		// thing here as it does everywhere else in the node.
+		dataDir := chainParams.DataDir
+		if dataDir == "" {
+			dataDir = config.DataDir
+		}
+		if dataDir != "" {
+			candidates = []string{filepath.Join(dataDir, configured), configured}
+		}
+	}
+
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return path, data, nil
+		}
+		if !os.IsNotExist(err) {
+			return path, nil, fmt.Errorf("sponsors file %s exists but cannot be read: %v",
+				path, err)
+		}
+	}
+	return "", nil, nil
+}
+
 func NewArbitrators(chainParams *config.Configuration, committee *state.Committee,
 	getProducerDepositAmount func(common.Uint168) (common.Fixed64, error),
 	tryUpdateCRMemberInactivity func(did common.Uint168, needReset bool, height uint32),
@@ -3422,30 +3526,9 @@ func NewArbitrators(chainParams *config.Configuration, committee *state.Committe
 	revertUpdateCRInactivePenalty func(cid common.Uint168, height uint32),
 	ckpManager *checkpoint.Manager) (*Arbiters, error) {
 
-	blockConfirmProposalSponsors := make(map[uint32][]byte)
-	sponsorsFilePath := chainParams.DPoSConfiguration.SponsorsFilePath
-	sponsors, err := os.ReadFile(sponsorsFilePath)
+	blockConfirmProposalSponsors, err := LoadBlockConfirmProposalSponsors(chainParams)
 	if err != nil {
-		log.Warn("sponsors file not exist!")
-	} else {
-		sponsorsStr := strings.Split(string(sponsors), "\n")
-		for _, sponsor := range sponsorsStr {
-			if len(sponsor) == 0 {
-				continue
-			}
-			sponsorInfo := strings.Split(sponsor, ",")
-			height, err := strconv.Atoi(sponsorInfo[0])
-			if err != nil {
-				return nil, err
-			}
-			sponsorBytes, err := common.HexStringToBytes(sponsorInfo[1])
-			if err != nil {
-				return nil, err
-
-			}
-			blockConfirmProposalSponsors[uint32(height)] = sponsorBytes
-		}
-		log.Info("block confirm proposal sponsors: ", len(blockConfirmProposalSponsors))
+		return nil, err
 	}
 
 	a := &Arbiters{
