@@ -64,6 +64,29 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 	return c.Conn.Read(b)
 }
 
+// readPayload reads the message payload described by hdr into a freshly
+// allocated buffer, refusing to allocate for a length no conforming sender
+// could ever have produced.
+//
+// F-136: hdr.Length is an attacker-controlled uint32 taken straight off the
+// wire, and both the hub handshake (WrapConn) and the hub pipe read it BEFORE
+// any allowlist / PID check has run.  A bare make([]byte, hdr.Length) therefore
+// let a single unauthenticated inbound TCP connection force a ~4 GiB
+// allocation.  p2p.MaxMessagePayload (32 MB) is the exact ceiling that
+// p2p.WriteMessage already enforces on every outgoing message, so a payload
+// above it can only come from a non-conforming peer -- bounding here rejects
+// nothing that was previously routable and changes no acceptance decision.
+func readPayload(r io.Reader, hdr *p2p.Header) ([]byte, error) {
+	if hdr.Length > p2p.MaxMessagePayload {
+		return nil, p2p.ErrMsgSizeExceeded
+	}
+	payload := make([]byte, hdr.Length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
 // WrapConn warps the origin network connection and returns a hub connection
 // with the handshake information resolved from version message.
 func WrapConn(c net.Conn) (conn *Conn, err error) {
@@ -86,8 +109,8 @@ func WrapConn(c net.Conn) (conn *Conn, err error) {
 	}
 
 	// Read payload
-	payload := make([]byte, hdr.Length)
-	if _, err = io.ReadFull(c, payload[:]); err != nil {
+	payload, err := readPayload(c, &hdr)
+	if err != nil {
 		return
 	}
 
