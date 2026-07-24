@@ -33,17 +33,60 @@ import (
 	"github.com/elastos/Elastos.ELA/database"
 	"github.com/elastos/Elastos.ELA/dpos/p2p/peer"
 	"github.com/elastos/Elastos.ELA/dpos/state"
+	"github.com/elastos/Elastos.ELA/elanet/pact"
 	"github.com/elastos/Elastos.ELA/events"
 	"github.com/elastos/Elastos.ELA/p2p/msg"
 	"github.com/elastos/Elastos.ELA/utils"
 )
 
 const (
-	maxOrphanBlocks    = 10000
+	// maxOrphanBlocks bounds the chain's orphan pool by CARDINALITY.
+	//
+	// NX-02: this was 10,000 and was the ONLY bound on the pool -- there was no
+	// byte counter and no memory ceiling anywhere on the path. A block may be
+	// pact.MaxBlockContextSize+pact.MaxBlockHeaderSize = 9,000,000 bytes, so the
+	// count cap alone permitted ~85 GiB of attacker-supplied blocks, admitted
+	// past a single free gate (CheckBlockSanity, whose work check is against
+	// PowLimit) with no ban score charged anywhere on the path. Measured
+	// retention was 1.0003x the wire bytes delivered, so a 16 GiB node dies at
+	// roughly 1,800 maximum-size orphans.
+	//
+	// 1024 is still far beyond any honest reorg depth or any legitimate burst of
+	// blocks whose parent is momentarily missing (mainnet's average retained
+	// block is ~11 KiB, so the byte ceiling below holds ~23,000 of them and this
+	// count cap is what binds on honest traffic).
+	maxOrphanBlocks = 1024
+
+	// maxOrphanBlockBytes bounds the chain's orphan pool by BYTES, which is the
+	// dimension that actually kills the process. 256 MiB is ~28x the largest
+	// single block the protocol permits, so no honest orphan is ever rejected
+	// for want of room, while the worst case an unauthenticated peer can pin is
+	// a fixed, survivable quantity instead of ~85 GiB.
+	//
+	// UNGATED, on the rationale already recorded in-tree for the shipped
+	// F-092/F-117 pool bounds (mempool/blockpool.go:22-41): this is RETENTION
+	// policy, not block acceptance. Refusing to RETAIN an orphan cannot change
+	// which blocks are valid -- an orphan has by definition not been accepted,
+	// CheckBlockContext has never run on it -- and a genuinely connectable block
+	// that is dropped is simply re-requested on the next announcement.
+	maxOrphanBlockBytes = 256 * 1024 * 1024
+
 	minMemoryNodes     = 20160
 	maxBlockLocators   = 500
 	medianTimeBlocks   = 11
 	maxHistoryCapacity = 720
+)
+
+// orphanCountCeiling and orphanByteCeiling are the ceilings AddOrphanBlock
+// actually enforces. They are vars rather than consts for one reason only: the
+// NX-02 regression test lowers them so that eviction can be driven through the
+// real processBlock without moving hundreds of MiB of blocks through a unit
+// test. NOTHING IN PRODUCTION ASSIGNS THEM, and
+// TestNX02CeilingsDefaultToTheProductionConstants asserts the defaults, so a
+// silent weakening of the policy fails the suite.
+var (
+	orphanCountCeiling = uint64(maxOrphanBlocks)
+	orphanByteCeiling  = uint64(maxOrphanBlockBytes)
 )
 
 var (
@@ -80,6 +123,9 @@ type BlockChain struct {
 	prevOrphans    map[Uint256][]*OrphanBlock
 	oldestOrphan   *OrphanBlock
 	orphanConfirms map[Uint256]*payload.Confirm
+	// orphanBytes is the running serialized size of every block held in
+	// b.orphans (NX-02). Maintained under orphanLock alongside the map itself.
+	orphanBytes uint64
 
 	blockCache     map[Uint256]*Block
 	confirmCache   map[Uint256]*payload.Confirm
@@ -974,9 +1020,22 @@ func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators
 type OrphanBlock struct {
 	Block      *Block
 	Expiration time.Time
+	// size is the serialized size of Block, captured once at insert so that the
+	// running total in BlockChain.orphanBytes is credited and debited with the
+	// identical value even if Block were ever mutated (NX-02).
+	size uint64
 }
 
 func (b *BlockChain) ProcessOrphans(hash *Uint256) error {
+	// NX-02: the 1-hour expiry stamped in AddOrphanBlock used to be enforced ONLY
+	// by the sweep at the top of AddOrphanBlock itself, so once an attacker
+	// stopped sending, the orphans it had pinned were retained for the life of
+	// the process -- the pool did not self-heal. ProcessOrphans runs on every
+	// successful block connect (processBlock, after maybeAcceptBlock), so
+	// sweeping here releases expired orphans at the chain's own cadence without
+	// introducing a background goroutine or any new lifecycle to manage.
+	b.SweepExpiredOrphans()
+
 	processHashes := make([]*Uint256, 0, 10)
 	processHashes = append(processHashes, hash)
 	for len(processHashes) > 0 {
@@ -1012,9 +1071,34 @@ func (b *BlockChain) RemoveOrphanBlock(orphan *OrphanBlock) {
 	b.orphanLock.Lock()
 	defer b.orphanLock.Unlock()
 
+	b.removeOrphanBlockLocked(orphan)
+}
+
+// removeOrphanBlockLocked drops an orphan from every index and debits its bytes
+// from the running total. The caller must hold b.orphanLock for writing.
+func (b *BlockChain) removeOrphanBlockLocked(orphan *OrphanBlock) {
+	if orphan == nil {
+		return
+	}
+
 	orphanHash := orphan.Block.Hash()
+	// NX-02: an eviction that silently removes nothing is how a count cap gets
+	// exceeded. Only debit bytes for the entry that is actually in the map, and
+	// compare by identity so a stale pointer can never evict its replacement.
+	if cur, exists := b.orphans[orphanHash]; !exists || cur != orphan {
+		if b.oldestOrphan == orphan {
+			b.oldestOrphan = nil
+		}
+		return
+	}
+
 	delete(b.orphans, orphanHash)
 	delete(b.orphanConfirms, orphanHash)
+	if b.orphanBytes >= orphan.size {
+		b.orphanBytes -= orphan.size
+	} else {
+		b.orphanBytes = 0
+	}
 
 	prevHash := &orphan.Block.Header.Previous
 	orphans := b.prevOrphans[*prevHash]
@@ -1038,25 +1122,82 @@ func (b *BlockChain) RemoveOrphanBlock(orphan *OrphanBlock) {
 	}
 }
 
-func (b *BlockChain) AddOrphanBlock(block *Block) {
-	for _, oBlock := range b.orphans {
-		if time.Now().After(oBlock.Expiration) {
-			b.RemoveOrphanBlock(oBlock)
-			continue
-		}
+// SweepExpiredOrphans drops every orphan whose 1-hour expiry has passed. It is
+// safe to call at any time and takes no argument, so it can be driven from the
+// block-connect path as well as from the insert path (NX-02: before this, the
+// expiry fired only inside AddOrphanBlock, so a pool filled by an attacker who
+// then went quiet was pinned for the life of the process).
+func (b *BlockChain) SweepExpiredOrphans() {
+	b.orphanLock.Lock()
+	defer b.orphanLock.Unlock()
 
-		if b.oldestOrphan == nil || oBlock.Expiration.Before(b.oldestOrphan.Expiration) {
-			b.oldestOrphan = oBlock
+	b.expireOrphansLocked()
+}
+
+// expireOrphansLocked removes expired orphans. Caller must hold b.orphanLock for
+// writing. Deleting from a map while ranging over it in the same goroutine is
+// well defined in Go.
+func (b *BlockChain) expireOrphansLocked() {
+	now := time.Now()
+	for _, oBlock := range b.orphans {
+		if now.After(oBlock.Expiration) {
+			b.removeOrphanBlockLocked(oBlock)
 		}
 	}
+}
 
-	if len(b.orphans)+1 > maxOrphanBlocks {
-		b.RemoveOrphanBlock(b.oldestOrphan)
-		b.oldestOrphan = nil
+// oldestOrphanLocked returns the orphan with the earliest expiration, which is
+// also the earliest inserted (every orphan is stamped now+1h at insert). Caller
+// must hold b.orphanLock for writing.
+func (b *BlockChain) oldestOrphanLocked() *OrphanBlock {
+	var oldest *OrphanBlock
+	for _, oBlock := range b.orphans {
+		if oldest == nil || oBlock.Expiration.Before(oldest.Expiration) {
+			oldest = oBlock
+		}
+	}
+	b.oldestOrphan = oldest
+	return oldest
+}
+
+// makeOrphanRoomLocked expires stale orphans and then evicts oldest-first until
+// the pool can take another `incoming` bytes while staying under BOTH the count
+// ceiling and the byte ceiling. Caller must hold b.orphanLock for writing.
+func (b *BlockChain) makeOrphanRoomLocked(incoming uint64) {
+	b.expireOrphansLocked()
+
+	for len(b.orphans) > 0 &&
+		(uint64(len(b.orphans))+1 > orphanCountCeiling ||
+			b.orphanBytes+incoming > orphanByteCeiling) {
+		oldest := b.oldestOrphanLocked()
+		if oldest == nil {
+			break
+		}
+		b.removeOrphanBlockLocked(oldest)
+	}
+}
+
+func (b *BlockChain) AddOrphanBlock(block *Block) {
+	// Serialize outside the lock. CheckBlockSanity has already called GetSize on
+	// this block before processBlock reached us, so this costs no new order of
+	// work on the admission path.
+	size := block.GetSize()
+	if size < 0 {
+		// A block that will not serialize cannot be sized; charge it the
+		// protocol maximum rather than accounting it as free.
+		size = int(pact.MaxBlockContextSize + pact.MaxBlockHeaderSize)
 	}
 
 	b.orphanLock.Lock()
 	defer b.orphanLock.Unlock()
+
+	hash := block.Hash()
+	if _, exists := b.orphans[hash]; exists {
+		// Already retained; re-inserting would double-count its bytes.
+		return
+	}
+
+	b.makeOrphanRoomLocked(uint64(size))
 
 	// Insert the block into the orphan map with an expiration time
 	// 1 hour from now.
@@ -1064,20 +1205,50 @@ func (b *BlockChain) AddOrphanBlock(block *Block) {
 	oBlock := &OrphanBlock{
 		Block:      block,
 		Expiration: expiration,
+		size:       uint64(size),
 	}
-	b.orphans[block.Hash()] = oBlock
+	b.orphans[hash] = oBlock
+	b.orphanBytes += uint64(size)
 
 	// Add to previous hash lookup index for faster dependency lookups.
 	prevHash := &block.Header.Previous
 	b.prevOrphans[*prevHash] = append(b.prevOrphans[*prevHash], oBlock)
 
+	// The newest orphan is never the oldest; force a recompute on the next
+	// eviction rather than carrying a stale pointer across calls.
+	b.oldestOrphan = nil
+
 	return
+}
+
+// OrphanPoolStats reports the current occupancy of the chain's orphan pool
+// (count, bytes) together with the ceilings it is held under (NX-02).
+func (b *BlockChain) OrphanPoolStats() (count int, bytes uint64, maxCount uint64, maxBytes uint64) {
+	b.orphanLock.RLock()
+	defer b.orphanLock.RUnlock()
+
+	return len(b.orphans), b.orphanBytes, orphanCountCeiling, orphanByteCeiling
 }
 
 func (b *BlockChain) AddOrphanConfirm(confirm *payload.Confirm) {
 	b.orphanLock.Lock()
+	defer b.orphanLock.Unlock()
+
+	// NX-02: orphanConfirms is only ever DRAINED by removeOrphanBlockLocked,
+	// which is keyed by an orphan's hash, so a confirm whose block is not (or is
+	// no longer) in the pool would be pinned for the life of the process on the
+	// same unauthenticated path. The sole production caller
+	// (mempool/blockpool.go:251) reaches here immediately after ProcessBlock
+	// reported isOrphan, so in the normal case the block IS present; the race it
+	// loses is the one where the byte ceiling evicted the block in between, and
+	// in that case the confirm is useless anyway — ProcessOrphans only ever
+	// looks a confirm up for an orphan it is holding. Binding admission to
+	// membership makes this map bounded by the pool by construction.
+	if _, exists := b.orphans[confirm.Proposal.BlockHash]; !exists {
+		return
+	}
+
 	b.orphanConfirms[confirm.Proposal.BlockHash] = confirm
-	b.orphanLock.Unlock()
 }
 
 func (b *BlockChain) GetOrphanConfirm(hash *Uint256) (*payload.Confirm, bool) {
