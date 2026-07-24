@@ -306,6 +306,14 @@ func (sp *ServerPeer) OnBlock(_ *peer.Peer, msgBlock *msg.Block) {
 // accordingly.  We pass the message down to blockmanager which will call
 // QueueMessage with any appropriate responses.
 func (sp *ServerPeer) OnInv(_ *peer.Peer, inv *msg.Inv) {
+	// F-054: charge the same decaying ban score OnGetData already applies, because
+	// each announced hash can cost us a haveInventory lookup -- and for a
+	// confirmed-block announcement that used to mean a full flat-file block read.
+	// The score is 0 for every announcement an honest peer sends: a getblocks
+	// answer carries at most pact.MaxBlocksPerMsg (500) entries and relay invs are
+	// far smaller, while 500*99/MaxInvPerMsg truncates to 0.
+	sp.AddBanScore(0, uint32(len(inv.InvList))*99/msg.MaxInvPerMsg, "inv")
+
 	if len(inv.InvList) > 0 {
 		sp.server.SyncManager.QueueInv(inv, sp.Peer)
 		sp.server.Routes.QueueInv(sp.Peer, inv)
