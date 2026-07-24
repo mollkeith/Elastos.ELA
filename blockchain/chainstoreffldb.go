@@ -217,7 +217,21 @@ func (c *ChainStoreFFLDB) RollbackBlock(b *Block, node *BlockNode,
 
 	err = c.db.Update(func(dbTx database.Tx) error {
 		// Update best block state.
-		err := dbPutBestState(dbTx, state, node.WorkSum)
+		//
+		// F-124: the BestState built above describes the PARENT (newBestState(prevNode,
+		// ...)), because rolling `node` back makes prevNode the new tip. The work sum
+		// stored alongside it must therefore be the parent's as well; passing
+		// node.WorkSum persisted a self-inconsistent best-chain record whose hash and
+		// height are the parent's but whose accumulated work is the DISCARDED child's.
+		//
+		// Ungated and acceptance-neutral: nothing reads this work sum back for any
+		// decision. Its only deserializer is the legacy migrateBlockIndex
+		// (blockchain/upgrade.go:88-93), which uses state.hash alone; initChainState
+		// (blockchain/chainio.go:430) only tests the key for existence; and every live
+		// BlockNode.WorkSum is recomputed from header.Bits (blockchain/blockindex.go:103)
+		// and re-accumulated in LoadBlockNode. No block or transaction acceptance
+		// decision consults the persisted value.
+		err := dbPutBestState(dbTx, state, prevNode.WorkSum)
 		if err != nil {
 			return err
 		}

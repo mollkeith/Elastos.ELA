@@ -1641,6 +1641,23 @@ func (s *State) processTransactions(txs []interfaces.Transaction, height uint32)
 			info := i
 			s.History.Append(height, func() {
 				s.UsedDposV2Votes[stakeAddress] -= info.Votes
+				// F-209: once every DPoSV2 vote of a stake address has expired its
+				// used-vote total is back to zero, but the map entry survived forever
+				// -- so UsedDposV2Votes accumulated one permanent entry per stake
+				// address that ever voted, in RAM, in every serialized dpos keyframe
+				// and in every deep copy taken per snapshot. Dropping the zero entry
+				// is behaviour-identical, not a semantic change: UsedDposV2Votes is a
+				// map to Fixed64 and every reader takes the zero value of a missing
+				// key (core/transaction/voting.go:136, returnvotes.go:108,
+				// servers/interfaces.go:876, state.go:2814); nothing ranges over it or
+				// tests key presence. The same delete-at-zero is already the
+				// established pattern for this map on the NFT paths below
+				// (state.go:2814-2816, :3032-3034). The revert closure re-adds via
+				// `+=`, which recreates the key with its pre-block value, so reorg
+				// behaviour is unchanged.
+				if s.UsedDposV2Votes[stakeAddress] == 0 {
+					delete(s.UsedDposV2Votes, stakeAddress)
+				}
 			}, func() {
 				s.UsedDposV2Votes[stakeAddress] += info.Votes
 			})

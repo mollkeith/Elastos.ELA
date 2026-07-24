@@ -134,6 +134,12 @@ func (s *StateKeyFrame) snapshot() *StateKeyFrame {
 		SpecialTxHashes:          make(map[common.Uint256]struct{}),
 		PreBlockArbiters:         make(map[string]struct{}),
 		ProducerDepositMap:       make(map[common.Uint168]struct{}),
+
+		// F-170: EmergencyInactiveArbiters was the one map the literal omitted, so a
+		// snapshot frame carried a NIL map where every other construction path
+		// (NewStateKeyFrame, Deserialize) carries an allocated one -- the same
+		// nil-map-in-a-rebuilt-frame class as F-096.
+		EmergencyInactiveArbiters: make(map[string]struct{}),
 	}
 	state.NodeOwnerKeys = copyStringMap(s.NodeOwnerKeys)
 	state.CurrentCRNodeOwnerKeys = copyStringMap(s.CurrentCRNodeOwnerKeys)
@@ -172,7 +178,39 @@ func (s *StateKeyFrame) snapshot() *StateKeyFrame {
 	state.PreBlockArbiters = copyStringSet(s.PreBlockArbiters)
 	state.ProducerDepositMap = copyDIDSet(s.ProducerDepositMap)
 
-	//todo add DPOSStartHeight and so on
+	// F-170 (was: "//todo add DPOSStartHeight and so on"): snapshot() copied the maps
+	// and DPoSV2ActiveHeight only, leaving EmergencyInactiveArbiters nil and the other
+	// fourteen scalars at their zero values -- so a snapshot was NOT a faithful copy of
+	// the frame it was taken from. The field set restored here is exactly the one
+	// StateKeyFrame.Serialize writes (keyframe.go, SerializeStringSet of
+	// EmergencyInactiveArbiters + WriteVarString + the fourteen WriteElements), which is
+	// the authoritative definition of the frame's contents.
+	//
+	// Ungated and acceptance-neutral: no live path reads any of these fields off a
+	// snapshot() result. snapshot() has exactly two callers -- Arbiters.newCheckPoint
+	// (arbitrators.go:3143), whose products are the in-RAM SnapshotByHeight ring, and
+	// State.GetHistory (state.go:3897). The ring's only consumers read arbiter public
+	// keys (blockchain/confirmvalidator.go:288,386 and the illegal-vote / illegal-
+	// proposal checkers), and State.GetHistory / Arbiters.Snapshot have no callers at
+	// all. The PERSISTED dpos checkpoint is built by CheckPoint.initFromArbitrators
+	// (dpos/state/checkpoint.go:701) from the LIVE keyframe, never from snapshot(), so
+	// no checkpoint byte changes either. This is latent hardening: it makes the copy
+	// complete before a future consumer can observe the hole.
+	state.EmergencyInactiveArbiters = copyStringSet(s.EmergencyInactiveArbiters)
+	state.LastRandomCandidateOwner = s.LastRandomCandidateOwner
+	state.VersionStartHeight = s.VersionStartHeight
+	state.VersionEndHeight = s.VersionEndHeight
+	state.LastRandomCandidateHeight = s.LastRandomCandidateHeight
+	state.DPOSWorkHeight = s.DPOSWorkHeight
+	state.ConsensusAlgorithm = s.ConsensusAlgorithm
+	state.LastBlockTimestamp = s.LastBlockTimestamp
+	state.NeedRevertToDPOSTX = s.NeedRevertToDPOSTX
+	state.NeedNextTurnDPOSInfo = s.NeedNextTurnDPOSInfo
+	state.NoProducers = s.NoProducers
+	state.NoClaimDPOSNode = s.NoClaimDPOSNode
+	state.RevertToPOWBlockHeight = s.RevertToPOWBlockHeight
+	state.LastIrreversibleHeight = s.LastIrreversibleHeight
+	state.DPOSStartHeight = s.DPOSStartHeight
 	state.DPoSV2ActiveHeight = s.DPoSV2ActiveHeight
 
 	return &state
