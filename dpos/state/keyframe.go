@@ -727,9 +727,16 @@ func (s *StateKeyFrame) SerializeProgramHashVotesInfoMap(vmap map[common.Uint168
 		if err = k.Serialize(w); err != nil {
 			return
 		}
-		common.WriteVarUint(w, uint64(len(v)))
+		// F-143: both of these writes discarded their error while every neighbouring
+		// write in this file checks its own, so a short or failing write truncated the
+		// keyframe and the caller was told the checkpoint had serialized cleanly.
+		if err = common.WriteVarUint(w, uint64(len(v))); err != nil {
+			return
+		}
 		for _, votes := range v {
-			votes.Serialize(w, 0)
+			if err = votes.Serialize(w, 0); err != nil {
+				return
+			}
 		}
 	}
 	return

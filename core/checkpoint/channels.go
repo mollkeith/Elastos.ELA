@@ -110,7 +110,9 @@ func (c *fileChannels) messageLoop() {
 }
 
 func (c *fileChannels) saveCheckpoint(msg *fileMsg) (err error) {
-	defer c.replyMsg(msg)
+	// F-122: the reply told the caller "saved" even when Serialize or Write had
+	// failed. Report what actually happened.
+	defer func() { c.replyMsg(msg, err == nil) }()
 
 	dir := getCheckpointDirectory(c.cfg.DataPath, msg.checkpoint)
 	if !utils.FileExisted(dir) {
@@ -119,21 +121,16 @@ func (c *fileChannels) saveCheckpoint(msg *fileMsg) (err error) {
 		}
 	}
 
-	filename := getFilePath(c.cfg.DataPath, msg.checkpoint)
-	var file *os.File
-	file, err = os.OpenFile(filename,
-		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-
+	// F-122: serialize BEFORE touching the destination. As shipped this opened the
+	// FINAL path with O_TRUNC first, so a Serialize error destroyed the checkpoint
+	// that was already on disk and left a zero-length file behind.
 	buf := new(bytes.Buffer)
 	if err = msg.checkpoint.Serialize(buf); err != nil {
 		return
 	}
 
-	if _, err = file.Write(buf.Bytes()); err != nil {
+	filename := getFilePath(c.cfg.DataPath, msg.checkpoint)
+	if err = writeFileAtomic(filename, buf.Bytes()); err != nil {
 		return
 	}
 
@@ -143,10 +140,48 @@ func (c *fileChannels) saveCheckpoint(msg *fileMsg) (err error) {
 	return nil
 }
 
+// writeFileAtomic writes data to a sibling temp file, flushes it to stable storage
+// and renames it over path.
+//
+// F-122: the shipped save wrote the final path in place with no fsync, so a crash
+// or power cut mid-write left a SHORT checkpoint file that still "exists" -- and
+// replaceCheckpoints only tests existence before renaming it over default.<ext>,
+// which then feeds the F-121 restore path on the next start. rename(2) inside one
+// directory is atomic, so a reader now sees either the previous checkpoint or the
+// complete new one, never a torn one. The directory entry itself is deliberately
+// not fsynced: losing the rename in a power cut leaves the previous good file in
+// place, which is a consistent outcome.
+func writeFileAtomic(path string, data []byte) (err error) {
+	tmp := path + ".tmp"
+	var file *os.File
+	if file, err = os.OpenFile(tmp,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err != nil {
+		return
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(tmp)
+		}
+	}()
+
+	if _, err = file.Write(data); err != nil {
+		file.Close()
+		return
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		return
+	}
+	if err = file.Close(); err != nil {
+		return
+	}
+	return os.Rename(tmp, path)
+}
+
 func (c *fileChannels) cleanCheckpoints(msg *fileMsg,
 	needReplay, cleanAll bool) (err error) {
 	if needReplay {
-		defer c.replyMsg(msg)
+		defer func() { c.replyMsg(msg, err == nil) }()
 	}
 
 	dir := getCheckpointDirectory(c.cfg.DataPath, msg.checkpoint)
@@ -175,7 +210,7 @@ func (c *fileChannels) cleanCheckpoints(msg *fileMsg,
 }
 
 func (c *fileChannels) replaceCheckpoints(msg *heightFileMsg) (err error) {
-	defer c.replyMsg(&msg.fileMsg)
+	defer func() { c.replyMsg(&msg.fileMsg, err == nil) }()
 
 	defaultFullName := getDefaultPath(c.cfg.DataPath, msg.checkpoint)
 	// source file is the previous saved checkpoint
@@ -196,7 +231,7 @@ func (c *fileChannels) replaceCheckpoints(msg *heightFileMsg) (err error) {
 }
 
 func (c *fileChannels) replaceAndRemoveCheckpoints(msg *heightFileMsg) (err error) {
-	defer c.replyMsg(&msg.fileMsg)
+	defer func() { c.replyMsg(&msg.fileMsg, err == nil) }()
 
 	defaultFullName := getDefaultPath(c.cfg.DataPath, msg.checkpoint)
 	// source file is the previous saved checkpoint
@@ -227,7 +262,7 @@ func (c *fileChannels) replaceAndRemoveCheckpoints(msg *heightFileMsg) (err erro
 }
 
 func (c *fileChannels) removeCheckpoints(msg *heightFileMsg) (err error) {
-	defer c.replyMsg(&msg.fileMsg)
+	defer func() { c.replyMsg(&msg.fileMsg, err == nil) }()
 
 	// source file is the previous saved checkpoint
 	sourceFullName := getFilePathByHeight(c.cfg.DataPath, msg.checkpoint,
@@ -241,9 +276,11 @@ func (c *fileChannels) removeCheckpoints(msg *heightFileMsg) (err error) {
 	return os.Remove(sourceFullName)
 }
 
-func (c *fileChannels) replyMsg(msg *fileMsg) {
+// replyMsg hands the outcome of a file operation back to the caller waiting on the
+// reply channel. F-122: this used to send true unconditionally.
+func (c *fileChannels) replyMsg(msg *fileMsg, ok bool) {
 	if msg.reply != nil {
-		msg.reply <- true
+		msg.reply <- ok
 	}
 }
 

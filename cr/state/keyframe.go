@@ -750,6 +750,14 @@ func (kf *KeyFrame) Snapshot() *KeyFrame {
 	frame.AppropriationAmount = kf.AppropriationAmount
 	frame.CommitteeUsedAmount = kf.CommitteeUsedAmount
 	frame.Members = copyMembersMap(kf.Members)
+	// F-145: NextMembers, ClaimedDPoSKeys and NextClaimedDPoSKeys are part of the
+	// KeyFrame and are written by the disk Serialize path (serializeMembersMap /
+	// serializeClaimedDPoSKeysMap), but were left out of the in-memory snapshot, so
+	// a snapshot silently dropped the next-term committee and the claimed DPoS node
+	// keys and compared equal to a state that had lost them.
+	frame.NextMembers = copyMembersMap(kf.NextMembers)
+	frame.ClaimedDPoSKeys = copyClaimedDPoSKeysMap(kf.ClaimedDPoSKeys)
+	frame.NextClaimedDPoSKeys = copyClaimedDPoSKeysMap(kf.NextClaimedDPoSKeys)
 	frame.HistoryMembers = copyHistoryMembersMap(kf.HistoryMembers)
 	frame.CRAssetsAddressUTXOCount = kf.CRAssetsAddressUTXOCount
 	frame.CurrentWithdrawFromSideChainIndex = kf.CurrentWithdrawFromSideChainIndex
@@ -810,9 +818,16 @@ func (kf *StateKeyFrame) SerializeProgramHashVotesInfoMap(vmap map[common.Uint16
 		if err = k.Serialize(w); err != nil {
 			return
 		}
-		common.WriteVarUint(w, uint64(len(v)))
+		// F-143: both of these writes discarded their error while every neighbouring
+		// write in this file checks its own, so a short or failing write truncated the
+		// keyframe and the caller was told the checkpoint had serialized cleanly.
+		if err = common.WriteVarUint(w, uint64(len(v))); err != nil {
+			return
+		}
 		for _, votes := range v {
-			votes.Serialize(w, 0)
+			if err = votes.Serialize(w, 0); err != nil {
+				return
+			}
 		}
 	}
 	return

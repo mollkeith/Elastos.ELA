@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -226,18 +227,30 @@ func (m *Manager) Restore() (err error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
+	var failures []string
 	sortedPoints := m.getOrderedCheckpoints()
 	for _, v := range sortedPoints {
 		// fixme: Skip 'dpos' and 'cr' checkpoint temporary
 		//if v.Key() == "dpos" || v.Key() == "cr" {
 		//	continue
 		//}
-		if err = m.loadDefaultCheckpoint(v); err != nil {
+		// F-123: a failed load must not be erased by a later successful one. As
+		// shipped the failure went into the NAMED return and the next iteration's
+		// success overwrote it with nil, so a manager that restored only some of its
+		// checkpoints reported success. Keep loading the remaining checkpoints -- a
+		// missing default file is normal on a fresh node and the others must still
+		// come up -- but report every failure to the caller.
+		if e := m.loadDefaultCheckpoint(v); e != nil {
+			failures = append(failures, fmt.Sprintf("%s: %s", v.Key(), e.Error()))
 			continue
 		}
 		v.OnInit()
 	}
-	return
+	if len(failures) != 0 {
+		return errors.New("checkpoint restore incomplete -> " +
+			strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // RestoreTo will load all data of specific height in each checkpoints file and store in
@@ -412,24 +425,41 @@ func (m *Manager) findHistoryCheckpoint(current ICheckPoint,
 
 func (m *Manager) loadDefaultCheckpoint(current ICheckPoint) (err error) {
 	path := getDefaultPath(m.cfg.CheckPointConfiguration.DataPath, current)
-	data, err := m.readFileBuffer(path)
-	if err != nil {
-		return err
-	}
-	buf := new(bytes.Buffer)
-	buf.Write(data)
-	return current.Deserialize(buf)
+	return m.loadCheckpointFile(current, path)
 }
 
 func (m *Manager) loadSpecificHeightCheckpoint(current ICheckPoint, height int) (err error) {
 	path := getSpecificHeightPath(m.cfg.CheckPointConfiguration.DataPath, current, height)
+	return m.loadCheckpointFile(current, path)
+}
+
+// loadCheckpointFile deserializes a checkpoint file into the LIVE checkpoint
+// object registered with the manager.
+//
+// F-121: ICheckPoint.Deserialize writes straight into that live object, so a
+// truncated or corrupt file leaves it half-populated -- and, because Height is the
+// first field every implementation reads, it leaves the live checkpoint carrying
+// the height of a state it does not actually hold. Restore() then skips OnInit(),
+// so the consensus state is never recovered, while SafeHeight() keeps reporting
+// the height read out of the bad file; InitCheckpoint's replay therefore starts
+// ABOVE the blocks that would have rebuilt the state and the node runs at full
+// block height with empty CR/DPoS state. Putting the pre-load height back on
+// failure returns the checkpoint to the full-replay path, which is the correct
+// recovery. Nothing changes on the success path.
+func (m *Manager) loadCheckpointFile(current ICheckPoint, path string) (err error) {
 	data, err := m.readFileBuffer(path)
 	if err != nil {
 		return err
 	}
 	buf := new(bytes.Buffer)
 	buf.Write(data)
-	return current.Deserialize(buf)
+
+	heightBefore := current.GetHeight()
+	if err = current.Deserialize(buf); err != nil {
+		current.SetHeight(heightBefore)
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) readFileBuffer(path string) (buf []byte, err error) {

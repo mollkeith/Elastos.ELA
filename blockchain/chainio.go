@@ -447,7 +447,17 @@ func (b *BlockChain) initChainState() error {
 		//	return initialized, nil
 		//}
 		//return initialized, errors.New("initChainState failed")
-		return nil
+		//
+		// F-138: the database carries the authoritative chainstate record but not the
+		// v2 block index, so there is nothing left to rebuild the block index, the tip
+		// or BestChain from. Returning nil started the node with an EMPTY index at a
+		// non-genesis height, no tip and a nil BestChain -- silently, and reporting
+		// success. The migration that used to close the gap is disabled just above
+		// (the commented-out lines show failure was the intended outcome), so until it
+		// is restored the only honest result is to refuse to start.
+		return fmt.Errorf("initChainState: chain state is initialized but block "+
+			"index bucket %q is missing; the block database needs re-indexing",
+			blockIndexBucketName)
 	}
 
 	// Attempt to load the chain state from the database.
