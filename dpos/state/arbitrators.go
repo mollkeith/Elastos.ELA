@@ -3271,6 +3271,26 @@ func getArbitersInfoWithoutOnduty(title string,
 }
 
 func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
+	// F-096 nil-fix: initArbitrators is the constructor the two checkpoint rebuild
+	// sites (CheckPoint.OnReset and the deep CheckPoint.OnRollbackTo branch) run over
+	// a hand-built &Arbiters{}, whose embedded *degradation is nil. F-096 made
+	// initFromArbitrators READ ar.degradation, so both sites nil-panicked. Establish
+	// here the same genesis-fresh baseline NewArbitrators builds: DSNormal, no
+	// understaffedSince / inactivateHeight, empty processed-inactive-tx set. Guarded
+	// on nil so NewArbitrators -- which fills degradation in its literal BEFORE
+	// calling this -- is left exactly as it was and can never be double-initialized,
+	// and so an already populated degradation is never wiped. UNGATED: it only
+	// restores the genesis defaults the pristine rebuild always meant to produce, so
+	// no consensus behaviour moves.
+	if a.degradation == nil {
+		a.degradation = &degradation{
+			inactiveTxs:       make(map[common.Uint256]interface{}),
+			inactivateHeight:  0,
+			understaffedSince: 0,
+			state:             DSNormal,
+		}
+	}
+
 	originArbiters := make([]ArbiterMember, len(chainParams.DPoSConfiguration.OriginArbiters))
 	for i, arbiter := range chainParams.DPoSConfiguration.OriginArbiters {
 		b, err := common.HexStringToBytes(arbiter)

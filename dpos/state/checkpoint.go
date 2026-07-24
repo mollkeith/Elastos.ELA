@@ -12,6 +12,7 @@ import (
 	"math"
 
 	"github.com/elastos/Elastos.ELA/common"
+	"github.com/elastos/Elastos.ELA/common/config"
 	"github.com/elastos/Elastos.ELA/core/checkpoint"
 	"github.com/elastos/Elastos.ELA/core/types"
 )
@@ -98,13 +99,33 @@ func (c *CheckPoint) OnRollbackSeekTo(height uint32) {
 	c.arbitrators.RollbackSeekTo(height)
 }
 
-func (c *CheckPoint) OnReset() error {
-	log.Info("dpos state OnReset")
+// newBaselineArbiters builds the genesis-fresh Arbiters that BOTH checkpoint
+// rebuild sites -- OnReset and the deep OnRollbackTo branch -- reconstruct the
+// checkpoint from. Both need the SAME fully constructed baseline, because
+// initFromArbitrators dereferences ar.State.StateKeyFrame and (since F-096)
+// ar.degradation, while a hand-built &Arbiters{} has both nil. OnReset used to
+// initialise State inline and the deep OnRollbackTo branch did not, so the two
+// paths had already drifted apart before F-096 added the second dereference;
+// building the baseline in exactly one place removes that whole class of drift.
+// UNGATED: it produces the genesis defaults the pristine rebuild always intended,
+// so nothing consensus-visible changes -- the paths simply stop crashing.
+func newBaselineArbiters(chainParams *config.Configuration) (*Arbiters, error) {
 	ar := &Arbiters{}
 	ar.State = &State{
 		StateKeyFrame: NewStateKeyFrame(),
 	}
-	if err := ar.initArbitrators(c.arbitrators.ChainParams); err != nil {
+	// initArbitrators fills the genesis arbiter / CRC / reward baseline and (F-096
+	// nil-fix) the empty DSNormal degradation struct.
+	if err := ar.initArbitrators(chainParams); err != nil {
+		return nil, err
+	}
+	return ar, nil
+}
+
+func (c *CheckPoint) OnReset() error {
+	log.Info("dpos state OnReset")
+	ar, err := newBaselineArbiters(c.arbitrators.ChainParams)
+	if err != nil {
 		return err
 	}
 	c.initFromArbitrators(ar)
@@ -114,8 +135,8 @@ func (c *CheckPoint) OnReset() error {
 
 func (c *CheckPoint) OnRollbackTo(height uint32) error {
 	if height < c.StartHeight() {
-		ar := &Arbiters{}
-		if err := ar.initArbitrators(c.arbitrators.ChainParams); err != nil {
+		ar, err := newBaselineArbiters(c.arbitrators.ChainParams)
+		if err != nil {
 			return err
 		}
 		c.initFromArbitrators(ar)
