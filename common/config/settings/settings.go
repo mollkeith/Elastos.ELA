@@ -91,7 +91,8 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 			"WARNING: unrecognized ActiveNet %q - keeping MAINNET chain params while "+
 				"DISABLING the CrossChain-UTXO freeze/restriction, strict-money-range and "+
 				"forced-rollback controls. Use one of: mainnet, testnet, regnet. If this is "+
-				"an intentional private/forked net, ignore this warning.\n", conf.ActiveNet)
+				"an intentional private/forked net, ignore this warning; if this node is meant "+
+				"to be MAINNET it will refuse to start (F-043 part 2 / G3).\n", conf.ActiveNet)
 	}
 
 	if conf.MaxBlockSize > 0 {
@@ -187,8 +188,8 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 		// to [DposV2MinVoteLockDuration, DposV2MaxVoteLockDuration] (7200/720000), so
 		// an operator override of these validation params would let validation admit
 		// a vote VoteRights then weights differently -- a consensus divergence.
-		configuration.DPoSConfiguration.DPoSV2MinVotesLockTime = 7200
-		configuration.DPoSConfiguration.DPoSV2MaxVotesLockTime = 720000
+		configuration.DPoSConfiguration.DPoSV2MinVotesLockTime = mainnetDPoSV2MinVotesLockTime
+		configuration.DPoSConfiguration.DPoSV2MaxVotesLockTime = mainnetDPoSV2MaxVotesLockTime
 	default:
 		// Rehearsal opt-in (see ArmIncidentGates): keep the supplied heights so the
 		// strict-money / forced-rollback path can be exercised on a testnet. Mainnet
@@ -269,30 +270,153 @@ func enforceMainnetSchnorrActivationHeights(configuration *config.Configuration)
 	}
 }
 
-// enforceMainnetIncidentGatesArmed (F-043 part 2) refuses to start the REAL mainnet
-// chain with the incident controls disabled. The ActiveNet label switch that selects
-// params has no default, so a typo (e.g. "mainet") keeps the mainnet foundation
-// identity while enforce*Heights() above hit their default branch and DISABLE the
-// CrossChain-UTXO freeze, strict-money-range and forced-rollback gates -- a mainnet
-// node that would follow the corrupt chain. Discriminates by foundation IDENTITY, not
-// the label (unknown labels are legitimately used for private/forked nets, which have a
-// different foundation and are unaffected).
+// mainnetDPoSV2MinVotesLockTime / mainnetDPoSV2MaxVotesLockTime are the coordinated
+// mainnet DPoS v2 vote lock-time bounds. Named so the pin above and the verification
+// below share one source of truth instead of repeating the literals.
+const (
+	mainnetDPoSV2MinVotesLockTime = uint32(7200)
+	mainnetDPoSV2MaxVotesLockTime = uint32(720000)
+)
+
+// coordinatedMainnetValue pairs one coordinated mainnet consensus height with the
+// compiled-in value every node in the fleet must agree on.
+type coordinatedMainnetValue struct {
+	name string
+	got  uint32
+	want uint32
+}
+
+// coordinatedMainnetValues is the COMPLETE set of heights the enforce* helpers above
+// assign on their mainnet arm. enforceMainnetIncidentGatesArmed asserts equality
+// against this set, which turns the guard into the post-condition of the whole pin
+// chain rather than a three-field spot check: a configuration that never reached a
+// mainnet arm is caught here even when the surviving values are ordinary numbers
+// rather than the Disabled sentinels. A pin added above must be listed here.
+func coordinatedMainnetValues(c *config.Configuration) []coordinatedMainnetValue {
+	return []coordinatedMainnetValue{
+		{"StrictMoneyRangeHeight", c.StrictMoneyRangeHeight,
+			config.MainNetStrictMoneyRangeHeight},
+		{"RevisedDPoSRewardHeight", c.RevisedDPoSRewardHeight,
+			config.MainNetRevisedDPoSRewardHeight},
+		{"CrossChainUTXOFreezeHeight", c.CrossChainUTXOFreezeHeight,
+			config.MainNetCrossChainUTXOFreezeHeight},
+		{"CrossChainUTXORestrictionHeight", c.CrossChainUTXORestrictionHeight,
+			config.MainNetCrossChainUTXORestrictionHeight},
+		{"ForcedRollbackHeight", c.ForcedRollbackHeight,
+			config.MainNetForcedRollbackHeight},
+		{"SchnorrStartHeight", c.SchnorrStartHeight,
+			config.MainNetSchnorrStartHeight},
+		{"NormalSchnorrStartHeight", c.NormalSchnorrStartHeight,
+			config.MainNetNormalSchnorrStartHeight},
+		{"ProducerSchnorrStartHeight", c.ProducerSchnorrStartHeight,
+			config.MainNetProducerSchnorrStartHeight},
+		{"CRSchnorrStartHeight", c.CRSchnorrStartHeight,
+			config.MainNetCRSchnorrStartHeight},
+		{"VotesSchnorrStartHeight", c.VotesSchnorrStartHeight,
+			config.MainNetVotesSchnorrStartHeight},
+		{"DPoSV2MinVotesLockTime", c.DPoSConfiguration.DPoSV2MinVotesLockTime,
+			mainnetDPoSV2MinVotesLockTime},
+		{"DPoSV2MaxVotesLockTime", c.DPoSConfiguration.DPoSV2MaxVotesLockTime,
+			mainnetDPoSV2MaxVotesLockTime},
+	}
+}
+
+// sameFrozenAddresses reports whether a frozen-address list carries exactly the
+// coordinated mainnet entries, in order. ProgramHash is derived from Address by
+// Sterilize and is deliberately not compared.
+func sameFrozenAddresses(got, want []config.FrozenAddress) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i].Address != want[i].Address ||
+			got[i].DisableStartHeight != want[i].DisableStartHeight {
+			return false
+		}
+	}
+	return true
+}
+
+// enforceMainnetIncidentGatesArmed (F-043 part 2, hardened by G3) refuses to start a
+// node that carries the REAL mainnet foundation identity unless its coordinated
+// consensus configuration is byte-for-byte the fleet's.
+//
+// The ActiveNet label switch that selects params has no default, so a typo (e.g.
+// "mainet") keeps the mainnet params AND this mainnet foundation identity while every
+// enforce* helper above takes its NON-mainnet branch. Discriminating by foundation
+// IDENTITY rather than by label is what catches that; unknown labels remain
+// legitimate for private/forked nets, which have a different foundation and return
+// early here.
+//
+// G3: the previous version only tested for the Disabled SENTINELS and an empty
+// trigger, so the rehearsal opt-in ArmIncidentGates -- whose whole purpose is to make
+// those default branches KEEP the operator's heights instead of disabling them --
+// walked straight through it. A mislabelled node then started, believing it was
+// mainnet, with gate 1 effectively off, the forced rollback disarmed, the
+// CrossChain-UTXO freeze off and the F-185 aggregate-Schnorr withdraw path re-opened.
+// Two changes close it:
+//
+//   - ArmIncidentGates is refused outright on the mainnet identity. It exists only to
+//     arm a NON-mainnet rehearsal chain; on mainnet the pins are unconditional, so the
+//     flag can never be anything but a copied-in rehearsal config.
+//   - every coordinated value must EQUAL its compiled-in mainnet constant, so any
+//     future pin that a mislabelled config bypasses is caught too.
+//
+// A correctly configured mainnet node reaches every mainnet arm above, so all of
+// these hold by construction and nothing about its behaviour changes.
 func enforceMainnetIncidentGatesArmed(configuration *config.Configuration) {
 	if !config.IsMainNetFoundationProgramHash(configuration.FoundationProgramHash) {
 		return
 	}
-	if configuration.StrictMoneyRangeHeight == config.DisabledStrictMoneyRangeHeight ||
-		configuration.CrossChainUTXOFreezeHeight == config.DisabledCrossChainUTXORestrictionHeight ||
-		configuration.ForcedRollbackTrigger == "" {
-		panic(fmt.Sprintf(
-			"config: ActiveNet %q resolves to the MAINNET chain (foundation identity) but the "+
-				"incident controls are DISABLED (StrictMoneyRangeHeight=%d, "+
-				"CrossChainUTXOFreezeHeight=%d, ForcedRollbackTrigger=%q). Refusing to start: a "+
-				"mainnet node with the CrossChain-UTXO freeze / strict-money / forced-rollback "+
-				"gates off would follow the corrupt chain. Set ActiveNet to \"mainnet\".",
-			configuration.ActiveNet, configuration.StrictMoneyRangeHeight,
-			configuration.CrossChainUTXOFreezeHeight, configuration.ForcedRollbackTrigger))
+
+	var problems []string
+
+	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
+	case "", "mainnet", "main":
+	default:
+		problems = append(problems, fmt.Sprintf(
+			"ActiveNet=%q is not a recognized mainnet label, so the params switch kept "+
+				"MAINNET params while every coordinated pin took its non-mainnet branch",
+			configuration.ActiveNet))
 	}
+
+	if configuration.ArmIncidentGates {
+		problems = append(problems,
+			"ArmIncidentGates=true, which is the NON-MAINNET rehearsal opt-in and must never "+
+				"appear in a mainnet configuration")
+	}
+
+	for _, value := range coordinatedMainnetValues(configuration) {
+		if value.got != value.want {
+			problems = append(problems, fmt.Sprintf("%s=%d, want the coordinated %d",
+				value.name, value.got, value.want))
+		}
+	}
+
+	if configuration.ForcedRollbackTrigger != config.MainNetForcedRollbackTrigger {
+		problems = append(problems, fmt.Sprintf(
+			"ForcedRollbackTrigger=%q, want the coordinated %q",
+			configuration.ForcedRollbackTrigger, config.MainNetForcedRollbackTrigger))
+	}
+
+	if !sameFrozenAddresses(configuration.FrozenAddresses, config.MainNetFrozenAddresses()) {
+		problems = append(problems, fmt.Sprintf(
+			"FrozenAddresses (%d entries) are not the coordinated mainnet list (%d entries)",
+			len(configuration.FrozenAddresses), len(config.MainNetFrozenAddresses())))
+	}
+
+	if len(problems) == 0 {
+		return
+	}
+
+	panic(fmt.Sprintf(
+		"config: this node carries the REAL MAINNET foundation identity but its coordinated "+
+			"consensus configuration does not match the fleet. Refusing to start: a mainnet node "+
+			"that disagrees about the CrossChain-UTXO freeze / strict-money-range / "+
+			"forced-rollback / Schnorr activation values either follows the corrupt chain or "+
+			"forks off the fleet. Problems: %s. Set ActiveNet to \"mainnet\", remove "+
+			"ArmIncidentGates, and remove every local override of these values.",
+		strings.Join(problems, "; ")))
 }
 
 // enforceFrozenAddresses prevents local configuration from changing the

@@ -666,35 +666,36 @@ func (p *Configuration) RegNet() *Configuration {
 
 // Configuration defines the configurable parameters to run a ELA node.
 type Configuration struct {
-	Conf          string `screw:"--conf" usage:"set the config file path"`
-	ActiveNet     string `json:"ActiveNet"`
+	Conf      string `screw:"--conf" usage:"set the config file path"`
+	ActiveNet string `json:"ActiveNet"`
 	// ArmIncidentGates lets a NON-MAINNET (rehearsal) chain opt in to the
 	// coordinated incident gates -- StrictMoneyRangeHeight, the CrossChain-UTXO
 	// freeze/restriction heights and the forced-rollback trigger -- which are
 	// otherwise pinned to Disabled for every non-mainnet net. Without this, every
 	// gated fix (F-015, F-212, the same-block mirrors, ...) is INERT on testnet and
-	// a green testnet run proves nothing. It is IGNORED on mainnet: the mainnet
-	// branch of enforceCrossChainUTXORestrictionHeights /
-	// enforceStrictMoneyAndRollbackHeights pins the real values unconditionally, so
-	// this flag can only ever ARM a rehearsal chain, never weaken mainnet.
-	ArmIncidentGates bool `json:"ArmIncidentGates"`
-	Password      string `screw:"short;--password" usage:"password for keystore"`
-	DataDir       string `screw:"short;--datadir" usage:"block data and logs storage path default: elastos"`
-	HttpInfoPort  uint16 `screw:"--infoport" usage:"port for the http info server"`
-	HttpInfoStart bool   `json:"HttpInfoStart"`
-	HttpRestPort  int    `screw:"--restport" usage:"port for the http restful server"`
-	HttpRestStart bool   `json:"HttpRestStart"`
-	HttpWsPort    int    `screw:"--wsport" usage:"port for the http web socket server"`
-	HttpWsStart   bool   `json:"HttpWsStart"`
-	HttpJsonPort  int    `screw:"--rpcport" usage:"port for the http json rpc port server"`
-	ProfilePort   uint32 `screw:"--profileport" usage:"port for the http profile port rpc server"`
-	ProfileHost   string `screw:"--profilehost" usage:"port for the http profile rpc host server"`
-	DisableDNS    bool   `screw:"--disabledns" usage:"disable DNS for node"`
-	EnableRPC     bool   `screw:"--enablerpc" usage:"enable RPC for node"`
-	MaxLogsSize   int64  `json:"MaxLogsSize"`
-	MaxPerLogSize int64  `json:"MaxPerLogSize"`
-	RestCertPath  string `json:"RestCertPath"`
-	RestKeyPath   string `json:"RestKeyPath"`
+	// a green testnet run proves nothing. It is REFUSED on mainnet: the mainnet branch
+	// of enforceCrossChainUTXORestrictionHeights / enforceStrictMoneyAndRollbackHeights
+	// pins the real values unconditionally, and enforceMainnetIncidentGatesArmed makes
+	// a node that carries the mainnet foundation identity refuse to start while this
+	// flag is set -- so it can only ever ARM a rehearsal chain, never weaken mainnet.
+	ArmIncidentGates bool   `json:"ArmIncidentGates"`
+	Password         string `screw:"short;--password" usage:"password for keystore"`
+	DataDir          string `screw:"short;--datadir" usage:"block data and logs storage path default: elastos"`
+	HttpInfoPort     uint16 `screw:"--infoport" usage:"port for the http info server"`
+	HttpInfoStart    bool   `json:"HttpInfoStart"`
+	HttpRestPort     int    `screw:"--restport" usage:"port for the http restful server"`
+	HttpRestStart    bool   `json:"HttpRestStart"`
+	HttpWsPort       int    `screw:"--wsport" usage:"port for the http web socket server"`
+	HttpWsStart      bool   `json:"HttpWsStart"`
+	HttpJsonPort     int    `screw:"--rpcport" usage:"port for the http json rpc port server"`
+	ProfilePort      uint32 `screw:"--profileport" usage:"port for the http profile port rpc server"`
+	ProfileHost      string `screw:"--profilehost" usage:"port for the http profile rpc host server"`
+	DisableDNS       bool   `screw:"--disabledns" usage:"disable DNS for node"`
+	EnableRPC        bool   `screw:"--enablerpc" usage:"enable RPC for node"`
+	MaxLogsSize      int64  `json:"MaxLogsSize"`
+	MaxPerLogSize    int64  `json:"MaxPerLogSize"`
+	RestCertPath     string `json:"RestCertPath"`
+	RestKeyPath      string `json:"RestKeyPath"`
 	// GenesisBlock defines the first block of the chain.
 	GenesisBlock *types.Block
 
