@@ -204,9 +204,24 @@ func (s *Server) sessionHandler(done chan bool) {
 
 func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 	// F-161: refuse before the upgrade, so an over-cap client gets a plain HTTP
-	// error instead of a websocket that is torn down a moment later. Concurrent
-	// upgrades can overshoot the cap by the number of upgrades in flight, which
-	// is bounded and costs one session each.
+	// error instead of a websocket that is torn down a moment later.
+	//
+	// CORRECTION (campaign close-out): the earlier text claimed the concurrent
+	// overshoot "is bounded" without saying by what. It is NOT bounded by any
+	// constant of ours. Count() and the Upgrade below are not atomic together, so
+	// every request already past this check and not yet inserted into s.sessions is
+	// invisible here; the overshoot therefore equals the number of upgrades IN
+	// FLIGHT, which is set by the ATTACKER's connection concurrency and by
+	// net/http's accept rate -- not by maxSessions. A client opening N connections
+	// in parallel against a full server can seat close to N extra sessions in that
+	// window.
+	//
+	// Why this is still worth having, stated plainly rather than overstated: the
+	// window is one Upgrade long, each overshoot session costs one slot and is
+	// reclaimed by the normal expiry sweep, and the cap holds in the steady state.
+	// A HARD bound needs the check and the insert under one lock (reserve-then-
+	// insert on s.sessions), which is a behaviour change to the session map and is
+	// deliberately NOT made here.
 	if s.maxSessions > 0 && s.sessions.Count() >= s.maxSessions {
 		log.Warn("websocket session limit reached, rejecting connection")
 		http.Error(w, "too many websocket sessions",

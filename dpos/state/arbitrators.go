@@ -3360,6 +3360,17 @@ func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
 	// defect (FV-12), and recoverFromCheckPoints now clears the ring for that reason.
 	// Independently, SnapshotByHeight index-writes a.Snapshots[height] unguarded, so a
 	// nil here is a crash one refactor away.
+	//
+	// CORRECTION (campaign close-out), so this guard is not read as load-bearing: on
+	// BOTH live rebuild paths it is belt-and-braces, NOT the thing that clears the
+	// ring. checkpoint.go OnReset and the OnRollbackTo(height < StartHeight) branch
+	// each run newBaselineArbiters -> initArbitrators (here) and then immediately
+	// RecoverFromCheckPoints, which UNCONDITIONALLY re-makes both fields. Whatever
+	// this guard leaves is replaced before any caller can read it. It earns its place
+	// only against a future constructor that reaches initArbitrators WITHOUT a
+	// following recoverFromCheckPoints -- there is none today. The FV-12 correctness
+	// property lives in recoverFromCheckPoints; do not weaken that one on the
+	// strength of this.
 	if a.Snapshots == nil {
 		a.Snapshots = make(map[uint32][]*CheckPoint)
 	}
