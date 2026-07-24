@@ -3270,18 +3270,37 @@ func getArbitersInfoWithoutOnduty(title string,
 	return info, params
 }
 
+// initArbitrators is the ONLY constructor the two checkpoint rebuild sites
+// (CheckPoint.OnReset and the deep CheckPoint.OnRollbackTo branch, both through
+// newBaselineArbiters) run over a hand-built &Arbiters{}. NewArbitrators, by
+// contrast, establishes a whole baseline in its composite literal and only THEN
+// calls in here -- so every field that literal fills and initArbitrators did not was
+// left nil on a rebuild, and recoverFromCheckPoints plants a subset of them straight
+// onto the LIVE Arbiters. That is the defect CLASS the guarded block below closes:
+// a rebuild must equal a genesis-fresh NewArbitrators field for field, not merely
+// avoid whichever dereference happened to crash first.
+//
+// Every assignment is guarded on nil because the NewArbitrators literal runs FIRST
+// and always leaves these non-nil. The guards are therefore provably never taken on
+// the NewArbitrators path -- its behaviour is bit-for-bit unchanged -- and an
+// already populated field is never wiped. (CRCommittee, CkpManager and
+// BlockConfirmProposalSponsors are the literal's only fields that are genesis-time
+// INPUTS rather than functions of chainParams; newBaselineArbiters supplies those.)
+//
+// Fields deliberately left at their zero value are the ones a genesis-fresh
+// NewArbitrators ALSO leaves at zero: CurrentCandidates (nil slice), nextCRCArbiters
+// (nil slice), arbitersRoundReward (explicitly nil in the literal, and only ever
+// wholesale-reassigned, never index-written), DutyIndex, crcChangedHeight,
+// accumulativeReward, finalRoundChange, clearingHeight, forceChanged, started,
+// pendingSpecialTx and the RegisterFunction closures. Filling those would DIVERGE
+// from genesis-fresh, not converge on it.
+//
+// UNGATED: this only restores the genesis defaults the pristine rebuild always meant
+// to produce, so no consensus behaviour moves.
 func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
-	// F-096 nil-fix: initArbitrators is the constructor the two checkpoint rebuild
-	// sites (CheckPoint.OnReset and the deep CheckPoint.OnRollbackTo branch) run over
-	// a hand-built &Arbiters{}, whose embedded *degradation is nil. F-096 made
-	// initFromArbitrators READ ar.degradation, so both sites nil-panicked. Establish
-	// here the same genesis-fresh baseline NewArbitrators builds: DSNormal, no
-	// understaffedSince / inactivateHeight, empty processed-inactive-tx set. Guarded
-	// on nil so NewArbitrators -- which fills degradation in its literal BEFORE
-	// calling this -- is left exactly as it was and can never be double-initialized,
-	// and so an already populated degradation is never wiped. UNGATED: it only
-	// restores the genesis defaults the pristine rebuild always meant to produce, so
-	// no consensus behaviour moves.
+	// F-096 made initFromArbitrators READ ar.degradation, so both rebuild sites
+	// nil-panicked: DSNormal, no understaffedSince / inactivateHeight, empty
+	// processed-inactive-tx set.
 	if a.degradation == nil {
 		a.degradation = &degradation{
 			inactiveTxs:       make(map[common.Uint256]interface{}),
@@ -3289,6 +3308,49 @@ func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
 			understaffedSince: 0,
 			state:             DSNormal,
 		}
+	}
+
+	// HARMFUL when nil, and the reason this commit exists: initFromArbitrators
+	// ALIASES this map into the CheckPoint, recoverFromCheckPoints then plants it on
+	// the LIVE Arbiters, and ProcessSpecialTxPayload index-writes it unguarded
+	// (a.illegalBlocksPayloadHashes[obj.Hash()] = nil) from the two DPoS-gossip entry
+	// points ProcessIllegalBlock / ProcessInactiveArbiter -- panicking with
+	// "assignment to entry in nil map" in the window between a reset and the first
+	// ProcessBlock, which is what re-makes the map. Pre-existing upstream: the
+	// rebuild leaves it nil at dcacb82 too, i.e. before F-096 touched this code.
+	if a.illegalBlocksPayloadHashes == nil {
+		a.illegalBlocksPayloadHashes = make(map[common.Uint256]interface{})
+	}
+
+	// Also planted on the LIVE Arbiters by recoverFromCheckPoints. Benign TODAY (only
+	// read, and wholesale-reassigned through copyDPoSRewardMap, which maps nil to an
+	// empty map), so this converges on genesis-fresh rather than fixing a live crash
+	// -- but it removes the standing trap.
+	if a.LastDPoSRewards == nil {
+		a.LastDPoSRewards = make(map[string]map[string]common.Fixed64)
+	}
+
+	// NOT planted by recoverFromCheckPoints (the live Arbiters keeps its own), but
+	// SnapshotByHeight index-writes a.Snapshots[height] unguarded, so a nil here is
+	// the same latent trap one refactor away.
+	if a.Snapshots == nil {
+		a.Snapshots = make(map[uint32][]*CheckPoint)
+	}
+	if a.SnapshotKeysDesc == nil {
+		a.SnapshotKeysDesc = make([]uint32, 0)
+	}
+
+	// nil is len/append-safe, so this is purely the genesis-fresh baseline.
+	if a.nextCandidates == nil {
+		a.nextCandidates = make([]ArbiterMember, 0)
+	}
+
+	if a.History == nil {
+		a.History = utils.NewHistory(maxHistoryCapacity)
+	}
+
+	if a.ChainParams == nil {
+		a.ChainParams = chainParams
 	}
 
 	originArbiters := make([]ArbiterMember, len(chainParams.DPoSConfiguration.OriginArbiters))

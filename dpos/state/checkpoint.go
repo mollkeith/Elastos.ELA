@@ -12,7 +12,6 @@ import (
 	"math"
 
 	"github.com/elastos/Elastos.ELA/common"
-	"github.com/elastos/Elastos.ELA/common/config"
 	"github.com/elastos/Elastos.ELA/core/checkpoint"
 	"github.com/elastos/Elastos.ELA/core/types"
 )
@@ -99,24 +98,47 @@ func (c *CheckPoint) OnRollbackSeekTo(height uint32) {
 	c.arbitrators.RollbackSeekTo(height)
 }
 
-// newBaselineArbiters builds the genesis-fresh Arbiters that BOTH checkpoint
-// rebuild sites -- OnReset and the deep OnRollbackTo branch -- reconstruct the
-// checkpoint from. Both need the SAME fully constructed baseline, because
-// initFromArbitrators dereferences ar.State.StateKeyFrame and (since F-096)
-// ar.degradation, while a hand-built &Arbiters{} has both nil. OnReset used to
-// initialise State inline and the deep OnRollbackTo branch did not, so the two
-// paths had already drifted apart before F-096 added the second dereference;
-// building the baseline in exactly one place removes that whole class of drift.
-// UNGATED: it produces the genesis defaults the pristine rebuild always intended,
-// so nothing consensus-visible changes -- the paths simply stop crashing.
-func newBaselineArbiters(chainParams *config.Configuration) (*Arbiters, error) {
-	ar := &Arbiters{}
+// newBaselineArbiters builds the genesis-fresh Arbiters that BOTH checkpoint rebuild
+// sites -- OnReset and the deep OnRollbackTo branch -- reconstruct the checkpoint
+// from. Both need the SAME fully constructed baseline: initFromArbitrators
+// dereferences ar.State.StateKeyFrame and (since F-096) ar.degradation, and ALIASES
+// ar.illegalBlocksPayloadHashes / ar.LastDPoSRewards into the CheckPoint, from where
+// recoverFromCheckPoints plants them on the LIVE Arbiters -- while a hand-built
+// &Arbiters{} leaves every one of those nil. Building the baseline in exactly one
+// place, over a constructor (initArbitrators) that establishes the WHOLE class
+// invariant, is what keeps a rebuild equal to a genesis-fresh NewArbitrators.
+//
+// It takes the live Arbiters because three of the NewArbitrators literal's fields are
+// genesis-time INPUTS rather than functions of chainParams: the CR committee, the
+// checkpoint manager, and the operator-supplied block-confirm sponsor overrides (read
+// once from DPoSConfiguration.SponsorsFilePath at construction). Carrying them across
+// from the live object reproduces the genesis values exactly, with no file I/O and --
+// decisively -- no new error path inside a reorg-recovery reset.
+//
+// The one deliberate divergence is *State: only its StateKeyFrame is rebuilt, not the
+// closures NewState installs. That is REQUIRED, not an oversight -- NewState calls
+// events.Subscribe(state.handleEvents), so constructing one per reset would leak a
+// subscription to a dead State on every deep reorg. It is also inert:
+// initFromArbitrators reads exactly *ar.State.StateKeyFrame off this object, and
+// recoverFromCheckPoints re-points the LIVE State's StateKeyFrame without ever
+// replacing the live State itself, so the live closures survive untouched.
+//
+// UNGATED: it produces the genesis defaults the pristine rebuild always intended, so
+// nothing consensus-visible changes -- the paths simply stop crashing.
+func newBaselineArbiters(live *Arbiters) (*Arbiters, error) {
+	ar := &Arbiters{
+		// Genesis-time inputs, not derivable from chainParams.
+		CRCommittee:                  live.CRCommittee,
+		CkpManager:                   live.CkpManager,
+		BlockConfirmProposalSponsors: live.BlockConfirmProposalSponsors,
+	}
 	ar.State = &State{
 		StateKeyFrame: NewStateKeyFrame(),
 	}
-	// initArbitrators fills the genesis arbiter / CRC / reward baseline and (F-096
-	// nil-fix) the empty DSNormal degradation struct.
-	if err := ar.initArbitrators(chainParams); err != nil {
+	// initArbitrators fills the whole rest of the genesis baseline: arbiters, CRC
+	// maps, rewards, degradation, illegalBlocksPayloadHashes, LastDPoSRewards,
+	// Snapshots, SnapshotKeysDesc, nextCandidates, History and ChainParams.
+	if err := ar.initArbitrators(live.ChainParams); err != nil {
 		return nil, err
 	}
 	return ar, nil
@@ -124,7 +146,7 @@ func newBaselineArbiters(chainParams *config.Configuration) (*Arbiters, error) {
 
 func (c *CheckPoint) OnReset() error {
 	log.Info("dpos state OnReset")
-	ar, err := newBaselineArbiters(c.arbitrators.ChainParams)
+	ar, err := newBaselineArbiters(c.arbitrators)
 	if err != nil {
 		return err
 	}
@@ -135,7 +157,7 @@ func (c *CheckPoint) OnReset() error {
 
 func (c *CheckPoint) OnRollbackTo(height uint32) error {
 	if height < c.StartHeight() {
-		ar, err := newBaselineArbiters(c.arbitrators.ChainParams)
+		ar, err := newBaselineArbiters(c.arbitrators)
 		if err != nil {
 			return err
 		}
@@ -663,6 +685,19 @@ func (c *CheckPoint) readArbiters(r io.Reader) ([]ArbiterMember, error) {
 	return arbiters, nil
 }
 
+// initFromArbitrators copies an Arbiters into this CheckPoint. Its callers are
+// Snapshot() and NewCheckpoint() over the LIVE Arbiters, and the two rebuild sites
+// over a newBaselineArbiters() baseline -- all of which are fully constructed.
+//
+// The nil guards below are therefore BELT AND BRACES, not the fix: the fix is that
+// initArbitrators now establishes the whole genesis baseline, so no caller can reach
+// here with these nil. They exist so a FUTURE hand-built &Arbiters{} caller that
+// skips newBaselineArbiters cannot silently re-open this defect class -- neither the
+// nil DEREFERENCES (ar.State.StateKeyFrame, ar.degradation) nor the nil MAPS that
+// recoverFromCheckPoints would plant on the live Arbiters for ProcessSpecialTxPayload
+// to index-write. Each guard emits exactly the documented genesis/legacy default, so
+// taking one produces the same CheckPoint a complete baseline would. On every path
+// that exists today they are provably not taken, so nothing observable changes.
 func (c *CheckPoint) initFromArbitrators(ar *Arbiters) {
 	c.CurrentCandidates = ar.CurrentCandidates
 	c.NextArbitrators = ar.nextArbitrators
@@ -670,25 +705,49 @@ func (c *CheckPoint) initFromArbitrators(ar *Arbiters) {
 	c.CurrentReward = ar.CurrentReward
 	c.NextReward = ar.NextReward
 	c.LastDPoSRewards = ar.LastDPoSRewards
+	if c.LastDPoSRewards == nil {
+		c.LastDPoSRewards = make(map[string]map[string]common.Fixed64)
+	}
 	c.LastArbitrators = ar.LastArbitrators
 	c.CurrentArbitrators = ar.CurrentArbitrators
-	c.StateKeyFrame = *ar.State.StateKeyFrame
+	// Legacy default: the empty genesis key frame NewArbitrators starts from.
+	if ar.State != nil && ar.State.StateKeyFrame != nil {
+		c.StateKeyFrame = *ar.State.StateKeyFrame
+	} else {
+		c.StateKeyFrame = *NewStateKeyFrame()
+	}
 	c.DutyIndex = ar.DutyIndex
 	c.AccumulativeReward = ar.accumulativeReward
 	c.FinalRoundChange = ar.finalRoundChange
 	c.ClearingHeight = ar.clearingHeight
+	// arbitersRoundReward is genuinely nil on a genesis-fresh Arbiters (explicitly so
+	// in the NewArbitrators literal) and is only ever wholesale-reassigned, never
+	// index-written, so it is deliberately NOT defaulted here: defaulting it would
+	// make a rebuild differ from genesis.
 	c.ArbitersRoundReward = ar.arbitersRoundReward
 	c.IllegalBlocksPayloadHashes = ar.illegalBlocksPayloadHashes
+	if c.IllegalBlocksPayloadHashes == nil {
+		c.IllegalBlocksPayloadHashes = make(map[common.Uint256]interface{})
+	}
 	c.CRCChangedHeight = ar.crcChangedHeight
 	c.CurrentCRCArbitersMap = ar.CurrentCRCArbitersMap
 	c.NextCRCArbitersMap = ar.nextCRCArbitersMap
 	c.NextCRCArbiters = ar.nextCRCArbiters
 	c.ForceChanged = ar.forceChanged
-	// F-096: capture degradation state so it survives serialize/restore.
-	c.DegradationState = byte(ar.degradation.state)
-	c.UnderstaffedSince = ar.degradation.understaffedSince
-	c.InactivateHeight = ar.degradation.inactivateHeight
-	c.InactiveTxs = copyInactiveTxs(ar.degradation.inactiveTxs)
+	// F-096: capture degradation state so it survives serialize/restore. The legacy
+	// default for a nil degradation is the one a pre-F-096 checkpoint restores as:
+	// DSNormal, no understaffedSince / inactivateHeight, empty processed set.
+	if ar.degradation != nil {
+		c.DegradationState = byte(ar.degradation.state)
+		c.UnderstaffedSince = ar.degradation.understaffedSince
+		c.InactivateHeight = ar.degradation.inactivateHeight
+		c.InactiveTxs = copyInactiveTxs(ar.degradation.inactiveTxs)
+	} else {
+		c.DegradationState = byte(DSNormal)
+		c.UnderstaffedSince = 0
+		c.InactivateHeight = 0
+		c.InactiveTxs = copyInactiveTxs(nil)
+	}
 
 }
 
