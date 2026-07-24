@@ -537,6 +537,26 @@ func (pow *Service) SolveBlock(msgBlock *types.Block, lastBlockHash *common.Uint
 		auxPow.ParBlockHeader.Nonce = i
 		hash := auxPow.ParBlockHeader.Hash() // solve parBlockHeader hash
 		if blockchain.HashToBig(&hash).Cmp(targetDifficulty) <= 0 {
+			// B2 (F-041 production side): stamp ParentHash for the WINNING
+			// nonce, i.e. only once the parent header is final.
+			// auxpow.GenerateAuxPow above never sets ParentHash, so every
+			// self-mined block used to carry ParentHash == 0x00..00 - exactly
+			// the encoding the canonical-AuxPow gate rejects at and above
+			// StrictMoneyRangeHeight, which is the height the chain restarts
+			// on. Stamping before the search would not help: the parent
+			// header hash moves with the nonce, so the value would go stale on
+			// the first iteration and still fail IsCanonical(). `hash` here IS
+			// ParBlockHeader.Hash() at this exact nonce, so the stamp cannot
+			// be stale for any nonce.
+			//
+			// Block PRODUCTION only, therefore ungated: ParentHash is not a
+			// BtcHeader field, so ParBlockHeader.Hash() - and with it the
+			// proof of work and AuxPow.Check() - is unchanged, and no
+			// acceptance rule is touched. Retained history is never
+			// re-produced here, so below-gate replay stays byte-identical.
+			// ParMerkleIndex, the other field IsCanonical() pins, is already 0
+			// out of GenerateAuxPow and is never mutated in this loop.
+			auxPow.ParentHash = hash
 			msgBlock.Header.AuxPow = *auxPow
 			return true
 		}
