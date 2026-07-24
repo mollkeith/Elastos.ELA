@@ -94,6 +94,25 @@ func (d *DPOSIllegalVotes) Hash() common.Uint256 {
 	return *d.hash
 }
 
+// DedupHash returns the SpecialTxHashes dedup key for illegal-VOTE evidence. Same NX-08
+// defect and same fold as DPOSIllegalProposals.DedupHash (see the comment there): the raw
+// payload Hash() carries the malleable BlockHeader blob, so one logical equivocation
+// minted unbounded distinct dedup keys.
+//
+// The logical identity here is the pair of DPOSProposalVote hashes plus the evidenced
+// BlockHeight. DPOSProposalVote.Hash() is SerializeUnsigned (proposal hash, signer,
+// accept flag) -- it excludes the vote signature, so ECDSA signature malleability cannot
+// move the key either, and it pins the proposal (and through it the block hash and
+// height) by containing ProposalHash. Below the gate the legacy raw Hash() is returned
+// unchanged for byte-identical replay.
+func (d *DPOSIllegalVotes) DedupHash(strictActive bool) common.Uint256 {
+	if !strictActive {
+		return d.Hash()
+	}
+	return illegalEvidenceDedupKey(dedupDomainIllegalVote, d.Evidence.BlockHeight,
+		d.Evidence.Vote.Hash(), d.CompareEvidence.Vote.Hash())
+}
+
 func (d *DPOSIllegalVotes) GetBlockHeight() uint32 {
 	return d.Evidence.BlockHeight
 }

@@ -299,6 +299,13 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	claimNodeDIDs := make(map[Uint168]struct{})          // F-083: mempool slotCRCouncilMemberDID
 	specialTxHashes := make(map[Uint256]struct{})        // F-030 closeout: mempool slotSpecialTxHash (illegal-evidence / inactive-arbitrators)
 	producerNicknames := make(map[string]struct{})       // NX-10/FV-08: mempool slotDPoSNickname
+	// FV-09: BLOCK-scope accumulators for the NFTDestroy owner/NFT stake-address alias.
+	// The per-tx F-073 guard (nftdestroytransaction.go) can only see ONE payload, and the
+	// F-118 arm below keys on the NFT ID, so a two-transaction split is invisible to both.
+	// Collected across the WHOLE block and intersected after the loop, because the naming
+	// transaction may precede the destroying transaction in block order.
+	nftDestroyedStakeAddrs := make(map[Uint168]struct{}) // derived stake addr of every NFT destroyed anywhere in this block
+	nftNamedOwners := make([]Uint168, 0)                 // every OwnerStakeAddresses entry named anywhere in this block
 	for _, txn := range block.Transactions {
 		switch txn.TxType() {
 		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
@@ -484,7 +491,16 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 						return errors.New("[PowCheckBlockSanity] block contains duplicate NFTDestroy id")
 					}
 					nftDestroyIDs[id] = struct{}{}
+					// FV-09: record this NFT's DERIVED stake address, the key
+					// processNFTDestroyFromSideChain folds DPoSV2RewardInfo out of. Derivation
+					// is identical to the per-tx F-073 guard. A derivation error is left to the
+					// per-tx SpecialContextCheck (canonical error), exactly as the RegisterCR
+					// arm above leaves a malformed code to its own checker.
+					if ct, err := contract.CreateStakeContractByCode(id.Bytes()); err == nil {
+						nftDestroyedStakeAddrs[*ct.ToProgramHash()] = struct{}{}
+					}
 				}
+				nftNamedOwners = append(nftNamedOwners, p.OwnerStakeAddresses...)
 			}
 		case common.RegisterProducer:
 			// F-100: mirror mempool slotDPoSOwnerPublicKey + slotDPoSNodePublicKey (the
@@ -580,14 +596,23 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 			// processIllegalEvidence / processEmergencyInactiveArbitrators runs twice,
 			// applying the illegal penalty twice (bounded by block size, deterministic and
 			// non-forking, but a genuine double-penalty on a guilty double-signer). Key by the
-			// SAME AuxPow-independent logical identity the committed dedup now uses
-			// (payload.SpecialTxDedupKey at StrictMoneyRangeHeight == gate) so the two
-			// encodings collide within the block. Reject the second. The mempool slot the
-			// guard mirrors (slotSpecialTxHash) covers all five special-tx types, so all five
-			// share this arm. Residual: evidence whose OWN BlockHeight is below the gate but
-			// included above it stays raw-keyed (AuxPow-malleable), matching SpecialTxExists /
-			// recordSpecialTx exactly -- read and write must agree, so the guard must not
-			// re-key independently; see the commit note.
+			// SAME logical identity the committed dedup uses (payload.SpecialTxDedupKey at
+			// StrictMoneyRangeHeight == gate) so the re-encodings collide within the block.
+			// Reject the second. The mempool slot the guard mirrors (slotSpecialTxHash) covers
+			// all five special-tx types, so all five share this arm.
+			//
+			// NX-08 CORRECTION -- the previous text here said the mirrored key covered "all five
+			// special-tx types", which conflated the ARM (five types) with the FOLD (one type).
+			// Stated precisely, at and above the gate SpecialTxDedupKey now folds THREE of the
+			// five to a logical identity: DPOSIllegalBlocks by AuxPow-independent block identity
+			// (F-030), and DPOSIllegalProposals / DPOSIllegalVotes by BlockHeader-independent
+			// evidence identity (NX-08 -- one appended byte to the raw header blob used to mint a
+			// fresh key, so one equivocation minted unbounded distinct evidence transactions).
+			// SidechainIllegalData and InactiveArbitrators keep the raw payload Hash(); neither
+			// carries a malleable raw header blob, and neither has been folded here.
+			// Residual, unchanged: evidence whose OWN BlockHeight is below the gate but included
+			// above it stays raw-keyed, matching SpecialTxExists / recordSpecialTx exactly --
+			// read and write must agree, so the guard must not re-key independently.
 			illegalData, ok := txn.Payload().(payload.DPOSIllegalData)
 			if !ok {
 				return errors.New("[PowCheckBlockSanity] invalid illegal-evidence special tx payload")
@@ -597,6 +622,29 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate illegal-evidence special tx")
 			}
 			specialTxHashes[key] = struct{}{}
+		}
+	}
+	// FV-09 (gap in our own F-073): the per-tx F-073 guard rejects only an
+	// OwnerStakeAddresses entry that aliases an NFT stake address destroyed by the SAME
+	// payload, so the vector SPLITS across two same-block NFTDestroy txs -- tx1 destroys
+	// NFT A naming NFT B's derived stake address, tx2 destroys NFT B. Each payload passes
+	// the per-tx guard trivially (disjoint sets) and the F-118 arm above passes too
+	// (A != B), yet the state-apply forwards COMPOSE at Commit: state.go's
+	// `DPoSV2RewardInfo[owner] += DPoSV2RewardInfo[nftStake]` is a LIVE lookup, so tx2
+	// reads B's key AFTER tx1 folded A's reward into it, and a reorg then misallocates
+	// A's claimable reward. (PROVEN by executed test; this is a claimable-BALANCE
+	// accounting defect -- NO mint and NO supply inflation is involved.) The block is the
+	// only scope at which the composition is visible, so reject it here. Deliberately a
+	// post-loop intersection, not an in-loop check: the naming tx may come FIRST in block
+	// order, before the aliased NFT's id has been seen. A legitimate new owner is a user
+	// stake address, never a derived NFT stake address, so this rejects only the attack.
+	// Gated with the function (returns nil below `gate` == StrictMoneyRangeHeight), so
+	// retained history re-derives byte-identically.
+	if len(nftDestroyedStakeAddrs) != 0 {
+		for _, owner := range nftNamedOwners {
+			if _, clash := nftDestroyedStakeAddrs[owner]; clash {
+				return errors.New("[PowCheckBlockSanity] block contains NFTDestroy owner stake address aliasing an NFT stake address destroyed in the same block")
+			}
 		}
 	}
 	return nil

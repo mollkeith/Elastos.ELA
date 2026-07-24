@@ -3095,7 +3095,7 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 					if common.GetNFTID(referKey, nftInfo.CreateNFTTxHash).IsEqual(nftID) {
 						strNFTStakeAddress, _ := stakeAddress.ToAddress()
 						strOwnerStakeAddress, _ := newOwnerStakeAddress.ToAddress()
-						oriRewardsInfo := s.DPoSV2RewardInfo[strNFTStakeAddress]
+						var creditedRewards common.Fixed64
 						nftAmount := detailVoteInfo.Info[0].Votes
 						originDetailVoteInfo := detailVoteInfo
 						s.History.Append(height, func() {
@@ -3106,7 +3106,19 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 							s.UsedDposV2Votes[newOwnerStakeAddress] += nftAmount
 							//remove nft stake address for future create new nft .
 							delete(producer.detailedDPoSV2Votes[stakeAddress], referKey)
-							s.DPoSV2RewardInfo[strOwnerStakeAddress] += s.DPoSV2RewardInfo[strNFTStakeAddress]
+							// FV-09: capture the credited amount INSIDE the forward closure. The old
+							// pre-Append capture (`oriRewardsInfo`) was the PRE-BLOCK value, but this credit
+							// is a LIVE lookup, so when a SECOND same-block NFTDestroy has already folded
+							// another NFT's reward into this key the two differ and the revert under-debits.
+							// utils/history.go runs closures at Commit and rolls back FORWARD (not LIFO), so
+							// the pair must be an exact inverse on its own. UNGATED, matching the F-064/F-075
+							// rollback-closure fixes already shipped in this file: rollback closures execute
+							// only on live reorgs and never during linear replay/InitCheckpoint re-derive, so
+							// retained history <= 2260450 derives byte-identically. In every non-aliased case
+							// creditedRewards == oriRewardsInfo and the `+=` restore below lands on a key the
+							// forward just deleted, so this is a no-op there too.
+							creditedRewards = s.DPoSV2RewardInfo[strNFTStakeAddress]
+							s.DPoSV2RewardInfo[strOwnerStakeAddress] += creditedRewards
 							delete(s.DPoSV2RewardInfo, strNFTStakeAddress)
 							//detailVoteInfo add to new owner nftDestroyPayload.OwnerStakeAddresses
 							if len(producer.detailedDPoSV2Votes[newOwnerStakeAddress]) == 0 {
@@ -3136,24 +3148,37 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 							producer.detailedDPoSV2Votes[stakeAddress][referKey] = originDetailVoteInfo
 							//remove owner's detailVoteInfo
 							delete(producer.detailedDPoSV2Votes[newOwnerStakeAddress], referKey)
-							// F-073: debit the CAPTURED credited amount, not a live lookup of the
-							// key the forward closure already deleted (which reads 0 -> owner keeps
-							// the credited reward = claimable reward inflation on reorg). oriRewardsInfo
-							// is captured before History.Append. Append DEFERS apply to Commit
-							// (utils/history.go), so the capture is the PRE-BLOCK committed value, which
-							// equals what the forward `owner += DPoSV2RewardInfo[NFT]` added UNLESS a
-							// same-block CROSS-KEY change intervenes. CORRECTION (fork round 2 / Fable finding I):
-							// F-104/F-118 close only a same-NFT-ID collision; the real hole is on the
-							// DPoSV2RewardInfo KEY with DISTINCT ids -- an attacker-chosen OwnerStakeAddresses[i]
-							// set to a DIFFERENT entry`s NFT stake address makes forwards compose while both
-							// reverts subtract pre-block captures, misallocating `a` claimable-reward sela on
-							// reorg. Mitigations: arbiter-signed + REORG-ONLY (linear InitCheckpoint replay runs
-							// apply only, so the recovery re-derive / keystone is UNAFFECTED). Closed at the
-							// validation layer by the F-073-guard in nftdestroytransaction.go (reject an
-							// NFTDestroy whose OwnerStakeAddresses intersect its own IDs` NFT stake-address set),
-							// gated at StrictMoneyRangeHeight. Empirically classified: dpos/state f073 cross-key test.
-							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= oriRewardsInfo
-							s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
+							// F-073: debit the credited amount, not a live lookup of the key the
+							// forward closure already deleted (which reads 0 -> owner keeps the credited
+							// reward = claimable reward misallocation on reorg). The hole F-073 closes is on
+							// the DPoSV2RewardInfo KEY with DISTINCT NFT ids (F-104/F-118 close only a
+							// same-NFT-ID collision): an attacker-chosen OwnerStakeAddresses[i] set to a
+							// DIFFERENT entry`s NFT stake address makes the forwards compose. Mitigations:
+							// arbiter-signed + REORG-ONLY (linear InitCheckpoint replay runs apply only, so
+							// the recovery re-derive / keystone is UNAFFECTED).
+							//
+							// FV-09 CORRECTION -- THE PREVIOUS TEXT HERE WAS WRONG. It claimed the hole was
+							// "Closed at the validation layer by the F-073-guard in nftdestroytransaction.go".
+							// That guard is INTRA-TRANSACTION only: it builds its NFT stake-address set from
+							// THIS payload's own IDs, so the identical vector SPLITS across two same-block
+							// NFTDestroy txs (tx1 destroys A naming stake(B), tx2 destroys B) and neither
+							// payload trips it. PROVEN by executed test. Two changes now close it:
+							//   (1) blockchain/blockvalidator.go CheckSameBlockConflicts rejects the split at
+							//       BLOCK scope (gate StrictMoneyRangeHeight) -- the only scope at which the
+							//       composition is visible; and
+							//   (2) this closure pair no longer relies on a pre-block capture at all:
+							//       creditedRewards is measured INSIDE the forward and restored with `+=`, so
+							//       apply/revert are exact inverses under the FORWARD rollback order of
+							//       utils/history.go even when a cross-key change intervenes.
+							// This is a claimable-BALANCE accounting defect: NO mint, NO supply inflation.
+							// Empirically classified: dpos/state f073 cross-key test + fv09 cross-tx test.
+							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= creditedRewards
+							// FV-09: `+=` (not `=`) so a cross-key restore composes correctly. With FORWARD
+							// rollback order the earlier closure's inverse may already have driven this key
+							// negative; assigning would overwrite that intermediate and strand the difference.
+							// The key was DELETED by the forward, so in the ordinary case `+=` on an absent
+							// key is byte-identical to the old assignment.
+							s.DPoSV2RewardInfo[strNFTStakeAddress] += creditedRewards
 							if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {
 								delete(s.DPoSV2RewardInfo, strOwnerStakeAddress)
 							}
@@ -3176,7 +3201,7 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 				if common.GetNFTID(votesInfo.ReferKey(), nftInfo.CreateNFTTxHash).IsEqual(nftID) {
 					strNFTStakeAddress, _ := stakeAddress.ToAddress()
 					strOwnerStakeAddress, _ := newOwnerStakeAddress.ToAddress()
-					oriRewardsInfo := s.DPoSV2RewardInfo[strNFTStakeAddress]
+					var creditedRewards common.Fixed64
 					nftAmount := votesInfo.Info[0].Votes
 					s.History.Append(height, func() {
 						//process total vote rights
@@ -3185,7 +3210,19 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 						//s.UsedDposV2Votes[newOwnerStakeAddress] += nftAmount
 						//remove nft stake address for future create new nft .
 						delete(producer.expiredNFTVotes, stakeAddress)
-						s.DPoSV2RewardInfo[strOwnerStakeAddress] += s.DPoSV2RewardInfo[strNFTStakeAddress]
+						// FV-09: capture the credited amount INSIDE the forward closure. The old
+						// pre-Append capture (`oriRewardsInfo`) was the PRE-BLOCK value, but this credit
+						// is a LIVE lookup, so when a SECOND same-block NFTDestroy has already folded
+						// another NFT's reward into this key the two differ and the revert under-debits.
+						// utils/history.go runs closures at Commit and rolls back FORWARD (not LIFO), so
+						// the pair must be an exact inverse on its own. UNGATED, matching the F-064/F-075
+						// rollback-closure fixes already shipped in this file: rollback closures execute
+						// only on live reorgs and never during linear replay/InitCheckpoint re-derive, so
+						// retained history <= 2260450 derives byte-identically. In every non-aliased case
+						// creditedRewards == oriRewardsInfo and the `+=` restore below lands on a key the
+						// forward just deleted, so this is a no-op there too.
+						creditedRewards = s.DPoSV2RewardInfo[strNFTStakeAddress]
+						s.DPoSV2RewardInfo[strOwnerStakeAddress] += creditedRewards
 						delete(s.DPoSV2RewardInfo, strNFTStakeAddress)
 						//detailVoteInfo add to new owner nftDestroyPayload.OwnerStakeAddresses
 						//if len(producer.detailedDPoSV2Votes[newOwnerStakeAddress]) == 0 {
@@ -3219,8 +3256,13 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 						//delete(producer.expiredNFTVotes, newOwnerStakeAddress)
 						// F-073 (expired branch): same fix as the active branch — debit the
 						// captured credited amount, not the deleted key's live (0) value.
-						s.DPoSV2RewardInfo[strOwnerStakeAddress] -= oriRewardsInfo
-						s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
+						s.DPoSV2RewardInfo[strOwnerStakeAddress] -= creditedRewards
+						// FV-09: `+=` (not `=`) so a cross-key restore composes correctly. With FORWARD
+						// rollback order the earlier closure's inverse may already have driven this key
+						// negative; assigning would overwrite that intermediate and strand the difference.
+						// The key was DELETED by the forward, so in the ordinary case `+=` on an absent
+						// key is byte-identical to the old assignment.
+						s.DPoSV2RewardInfo[strNFTStakeAddress] += creditedRewards
 						if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {
 							delete(s.DPoSV2RewardInfo, strOwnerStakeAddress)
 						}

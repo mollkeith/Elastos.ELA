@@ -294,16 +294,51 @@ func logicalHeaderHash(raw []byte) (common.Uint256, error) {
 	return hdr.Hash(), nil
 }
 
+// Domain tags for the logical illegal-evidence dedup keys, so the block, proposal and
+// vote key spaces cannot collide with one another.
+const (
+	dedupDomainIllegalProposal = uint32(0x01)
+	dedupDomainIllegalVote     = uint32(0x02)
+)
+
+// illegalEvidenceDedupKey folds one logical equivocation -- an evidenced height plus the
+// two evidence identities in canonical (order-independent) form -- into a single dedup
+// key. Shared by DPOSIllegalProposals.DedupHash and DPOSIllegalVotes.DedupHash (NX-08) and
+// deliberately shaped like DPOSIllegalBlocks.DedupHash (F-030).
+func illegalEvidenceDedupKey(domain uint32, blockHeight uint32,
+	h1, h2 common.Uint256) common.Uint256 {
+	lo, hi := h1, h2
+	if bytes.Compare(lo[:], hi[:]) > 0 {
+		lo, hi = hi, lo
+	}
+	buf := new(bytes.Buffer)
+	_ = common.WriteUint32(buf, domain)
+	_ = common.WriteUint32(buf, blockHeight)
+	_ = lo.Serialize(buf)
+	_ = hi.Serialize(buf)
+	return common.Hash(buf.Bytes())
+}
+
 // SpecialTxDedupKey returns the SpecialTxHashes dedup key for any DPOSIllegalData
-// payload, given the coordinated StrictMoneyRangeHeight gate. IllegalBlock evidence gets
-// the AuxPow-independent logical key at/above the gate (F-030); every other illegal-data
-// type, and below-gate blocks, keep the legacy raw payload Hash() so below-gate history
-// serializes byte-identically. The gate is read from the evidence's own BlockHeight so
-// the read (SpecialTxExists) and write (recordSpecialTx) paths always agree without
-// threading an external height.
+// payload, given the coordinated StrictMoneyRangeHeight gate. At and above the gate,
+// illegal-BLOCK evidence gets the AuxPow-independent logical key (F-030) and
+// illegal-PROPOSAL / illegal-VOTE evidence get the BlockHeader-independent logical key
+// (NX-08). Below the gate, and for the two remaining DPOSIllegalData types
+// (SidechainIllegalData and InactiveArbitrators -- both hash SerializeUnsigned only, i.e.
+// neither covers a raw header blob nor the arbiter signature set, so neither has the
+// malleability this fold exists to remove), the legacy raw payload Hash() is kept so
+// below-gate history serializes byte-identically. The gate is read from the evidence's own BlockHeight so the read
+// (State.SpecialTxExists) and write (State.recordSpecialTx) paths, and the block-level
+// guard (blockchain.CheckSameBlockConflicts), always agree without threading an external
+// height -- F-030's commit note requires read and write to flip together.
 func SpecialTxDedupKey(d DPOSIllegalData, gateHeight uint32) common.Uint256 {
-	if blk, ok := d.(*DPOSIllegalBlocks); ok {
-		return blk.DedupHash(blk.BlockHeight >= gateHeight)
+	switch p := d.(type) {
+	case *DPOSIllegalBlocks:
+		return p.DedupHash(p.BlockHeight >= gateHeight)
+	case *DPOSIllegalProposals:
+		return p.DedupHash(p.GetBlockHeight() >= gateHeight)
+	case *DPOSIllegalVotes:
+		return p.DedupHash(p.GetBlockHeight() >= gateHeight)
 	}
 	return d.Hash()
 }

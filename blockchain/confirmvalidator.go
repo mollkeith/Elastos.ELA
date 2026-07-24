@@ -17,6 +17,7 @@ import (
 	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	"github.com/elastos/Elastos.ELA/crypto"
+	"github.com/elastos/Elastos.ELA/dpos/state"
 )
 
 func ConfirmSanityCheck(confirm *payload.Confirm) error {
@@ -56,11 +57,6 @@ func IllegalConfirmContextCheck(confirm *payload.Confirm, blockHeight uint32,
 		signers[common.BytesToHexString(vote.Signer)] = struct{}{}
 	}
 
-	if len(signers) <= DefaultLedger.Arbitrators.GetArbitersMajorityCount() {
-		return errors.New("[IllegalConfirmContextCheck] signers less than " +
-			"majority count")
-	}
-
 	// F-082: at and above the coordinated StrictMoneyRangeHeight activation, validate
 	// the confirm sponsor and every vote signer against the DPoS arbiter set on duty
 	// at the evidenced height -- the correct voter universe, matching sibling
@@ -70,19 +66,82 @@ func IllegalConfirmContextCheck(confirm *payload.Confirm, blockHeight uint32,
 	// arbiters -- so off-duty producers could be counted toward the majority to
 	// fabricate evidence. Below the gate the legacy universe is kept so historical
 	// evidence replays byte-identically.
+	//
+	// FV-06 (gap in our own F-082): F-082 fixed the voter UNIVERSE and left the
+	// THRESHOLD, which made the function READ sound while it was not. Two defects
+	// remained, both closed here:
+	//
+	//  (1) The majority count came from GetArbitersMajorityCount(), i.e. 2/3 of
+	//      len(a.CurrentArbitrators) -- the committee ON DUTY NOW -- while membership was
+	//      checked against the committee at the EVIDENCED height. Count and universe were
+	//      drawn from two different committees.
+	//  (2) GetSnapshot returns a SLICE of frames (SnapshotByHeight APPENDS on a force
+	//      change, so one election key can hold a pre- and a post-force-change frame), and
+	//      ProposalContextCheckByHeight / VoteContextCheckByHeight each accepted a match in
+	//      ANY frame, INDEPENDENTLY PER SIGNER. Nothing bound the sponsor and the N votes
+	//      to one coherent historical committee, so the admissible signer universe was the
+	//      UNION of two committees while the bar was 2/3 of ONE -- a signer set that never
+	//      simultaneously existed as a majority of any real committee could clear it.
+	//
+	// The fix selects ONE key frame and uses it for BOTH the count and the membership:
+	// the sponsor and EVERY vote signer must belong to the SAME frame, and the accepting
+	// signer count must exceed 2/3 of THAT frame's size. Accept if any single frame
+	// satisfies the whole conjunction. An empty ring fails closed (it already did, via
+	// the by-height checks) but is now rejected explicitly rather than incidentally.
+	//
+	// Applied to the strictActive branch ONLY, so the legacy branch below -- and its
+	// current-committee majority check -- are untouched for below-gate replay.
+	// Census support (PROVEN): ZERO IllegalBlockEvidence txs in 2,260,597 blocks /
+	// 5,471,568 transactions, so re-thresholding rejects ZERO real history.
 	if strictActive {
-		if err := ProposalContextCheckByHeight(&confirm.Proposal,
-			blockHeight); err != nil {
-			return errors.New("[IllegalConfirmContextCheck] confirm contain invalid " +
-				"proposal: " + err.Error())
+		frames := DefaultLedger.Arbitrators.GetSnapshot(blockHeight)
+		if len(frames) == 0 {
+			return errors.New("[IllegalConfirmContextCheck] no arbiter snapshot " +
+				"retained for the evidenced height")
 		}
-		for _, vote := range confirm.Votes {
-			if err := VoteContextCheckByHeight(&vote, blockHeight); err != nil {
-				return errors.New("[IllegalConfirmContextCheck] confirm contain " +
-					"invalid vote: " + err.Error())
+		var lastErr error
+		for _, frame := range frames {
+			members := make(map[string]struct{}, len(frame.CurrentArbitrators))
+			for _, a := range frame.CurrentArbitrators {
+				members[common.BytesToHexString(a.GetNodePublicKey())] = struct{}{}
 			}
+			if _, ok := members[common.BytesToHexString(
+				confirm.Proposal.Sponsor)]; !ok {
+				lastErr = errors.New("[IllegalConfirmContextCheck] confirm contain " +
+					"invalid proposal: current arbitrators verify error")
+				continue
+			}
+			var badVote bool
+			for _, vote := range confirm.Votes {
+				if _, ok := members[common.BytesToHexString(vote.Signer)]; !ok {
+					badVote = true
+					break
+				}
+			}
+			if badVote {
+				lastErr = errors.New("[IllegalConfirmContextCheck] confirm contain " +
+					"invalid vote: current arbitrators verify error")
+				continue
+			}
+			// The threshold is 2/3 of THIS frame, computed exactly as
+			// Arbiters.GetArbitersMajorityCount does for the current committee.
+			threshold := int(float64(len(frame.CurrentArbitrators)) *
+				state.MajoritySignRatioNumerator / state.MajoritySignRatioDenominator)
+			if len(signers) <= threshold {
+				lastErr = errors.New("[IllegalConfirmContextCheck] signers less than " +
+					"majority count")
+				continue
+			}
+			return nil
 		}
-		return nil
+		return lastErr
+	}
+
+	// Legacy (below-gate) path: unchanged, including its current-committee majority
+	// count, so retained history replays byte-identically.
+	if len(signers) <= DefaultLedger.Arbitrators.GetArbitersMajorityCount() {
+		return errors.New("[IllegalConfirmContextCheck] signers less than " +
+			"majority count")
 	}
 
 	if err := IllegalProposalContextCheck(&confirm.Proposal); err != nil {
