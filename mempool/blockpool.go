@@ -19,7 +19,27 @@ import (
 	"github.com/elastos/Elastos.ELA/events"
 )
 
-const cachedCount = 6
+const (
+	cachedCount = 6
+
+	// retainAheadCount bounds how far ABOVE the reference height a block may sit
+	// in the pool and still be retained. F-092: appendBlock stores every block
+	// that passes CheckBlockSanity -- whose only work gate is CheckProofOfWork
+	// against PowLimit (2^255-1, i.e. free) -- at ANY height, and the retention
+	// sweep only ever dropped entries BELOW the tip, so blocks minted at
+	// arbitrary future heights were kept for the life of the process. Nothing
+	// further above the tip than the pool's own retention window can be
+	// confirmed from here anyway, and a genuinely connectable orphan is held by
+	// the chain's orphan pool (AddOrphanBlock/ProcessOrphans), not by this map.
+	retainAheadCount = cachedCount
+
+	// maxOrphanConfirms bounds the number of confirms retained for blocks that
+	// are not in the pool. F-117: appendConfirm stores the confirm before
+	// confirmBlock runs, and the sweep only ever visited confirms keyed by
+	// blocks that are in the pool -- so a confirm whose block never arrives was
+	// retained for the life of the process.
+	maxOrphanConfirms = 512
+)
 
 type ConfirmInfo struct {
 	Confirm *payload.Confirm
@@ -32,8 +52,13 @@ type BlockPool struct {
 	IsCurrent func() bool
 
 	sync.RWMutex
-	blocks      map[common.Uint256]*types.Block
-	confirms    map[common.Uint256]*payload.Confirm
+	blocks   map[common.Uint256]*types.Block
+	confirms map[common.Uint256]*payload.Confirm
+	// confirmAge counts how many retention sweeps a confirm whose block is not
+	// in the pool has survived. Entries exist only for such orphan confirms, so
+	// len(confirmAge) is also the orphan-confirm census used by
+	// maxOrphanConfirms. (F-117)
+	confirmAge  map[common.Uint256]uint32
 	chainParams *config.Configuration
 }
 
@@ -171,6 +196,10 @@ func (bm *BlockPool) appendConfirm(confirm *payload.Confirm) (
 
 	inMainChain, isOrphan, err := bm.confirmBlock(confirm.Proposal.BlockHash)
 	if err != nil {
+		// F-117: the confirm deliberately stays in bm.confirms so that a block
+		// which arrives after its confirm can still be confirmed -- but from
+		// here on it is tracked and bounded instead of being retained forever.
+		bm.trackOrphanConfirmLocked(confirm.Proposal.BlockHash)
 		return inMainChain, isOrphan, err
 	}
 	block := bm.blocks[confirm.Proposal.BlockHash]
@@ -267,6 +296,8 @@ func (bm *BlockPool) AddToConfirmMap(confirm *payload.Confirm) {
 	defer bm.Unlock()
 
 	bm.confirms[confirm.Proposal.BlockHash] = confirm
+	// F-117: bound this entry too when its block is not in the pool.
+	bm.trackOrphanConfirmLocked(confirm.Proposal.BlockHash)
 }
 
 func (bm *BlockPool) GetConfirm(hash common.Uint256) (
@@ -282,11 +313,95 @@ func (bm *BlockPool) CleanFinalConfirmedBlock(height uint32) {
 	bm.Lock()
 	defer bm.Unlock()
 
-	for _, block := range bm.blocks {
-		if block.Height < height-cachedCount {
-			delete(bm.blocks, block.Hash())
-			delete(bm.confirms, block.Hash())
+	bm.pruneLocked(height)
+}
+
+// pruneLocked evicts every pool entry that is outside the retention window
+// around the given (just connected) reference height, and ages out confirms
+// whose block is not in the pool. The caller must hold bm's write lock.
+//
+// F-092/F-117: this is retention only. It never rejects an incoming block or
+// confirm, so it cannot change which blocks or transactions the node accepts:
+// an evicted block that later becomes relevant is simply re-requested on the
+// next announcement, and a connectable orphan lives in the chain's own orphan
+// pool rather than here.
+func (bm *BlockPool) pruneLocked(height uint32) {
+	// F-092: height-cachedCount underflowed for the first cachedCount heights
+	// and wrapped to ~2^32, which dropped the entire pool -- including the
+	// block being connected -- during genesis bootstrap.
+	var floor uint32
+	if height > cachedCount {
+		floor = height - cachedCount
+	}
+	ceiling := ^uint32(0)
+	if height <= ceiling-retainAheadCount {
+		ceiling = height + retainAheadCount
+	}
+
+	for hash, block := range bm.blocks {
+		if block.Height < floor || block.Height > ceiling {
+			delete(bm.blocks, hash)
+			delete(bm.confirms, hash)
+			delete(bm.confirmAge, hash)
 		}
+	}
+
+	// F-117: age out confirms with no block in the pool. Retaining them for a
+	// while is deliberate -- a confirm may legitimately arrive before its block
+	// -- but one whose block has not shown up within the pool's own retention
+	// window is dead weight.
+	for hash := range bm.confirms {
+		if _, ok := bm.blocks[hash]; ok {
+			delete(bm.confirmAge, hash)
+			continue
+		}
+		age := bm.confirmAge[hash] + 1
+		if age > cachedCount {
+			delete(bm.confirms, hash)
+			delete(bm.confirmAge, hash)
+			continue
+		}
+		bm.confirmAge[hash] = age
+	}
+}
+
+// trackOrphanConfirmLocked registers a confirm whose block is not in the pool
+// so the retention sweep can age it out, and enforces maxOrphanConfirms by
+// dropping the stalest tracked entries first. The caller must hold bm's write
+// lock. (F-117)
+func (bm *BlockPool) trackOrphanConfirmLocked(hash common.Uint256) {
+	if _, ok := bm.blocks[hash]; ok {
+		return
+	}
+	if _, ok := bm.confirms[hash]; !ok {
+		return
+	}
+	if bm.confirmAge == nil {
+		bm.confirmAge = make(map[common.Uint256]uint32)
+	}
+	if _, ok := bm.confirmAge[hash]; !ok {
+		bm.confirmAge[hash] = 0
+	}
+
+	for len(bm.confirmAge) > maxOrphanConfirms {
+		var (
+			victim    common.Uint256
+			victimAge uint32
+			found     bool
+		)
+		for h, age := range bm.confirmAge {
+			if h == hash {
+				continue
+			}
+			if !found || age > victimAge {
+				victim, victimAge, found = h, age, true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(bm.confirms, victim)
+		delete(bm.confirmAge, victim)
 	}
 }
 
@@ -294,6 +409,7 @@ func NewBlockPool(params *config.Configuration) *BlockPool {
 	return &BlockPool{
 		blocks:      make(map[common.Uint256]*types.Block),
 		confirms:    make(map[common.Uint256]*payload.Confirm),
+		confirmAge:  make(map[common.Uint256]uint32),
 		chainParams: params,
 	}
 }
