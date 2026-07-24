@@ -298,6 +298,7 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	producerCRKeys := make(map[string]struct{})          // F-100: mempool slotDPoSOwnerPublicKey/slotDPoSNodePublicKey (producer/CR overlap)
 	claimNodeDIDs := make(map[Uint168]struct{})          // F-083: mempool slotCRCouncilMemberDID
 	specialTxHashes := make(map[Uint256]struct{})        // F-030 closeout: mempool slotSpecialTxHash (illegal-evidence / inactive-arbitrators)
+	producerNicknames := make(map[string]struct{})       // NX-10/FV-08: mempool slotDPoSNickname
 	for _, txn := range block.Transactions {
 		switch txn.TxType() {
 		case common.ExchangeVotes, common.Voting, common.ReturnVotes, common.CreateNFT:
@@ -392,6 +393,33 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate CR claim DPOS node public key")
 			}
 			claimNodeKeys[nodeKey] = struct{}{}
+			// NX-10/FV-08: CRCouncilMemberClaimNode is the FIFTH member of the single mempool
+			// slotDPoSNodePublicKey slot, but at block level its node key only ever reached
+			// claimNodeKeys -- the F-071 claim-vs-claim map, which is never compared against the
+			// producer/CR key map. So RegisterProducer/UpdateProducer(node=X) +
+			// CRCouncilMemberClaimNode(X) in one block both passed: the producer side's
+			// ProducerOrCRNodePublicKeyExists and the claim side's ClaimedDPoSKeys /
+			// ProducerAndCurrentCRNodePublicKeyExists are all COMMITTED-state reads that cannot
+			// see the sibling transaction, and no block-level structure compared the two. Feed
+			// the shared producerCRKeys map as well. claimNodeKeys STAYS -- it is the F-071
+			// claim-vs-claim guard and carries its own distinct error.
+			//
+			// ONE DELIBERATE DEVIATION FROM EXACT MEMPOOL PARITY, recorded so it is not
+			// mistaken for an oversight: producerCRKeys is a SINGLE map holding producer
+			// OWNER keys, producer NODE keys, RegisterCR keys and (now) claimed node keys,
+			// because that is how F-100 mirrored the mempool's strDPoSOwnerNodePublicKeys
+			// array slot. The mempool keeps owner keys and node keys in two slots, and
+			// CRCouncilMemberClaimNode is a member of the NODE slot only -- so the pairing
+			// "producer OWNER key == claimed node key in one block" is NOT a mempool
+			// conflict while this guard does reject it. That is STRICTER, never looser; it
+			// is deterministic; it is what NX-10's prescribed fix asks for; and a full
+			// census of the retained chain (2,260,597 blocks, this guard run with its gate
+			// forced to 0) rejects ZERO real blocks, so no retained history depends on the
+			// looser reading.
+			if _, exists := producerCRKeys[nodeKey]; exists {
+				return errors.New("[PowCheckBlockSanity] block contains conflicting producer/CR public key")
+			}
+			producerCRKeys[nodeKey] = struct{}{}
 			// F-083: mirror mempool slotCRCouncilMemberDID. processCRCouncilMemberClaimNode
 			// captures the member's old DPoS key / member state OUTSIDE the History forward
 			// closure (oriPublicKey/oriMemberState/oriInactiveCount are read at process time,
@@ -477,6 +505,52 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				}
 				producerCRKeys[k] = struct{}{}
 			}
+			// NX-10/FV-08 (nickname slot): the RegisterProducer half of mempool
+			// slotDPoSNickname. See addProducerNickname for why the block level needed it.
+			if err := addProducerNickname(producerNicknames, p.NickName); err != nil {
+				return err
+			}
+		case common.UpdateProducer:
+			// NX-10/FV-08: UpdateProducer is the SECOND of the five transaction types the
+			// mempool holds in one slotDPoSNodePublicKey slot (mempool/conflictmanager.go:175-199)
+			// and is also a member of slotDPoSOwnerPublicKey and slotDPoSOwnerNodePublicKeys --
+			// yet it had NO arm in this function at all, so the block mirror of a five-member
+			// slot had arms for two.
+			//
+			// What was NOT the gap: CheckDuplicateTx (upstream, ungated, runs on every block)
+			// already shares existingProducer across RegisterProducer/UpdateProducer/CancelProducer
+			// and existingProducerNode across RegisterProducer/UpdateProducer, so a repeated
+			// producer OWNER key and a repeated producer NODE key are already rejected.
+			//
+			// What WAS the gap is the CROSS-IDENTITY pairing, because CheckDuplicateTx has no
+			// RegisterCR and no CRCouncilMemberClaimNode arm and this function had no
+			// UpdateProducer arm: UpdateProducer(node=X) + RegisterCR(key=X) in ONE block both
+			// pass -- UpdateProducer's ExistCR(nodeCode) read (updateproducertransaction.go)
+			// and RegisterCR's ProducerExists read (registercrtransaction.go) are both
+			// COMMITTED-state reads and neither can see the sibling transaction -- so one DPoS
+			// node public key ends up bound to a producer identity AND a CR identity, which is
+			// the uniqueness invariant that arbiter-membership resolution, reward attribution
+			// and illegal-evidence slashing all rest on. Deterministic (every node computes the
+			// same corrupted state), so it does not fork the chain.
+			//
+			// Feed the SAME shared producerCRKeys map the F-100 arms use, keyed on owner and
+			// node key with the existing dedupHexKeys helper, which mirrors the mempool's
+			// strDPoSOwnerNodePublicKeys owner==node dedup so a producer whose owner key equals
+			// its own node key does not self-collide.
+			p, ok := txn.Payload().(*payload.ProducerInfo)
+			if !ok {
+				return errors.New("[PowCheckBlockSanity] invalid UpdateProducer payload")
+			}
+			for _, k := range dedupHexKeys(p.OwnerKey, p.NodePublicKey) {
+				if _, exists := producerCRKeys[k]; exists {
+					return errors.New("[PowCheckBlockSanity] block contains conflicting producer/CR public key")
+				}
+				producerCRKeys[k] = struct{}{}
+			}
+			// NX-10/FV-08 (nickname slot): the UpdateProducer half of mempool slotDPoSNickname.
+			if err := addProducerNickname(producerNicknames, p.NickName); err != nil {
+				return err
+			}
 		case common.RegisterCR:
 			// F-100: the RegisterCR side of the same two mempool slots. RegisterCR rejects a
 			// public key already in the producer list (ProducerExists) but reads committed
@@ -525,6 +599,34 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 			specialTxHashes[key] = struct{}{}
 		}
 	}
+	return nil
+}
+
+// addProducerNickname mirrors the mempool slotDPoSNickname slot
+// (mempool/conflictmanager.go:235-248 -- RegisterProducer + UpdateProducer, keyed on
+// ProducerInfo.NickName) at block level, where there was NO nickname handling of any kind:
+// a grep of this file found zero nickname reads, and the only UpdateProducer arm anywhere
+// was CheckDuplicateTx's owner/node-key one.
+//
+// The defect (NX-10/FV-08): both producer transactions check nickname uniqueness with
+// GetState().NicknameExists, a COMMITTED-state read that cannot see an earlier transaction
+// in the same block, so two same-block registrations/updates binding ONE nickname to two
+// DIFFERENT owner keys both pass. StateKeyFrame.Nicknames is a SET (dpos/state/keyframe.go),
+// so the two forward inserts are idempotent while the two reverts each delete once -- one
+// cancel or one reorg then frees a nickname another LIVE producer still holds, breaking the
+// uniqueness invariant in the durable direction.
+//
+// An EMPTY nickname is deliberately not keyed: checkStringField(NickName, allowEmpty=false)
+// rejects it per-transaction anyway, and keying it would let two malformed payloads collide
+// here and be reported as a conflict rather than as the malformed payloads they are.
+func addProducerNickname(seen map[string]struct{}, nickname string) error {
+	if nickname == "" {
+		return nil
+	}
+	if _, exists := seen[nickname]; exists {
+		return errors.New("[PowCheckBlockSanity] block contains conflicting producer nickname")
+	}
+	seen[nickname] = struct{}{}
 	return nil
 }
 
@@ -1246,11 +1348,53 @@ func checkCoinbaseFrozenOutputs(coinbase interfaces.Transaction, blockHeight, ga
 	return nil
 }
 
+// checkCoinbaseLockTimePin closes FV-19, which is a gap in our OWN F-031 fix rather than a
+// fresh defect. The pin was written into CoinBaseTransaction.SpecialContextCheck, and
+// NOTHING on the block-connect path calls that method: its only caller is the coinbase's own
+// ContextCheck override, whose only non-test caller is BlockChain.CheckTransactionContext
+// (blockchain/txvalidator.go), and every one of that function's four call sites structurally
+// excludes the coinbase -- checkTxsContext and pow/service.go both iterate from index 1, and
+// the mempool rejects a coinbase outright (mempool/txpool.go, "coinbase tx cannot be added
+// into transaction pool"). This file already recorded that fact twice: checkCoinbaseBIP30
+// (F-089) and checkCoinbaseFrozenOutputs (F-013) were BOTH relocated here for exactly this
+// reason. F-031 was not, and the record that it was "fail-on-pristine tested" was true only
+// of a test that called the dead method directly.
+//
+// Why the pin matters: checkInvalidUTXO (core/transaction/transactionchecker.go) derives the
+// CoinbaseMaturity window from the coinbase's OWN LockTime, so a block producer -- which
+// already chooses its coinbase, whose Outputs[1] pays an address of its choosing -- can set
+// LockTime = 0 (mature immediately) or any value ABOVE the spending height (the uint32
+// subtraction underflows to ~4e9, also mature) and spend its reward before the 100-block
+// reorg-safety window. This is NOT inflation: the reward AMOUNT is unchanged and is
+// separately validated by checkCoinbaseTransactionContext below.
+//
+// Gate 1 (StrictMoneyRangeHeight) -- the gate F-031 already chose; no new gate is
+// introduced. MEASURED over the retained chain (2,260,597 blocks to the frozen tip
+// 2,260,595): coinbases with LockTime != their own block height ZERO, with LockTime == 0
+// ZERO, with LockTime > height ZERO. Arming the pin on the real path therefore rejects no
+// retained block and is byte-identical over all retained history.
+func checkCoinbaseLockTimePin(coinbase interfaces.Transaction, blockHeight, gate uint32) error {
+	if blockHeight < gate {
+		return nil
+	}
+	if coinbase.LockTime() != blockHeight {
+		return errors.New("coinbase locktime must equal block height")
+	}
+	return nil
+}
+
 func (b *BlockChain) checkCoinbaseTransactionContext(blockHeight uint32, coinbase interfaces.Transaction, totalTxFee, dposReward Fixed64) error {
 	// F-013: enforce the frozen-address "no sends to" rule on the coinbase path, which
 	// otherwise bypasses checkFrozenAddresses entirely (see checkCoinbaseFrozenOutputs).
 	if err := checkCoinbaseFrozenOutputs(coinbase, blockHeight,
 		b.chainParams.StrictMoneyRangeHeight, b.chainParams.FrozenAddresses); err != nil {
+		return err
+	}
+	// FV-19: the F-031 coinbase LockTime pin, relocated from the coinbase's dead
+	// SpecialContextCheck onto the path that actually runs on block connect. Same gate,
+	// same rule (see checkCoinbaseLockTimePin).
+	if err := checkCoinbaseLockTimePin(coinbase, blockHeight,
+		b.chainParams.StrictMoneyRangeHeight); err != nil {
 		return err
 	}
 	activeHeight := DefaultLedger.Arbitrators.GetDPoSV2ActiveHeight()

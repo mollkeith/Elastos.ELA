@@ -95,20 +95,24 @@ func (t *CoinBaseTransaction) IsAllowedInPOWConsensus() bool {
 	return true
 }
 
+// SpecialContextCheck is DEAD ON THE BLOCK-CONNECT PATH and no consensus guard may be
+// added to it. Its only caller is this type's ContextCheck override, whose only non-test
+// caller is BlockChain.CheckTransactionContext, and all four call sites of that function
+// structurally exclude the coinbase (blockchain/blockvalidator.go checkTxsContext and
+// pow/service.go both iterate transactions from index 1; mempool/txpool.go rejects a
+// coinbase outright). The same is true of the duplicate-txid check in ContextCheck below.
+//
+// FV-19: the F-031 coinbase LockTime pin used to live HERE and was therefore never
+// evaluated by any validator, while the tracker recorded it as armed. It now lives on the
+// path that actually runs, as blockchain.checkCoinbaseLockTimePin, called from
+// checkCoinbaseTransactionContext at the same gate (StrictMoneyRangeHeight) -- exactly
+// where F-089's BIP30 guard and F-013's frozen-output guard had already been relocated for
+// this same reason. It is deliberately NOT duplicated here: one consensus rule, one site.
+// The address rules below are likewise enforced, differently, by
+// checkCoinbaseTransactionContext; they are left untouched so that nothing about the
+// coinbase's acceptance changes with this relocation.
 func (a *CoinBaseTransaction) SpecialContextCheck() (result elaerr.ELAError, end bool) {
 	para := a.parameters
-	// F-031: pin the coinbase LockTime to its own block height. The coinbase-
-	// maturity window (checkInvalidUTXO, transactionchecker.go) derives the
-	// 100-block lock from the coinbase's own LockTime, which no validator
-	// checked -> a malicious producer could set LockTime=0 (or a future value
-	// causing a uint32 underflow) to spend the reward before maturity. Honest
-	// coinbases already set LockTime=height (pow/service.go), so gating at
-	// StrictMoneyRangeHeight rejects no historical block.
-	if para.BlockHeight >= para.Config.StrictMoneyRangeHeight &&
-		a.LockTime() != para.BlockHeight {
-		return elaerr.Simple(elaerr.ErrTxInvalidOutput,
-			errors.New("coinbase locktime must equal block height")), true
-	}
 	if para.BlockHeight >= para.Config.CRConfiguration.CRCommitteeStartHeight {
 		if para.BlockChain.GetState().GetConsensusAlgorithm() == 0x01 {
 			if !a.outputs[0].ProgramHash.IsEqual(*para.Config.DestroyELAProgramHash) {

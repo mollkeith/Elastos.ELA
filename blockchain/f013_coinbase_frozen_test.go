@@ -73,7 +73,10 @@ func TestF013CoinbaseFrozenOutputRejected(t *testing.T) {
 		cr := Fixed64(math.Ceil(float64(total) * 0.3))
 		arb := Fixed64(math.Ceil(float64(total) * 0.35))
 		miner := total - cr - arb
-		tx := &f011Tx{outs: []*common2.Output{
+		// lock = height: FV-19's relocated F-031 pin now runs inside
+		// checkCoinbaseTransactionContext, so an honest stub coinbase must carry the
+		// LockTime an honest producer sets.
+		tx := &f011Tx{lock: height, outs: []*common2.Output{
 			{Value: cr, ProgramHash: crAddr},
 			{Value: miner, ProgramHash: minerPH},
 			{Value: arb, ProgramHash: dposAddr},

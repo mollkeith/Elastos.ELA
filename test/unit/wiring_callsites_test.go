@@ -97,6 +97,30 @@ var requiredCallSites = []callSite{
 		why:    "the coinbase path otherwise bypasses checkFrozenAddresses entirely",
 	},
 	{
+		finding: "FV-19",
+		file:    "blockchain/blockvalidator.go", fn: "checkCoinbaseTransactionContext",
+		callee:   "checkCoinbaseLockTimePin",
+		mustArgs: []string{"blockHeight", "b.chainParams.StrictMoneyRangeHeight"},
+		why: "the F-031 coinbase LockTime pin: it previously sat in the coinbase's " +
+			"SpecialContextCheck, which nothing on the block-connect path calls, so it " +
+			"enforced nothing while the tracker recorded it as armed",
+	},
+	{
+		finding: "FV-19 (maturity underflow)",
+		file:    "core/transaction/transactionchecker.go", fn: "ContextCheck",
+		callee: "checkInvalidUTXO",
+		why: "the coinbase-maturity window (and its uint32-underflow guard) is only " +
+			"evaluated from here; this is the structural half of that leg's proof",
+	},
+	{
+		finding: "F-013/FV-19 parent link",
+		file:    "blockchain/blockvalidator.go", fn: "checkTxsContext",
+		callee: "checkCoinbaseTransactionContext",
+		why: "severing this link disarms every coinbase-path guard at once (F-013 frozen " +
+			"outputs, FV-19 LockTime pin, and the reward-split rules themselves) without " +
+			"touching any of their call sites",
+	},
+	{
 		finding: "F-049/F-091",
 		file:    "blockchain/txvalidator.go", fn: "checkTransactionSignature",
 		callee:   "RunPrograms",

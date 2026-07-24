@@ -27,10 +27,15 @@ type f011Tx struct {
 	interfaces.Transaction
 	fee  Fixed64
 	outs []*common2.Output
+	// lock models the coinbase LockTime. FV-19 relocated the F-031 pin onto
+	// checkCoinbaseTransactionContext, which now reads it, so every stub coinbase handed
+	// to that function must set lock = its block height exactly as pow/service.go does.
+	lock uint32
 }
 
 func (f *f011Tx) Fee() Fixed64               { return f.fee }
 func (f *f011Tx) Outputs() []*common2.Output { return f.outs }
+func (f *f011Tx) LockTime() uint32           { return f.lock }
 
 // TestF011CoinbaseWedgeRejectedOnELABasis closes the F-011 EVIDENCE GAP flagged by the
 // Fable-review fork: the pre-existing f011 tests call GetBlockDPOSRewardStrict directly and
@@ -131,7 +136,7 @@ func TestF011CoinbaseWedgeRejectedOnELABasis(t *testing.T) {
 	crAddr := *params.CRConfiguration.CRAssetsProgramHash
 	dposAddr := *params.DPoSConfiguration.DPoSV2RewardAccumulateProgramHash
 	mk := func(dposLeg Fixed64) interfaces.Transaction {
-		return &f011Tx{outs: []*common2.Output{
+		return &f011Tx{lock: height, outs: []*common2.Output{
 			{Value: cr, ProgramHash: crAddr},
 			{Value: miner},
 			{Value: dposLeg, ProgramHash: dposAddr},

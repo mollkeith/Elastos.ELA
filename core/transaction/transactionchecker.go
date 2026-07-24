@@ -613,6 +613,23 @@ func (t *DefaultChecker) checkInvalidUTXO(txn interfaces.Transaction) error {
 			return err
 		}
 		if referTxn.IsCoinBaseTx() {
+			// FV-19 (defence in depth): the maturity window is computed on uint32, so a
+			// coinbase whose LockTime is ABOVE the spending height underflows to ~4e9 and
+			// reads as mature. Treat that as NOT mature instead of letting it wrap.
+			//
+			// Gated at StrictMoneyRangeHeight although the finding suggested shipping it
+			// ungated: a census of the retained chain (2,260,597 blocks) found ZERO
+			// coinbases whose LockTime differs from their own block height, so no retained
+			// spend can reach this branch and the two forms are indistinguishable over
+			// retained history -- but this IS an acceptance decision, and the campaign rule
+			// is that acceptance-changing behaviour sits behind gate 1. It reuses gate 1, the
+			// same gate as the relocated pin (blockchain.checkCoinbaseLockTimePin), so no
+			// third gate is introduced and below-gate replay is byte-identical by
+			// construction rather than by measurement. Unreachable once that pin is live.
+			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight &&
+				referTxn.LockTime() > currentHeight {
+				return errors.New("the utxo of coinbase is locking")
+			}
 			if currentHeight-referTxn.LockTime() < t.parameters.Config.PowConfiguration.CoinbaseMaturity {
 				return errors.New("the utxo of coinbase is locking")
 			}
