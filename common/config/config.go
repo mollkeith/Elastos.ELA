@@ -65,6 +65,32 @@ const (
 	MainNetForcedRollbackTrigger = "e1a11e04942a7513f0256dbf3605080490800fd845f8e261deffcec68c2ea9af"
 	// DisabledForcedRollbackHeight leaves forced rollback inactive.
 	DisabledForcedRollbackHeight uint32 = math.MaxUint32
+	// MainNetSchnorrStartHeight is the coordinated mainnet activation height of
+	// the aggregate-Schnorr WithdrawFromSideChain payload (V2). math.MaxUint32 =
+	// DISABLED, which is the value mainnet has always shipped and the value the
+	// F-185 two-sided gate depends on: checkSchnorrWithdrawFromSidechain builds the
+	// group key as a PLAIN SUM of the signers' NodePublicKeys, with no MuSig H(L)
+	// coefficients and no proof-of-possession on NodePublicKey (F-189), so a single
+	// arbiter with a rogue key could forge a full-threshold cross-chain withdraw.
+	// A full read-only census of the frozen mainnet chain (2,260,597 blocks) found
+	// ZERO V2 withdrawals, so nothing on mainnet has ever used the feature.
+	MainNetSchnorrStartHeight uint32 = math.MaxUint32
+	// MainNetNormalSchnorrStartHeight is the LIVE mainnet activation height for
+	// single-key Schnorr program codes in ordinary transactions
+	// (transactionchecker.go CheckAttributeProgram). Long past on mainnet.
+	MainNetNormalSchnorrStartHeight uint32 = 1405000
+	// MainNetProducerSchnorrStartHeight is the mainnet producer-Schnorr activation
+	// height. math.MaxUint32 = DISABLED; the F-026/F-175 dormant-gate rejections in
+	// registerproducer / updateproducer / cancelproducer hang off exactly this value.
+	MainNetProducerSchnorrStartHeight uint32 = math.MaxUint32
+	// MainNetCRSchnorrStartHeight is the mainnet CR-Schnorr activation height.
+	// math.MaxUint32 = DISABLED; the F-046 dormant-gate rejections in registercr /
+	// updatecr hang off exactly this value.
+	MainNetCRSchnorrStartHeight uint32 = math.MaxUint32
+	// MainNetVotesSchnorrStartHeight is the mainnet votes-Schnorr activation height.
+	// math.MaxUint32 = DISABLED; exchangevotes.go rejects the Schnorr votes path
+	// below it.
+	MainNetVotesSchnorrStartHeight uint32 = math.MaxUint32
 	// ExploitIntermediateFrozenAddress is the mainchain intermediate address
 	// that received funds from the CrossChain UTXO exploit.
 	ExploitIntermediateFrozenAddress = "EfduuvdDcAgif8njgXNJUfsBumQf9yYP72"
@@ -338,11 +364,11 @@ func GetDefaultParams() *Configuration {
 		DPoSV2EffectiveVotes:            80000 * 100000000,
 		DPoSV2StartHeight:               1405000, //1405000+262800=1667800
 		StakePoolProgramHash:            StakePoolProgramHash,
-		SchnorrStartHeight:              math.MaxUint32,
-		NormalSchnorrStartHeight:        1405000,
-		ProducerSchnorrStartHeight:      math.MaxUint32,
-		CRSchnorrStartHeight:            math.MaxUint32,
-		VotesSchnorrStartHeight:         math.MaxUint32,
+		SchnorrStartHeight:              MainNetSchnorrStartHeight,
+		NormalSchnorrStartHeight:        MainNetNormalSchnorrStartHeight,
+		ProducerSchnorrStartHeight:      MainNetProducerSchnorrStartHeight,
+		CRSchnorrStartHeight:            MainNetCRSchnorrStartHeight,
+		VotesSchnorrStartHeight:         MainNetVotesSchnorrStartHeight,
 		CrossChainMonitorStartHeight:    math.MaxUint32,
 		CrossChainMonitorInterval:       100,
 		SupportMultiCodeHeight:          math.MaxUint32, // todo complete me

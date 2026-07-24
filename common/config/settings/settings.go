@@ -117,9 +117,7 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 	if withScrew {
 		screw.Bind(conf.Configuration, version, about)
 	}
-	enforceCrossChainUTXORestrictionHeights(conf.Configuration)
-	enforceStrictMoneyAndRollbackHeights(conf.Configuration)
-	enforceFrozenAddresses(conf.Configuration)
+	enforceCoordinatedMainnetParameters(conf.Configuration)
 	conf.Configuration = conf.Sterilize()
 	// F-043 part 2: run AFTER Sterilize so FoundationProgramHash reflects any config.json
 	// FoundationAddress (Sterilize recomputes it from a non-empty address). Running before
@@ -130,6 +128,20 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 	enforceMainnetIncidentGatesArmed(conf.Configuration)
 	config.Parameters = conf.Configuration
 	return conf.Configuration
+}
+
+// enforceCoordinatedMainnetParameters applies every pin that local configuration
+// (config.json or a CLI flag) must not be able to move. Kept as a single function so
+// the test suite exercises the exact production set and order rather than a copy of
+// it: a pin added here is automatically covered.
+//
+// enforceMainnetIncidentGatesArmed is deliberately NOT part of this chain -- it must
+// run AFTER Sterilize (see the comment at its call site in SetupConfig).
+func enforceCoordinatedMainnetParameters(configuration *config.Configuration) {
+	enforceCrossChainUTXORestrictionHeights(configuration)
+	enforceStrictMoneyAndRollbackHeights(configuration)
+	enforceFrozenAddresses(configuration)
+	enforceMainnetSchnorrActivationHeights(configuration)
 }
 
 // enforceCrossChainUTXORestrictionHeights prevents local configuration from
@@ -190,6 +202,70 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 		configuration.RevisedDPoSRewardHeight = config.DisabledStrictMoneyRangeHeight
 		configuration.ForcedRollbackHeight = config.DisabledForcedRollbackHeight
 		configuration.ForcedRollbackTrigger = ""
+	}
+}
+
+// enforceMainnetSchnorrActivationHeights prevents local configuration from changing
+// the coordinated mainnet Schnorr activation heights. Every one of them is exposed as
+// a CLI flag (--schnorrstartheight, --normalschnorrstartheight,
+// --producerschnorrstartheight, --crschnorrstartheight, --votesschnorrstartheight) and
+// is settable from config.json, and every one of them is a consensus activation height
+// that the tree's Schnorr rejections hang off:
+//
+//   - SchnorrStartHeight gates the aggregate-Schnorr WithdrawFromSideChain payload
+//     (F-185). Lowering it on mainnet does two consensus-relevant things at once: it
+//     re-opens the plain-sum group-key path an arbiter with a rogue NodePublicKey can
+//     forge a full-threshold withdraw through, AND -- because SpecialContextCheck
+//     rejects every NON-V2 withdraw once BlockHeight > SchnorrStartHeight -- it makes
+//     the node reject the V1 withdrawals the rest of the fleet accepts, forking it off.
+//   - NormalSchnorrStartHeight (1405000, live on mainnet) gates Schnorr program codes
+//     in CheckAttributeProgram.
+//   - Producer/CR/VotesSchnorrStartHeight are the dormant gates the F-026/F-046/F-175
+//     rejections hang off.
+//
+// Pinned for mainnet exactly like the CrossChain-UTXO, strict-money and
+// RevisedDPoSReward heights above. The pinned values ARE the compiled-in mainnet
+// defaults, so a correctly configured mainnet node sees NO change of any kind and no
+// acceptance decision moves; only an operator override is discarded (loudly).
+//
+// Unlike the incident gates there is deliberately NO non-mainnet branch: testnet
+// (973000) and regnet (879144) carry REAL Schnorr activation heights that
+// TestNet()/RegNet() set, and a private/forked net may legitimately choose its own.
+// Clobbering those would be a behaviour change on those nets, so they are untouched.
+func enforceMainnetSchnorrActivationHeights(configuration *config.Configuration) {
+	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
+	case "", "mainnet", "main":
+	default:
+		return
+	}
+
+	pins := []struct {
+		flag    string
+		field   *uint32
+		mainnet uint32
+	}{
+		{"--schnorrstartheight", &configuration.SchnorrStartHeight,
+			config.MainNetSchnorrStartHeight},
+		{"--normalschnorrstartheight", &configuration.NormalSchnorrStartHeight,
+			config.MainNetNormalSchnorrStartHeight},
+		{"--producerschnorrstartheight", &configuration.ProducerSchnorrStartHeight,
+			config.MainNetProducerSchnorrStartHeight},
+		{"--crschnorrstartheight", &configuration.CRSchnorrStartHeight,
+			config.MainNetCRSchnorrStartHeight},
+		{"--votesschnorrstartheight", &configuration.VotesSchnorrStartHeight,
+			config.MainNetVotesSchnorrStartHeight},
+	}
+
+	for _, pin := range pins {
+		if *pin.field == pin.mainnet {
+			continue
+		}
+		fmt.Fprintf(os.Stderr,
+			"WARNING: ignoring mainnet %s override %d - pinned to the coordinated "+
+				"mainnet value %d. Schnorr activation heights are consensus heights; a "+
+				"node that disagrees with the fleet about them forks off the chain.\n",
+			pin.flag, *pin.field, pin.mainnet)
+		*pin.field = pin.mainnet
 	}
 }
 
