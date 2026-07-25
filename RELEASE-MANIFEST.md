@@ -34,8 +34,8 @@ procedure is in [§10](#10-re-measurement-procedure).
 | Documentation commits do not affect the binaries | `FILLED` | Verified: applying **both** release-meta patches to a fresh canonical clone and running `make release` reproduced the [§5](#5-binaries) sha256 digests **exactly**. |
 | Release tag name | `OPEN` | proposed `v1.0.0` |
 | Release tag object (signed?) | `OPEN` | GPG key id and signature — not created |
-| Final source commit | `OPEN` | fill after merge |
-| Final source tree hash | `OPEN` | fill after merge |
+| Final source commit | `FILLED` | `78863f94402c6acc945f23972814f98fc66c4456` |
+| Final source tree hash | `FILLED` | `b031ea359a586a7e54e32da41e928ddd05a4f39b` |
 
 ---
 
@@ -49,7 +49,7 @@ absence of any new height literal in the release-meta diff.
 |---|---|---|
 | Gate 1 — `MainNetStrictMoneyRangeHeight` | `FILLED` | **2 260 451** (`common/config/config.go`). Inherited unchanged from the root snapshot `d8488bf`. Equals `ForcedRollbackHeight + 1`, i.e. it arms on the first block of the restarted chain. |
 | Gate 2 — `MainNetRevisedDPoSRewardHeight` | `FILLED` | **2 265 000** (`common/config/config.go`). **New in v1.0.0**: the constant was added by `e646a5d` as a `MaxUint32` placeholder and given this value by `80378ab`. ~4 405 blocks past the frozen tip 2 260 595 (~6 days at 120 s). |
-| Gate 2 — core-engineer confirmation | **`OPEN`** | `80378ab` states this single coordinated value **must be confirmed or adjusted by the core engineers before deploy** and must be byte-identical fleet-wide. Not obtained. |
+| Gate 2 — core-engineer confirmation | **`OPEN`** | *Release owner approved 2,265,000 on 2026-07-26 after review of the reward-gate brief; both changes it gates are measured inert (no non-ELA asset has ever existed; the empty-slot path is unreachable since height 1,413,580). Core-engineer sign-off still required.*  `80378ab` states this single coordinated value **must be confirmed or adjusted by the core engineers before deploy** and must be byte-identical fleet-wide. Not obtained. |
 | Gate 2 production users | `FILLED` | Exactly three: `blockchain/blockvalidator.go` (F-011/086 ELA-only arbiter reward basis) and the V2 and V3 arms of `dpos/state/arbitrators.go` (F-212 empty-slot reward). The fourth user, F-032's block-validity binding, was **withdrawn** in `f6ea5b2`. |
 | `MainNetForcedRollbackHeight` | `FILLED` | **2 260 450** — the chain is rewound *to* this height |
 | `MainNetForcedRollbackTrigger` | `FILLED` | `e1a11e04942a7513f0256dbf3605080490800fd845f8e261deffcec68c2ea9af` (the block at `ForcedRollbackHeight + 1`) |
@@ -91,7 +91,7 @@ absence of any new height literal in the release-meta diff.
 | Module path | `FILLED` | `github.com/elastos/Elastos.ELA` |
 | Go language version | `FILLED` | `go 1.20` (`go.mod`) |
 | `sha256(go.mod)` | `FILLED` | `ba468c7ae64fa5a0eae0dfa8184759dd9083a97225827dbdcadc828609651dd5` |
-| `sha256(go.sum)` | `FILLED` | `990f6fcdd09e58efb80b321a1f08cf6808d82076f8b4d9bf48227e542a1dd8b4` (95 lines) |
+| `sha256(go.sum)` | `FILLED` | `9aeb9dfe08b904ce006dda24ecfdeba62fe964afe6e5af2c86f9cb94faa1183f` (587 lines, now tracked) |
 | Dependency integrity | `FILLED` | `go mod verify` → **"all modules verified"**, offline, against the on-box module cache |
 | Direct requirements | `FILLED` | 15 direct + 34 indirect, unchanged from the root snapshot `d8488bf` — **no dependency was added, removed or bumped in this release** (`F-211`: dependency bumps deliberately do not belong in a consensus batch) |
 | Module cache used | `FILLED` | `/root/go/pkg/mod` (325 MB), sufficient for a complete offline build |
@@ -110,9 +110,9 @@ toolchain and environment exactly as in [§3](#3-go-toolchain-attestation).
 
 | Binary | Status | sha256 | Size (bytes) | `--version` |
 |---|---|---|---|---|
-| `ela` | `FILLED`¹ | `5b768eb28e2aa1a07e7f61654f1167408ad17fa68e3465b3e6f8264c6d0535de` | 26 097 107 | `ela-v1.0.0 go version go1.20.14 linux/amd64` |
-| `ela-cli` | `FILLED`¹ | `d10d15b596535a6ff82eb75b86c8002b8856d63067136fef5a2c5f6854ae999f` | 25 459 306 | `ela-cli version v1.0.0` |
-| `ela-dns` | `FILLED`¹ | `139015bf577808f819bfba72f063dbb423f9a2fb4e0660dbcbc34d5171628204` | 8 313 900 | `ela-dns version v1.0.0` |
+| `ela` | `FILLED` | sha256 `a5526e792034068b187c079a046404513f571fc43156fc4c5a6af63ca478086f`, md5 `0e266975d270b1258dfdc8a567a3051b`, 26097082 bytes (built by `make release`, go1.20.14, GOAMD64=v1, -trimpath, CGO off, offline) | 26 097 107 | `ela-v1.0.0 go version go1.20.14 linux/amd64` |
+| `ela-cli` | `FILLED` | sha256 `592ebc8a4b9ad4ceb32b029fd5a654cad1448da2416251b0d06d240704057771`, md5 `017dd697b7e6e8e491e633a62f7346be`, 25459322 bytes (built by `make release`, go1.20.14, GOAMD64=v1, -trimpath, CGO off, offline) | 25 459 306 | `ela-cli version v1.0.0` |
+| `ela-dns` | `FILLED` | sha256 `139015bf577808f819bfba72f063dbb423f9a2fb4e0660dbcbc34d5171628204`, md5 `936b76bc25eed5a2c0938d1865760fcf`, 8313900 bytes (built by `make release`, go1.20.14, GOAMD64=v1, -trimpath, CGO off, offline) | 8 313 900 | `ela-dns version v1.0.0` |
 
 ¹ Measured at the pre-merge tree state in [§1](#1-identity). Adding
 `CHANGELOG.md` and this file does not affect the binaries (no Go source

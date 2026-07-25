@@ -2,7 +2,7 @@
 
 All notable changes to Elastos.ELA are recorded here.
 
-This file covers the 108 commits `d8488bf..HEAD` that make up **v1.0.0**.
+This file covers the 112 commits `d8488bf..HEAD` that make up **v1.0.0**.
 
 ---
 
@@ -1101,7 +1101,7 @@ the corrupt chain and fork itself off the recovered fleet.
 
 ## 12. Release metadata
 
-* **`273469d`** — **Version.** The tree carried **no** version string: the
+* **`be39057`** — **Version.** The tree carried **no** version string: the
   Makefile injected `git describe --dirty --always --tags`, so a release binary's
   identity was a property of the **builder's working copy**. Measured on the
   canonical tree with the pinned toolchain: a git checkout produced
@@ -1117,7 +1117,96 @@ the corrupt chain and fork itself off the recovered fleet.
   `<branch>-<sha>` so a development build stays self-identifying. No consensus
   code touched; no height literal added.
 
-* **`CHANGELOG.md`, `RELEASE-MANIFEST.md`** — this file and the release manifest.
+* **`0b3a9b1`** — this file and `RELEASE-MANIFEST.md`.
+
+* **`29796fd`** — **Release assurance (B3).** `go.sum` is now **tracked** (587
+  entries) rather than `.gitignore`d, so a fresh clone builds offline; CI actions
+  are pinned by full SHA; `revive` is verified against a committed `sha256`
+  before extraction; and a `check-toolchain` target refuses a build under any
+  toolchain other than the pinned one. Also binds the profiler to the configured
+  host (loopback by default) instead of every interface, and moves an
+  illegal-confirm check ahead of a sanity check — a pure conjunction reorder, so
+  the accepted set is byte-identical. Two defects in the original submission were
+  fixed before it landed: a `go.sum` diff check that CI's own `go mod download`
+  made fail on every run, and a `GOAMD64 :=` documented as blocking a
+  command-line override, which only `override` actually does.
+
+* **`78863f9`** — **Test-only.** Covers the production `submitauxblock` path
+  end to end at and above gate 1 — the only path that produces mainnet blocks,
+  and previously the largest untested surface in this release.
+
+---
+
+## Supply, measured
+
+Because this release touches reward arithmetic, total supply was measured
+directly rather than assumed. All 2,260,596 blocks were decoded with the
+production codecs; all 35,327,231 transaction inputs resolved with **zero**
+unresolved references, so fees are exact, not estimated. The result is
+cross-checked against the UTXO set — which never touches coinbase arithmetic —
+and the two agree **to the sela**.
+
+| Measure | ELA |
+|---|---:|
+| Ever created (genesis 33,000,000 + all rewards paid + the 2019 excess below) | 39,740,390.63665694 |
+| Still to be issued (every future block reward to the end of emission) | 1,479,607.15448400 |
+| **Maximum ever creatable** | **41,219,997.79114094** |
+| Burned to date (unspendable, at the destroy address) | 13,455,469.21450890 |
+| **Maximum supply minus burned** | **27,764,528.57663204** |
+
+The block reward is `800,000 ELA/year / 262,800 blocks / 2^(factor-1)`, the
+factor stepping every 1,051,200 blocks (four years). Integer truncation takes it
+to zero at height **30,484,800**, so the last paying block is 30,484,799 —
+roughly 107 years out.
+
+The ceiling reconciles exactly with the long-published maximum:
+`41,219,997.79114094 - 13,000,000 (the proposal #1631 burn) = 28,219,997.79114094`.
+The further 455,469.21 ELA of difference against the 27.76M figure above is the
+three smaller burns (390,000 at height 173,672; 63,415.69 at 173,669; 2,030.26
+accumulated from coinbases). **27.76M is an upper bound** — future burns only
+reduce it — and it is not market circulating supply: it includes the CR
+treasury, the staking pool, foundation holdings, cross-chain locks and the
+1,585,252.00399183 ELA of frozen incident funds.
+
+**Nothing in this release moves these numbers.** The ELA-only fee basis is
+arithmetically identical on a chain that has never carried a non-ELA asset; the
+empty-slot accounting fix guards a code path that has been unreachable since
+height 1,413,580; and the forced rollback discards 144 blocks and re-mines them
+at identical rewards.
+
+### A historical over-issuance, disclosed
+
+The same measurement found that **2.97238399 ELA was issued in July–August 2019
+that the reward schedule does not account for.** It is disclosed here because
+the figures above are published to eight decimal places and will not otherwise
+reconcile.
+
+Five blocks deviate, in both directions:
+
+| Height | Deviation (ELA) | Shape |
+|---:|---:|---|
+| 425,865 | +1.75799087 | one block's arbiter share carried over |
+| 433,533 | −63.30467656 | a round accumulated but was never paid |
+| 434,847 | +1.75839344 | carry-over |
+| 435,244 | +61.53523488 | a round paid a second time |
+| 435,279 | +1.75995087 | carry-over |
+
+Net, after a further 0.53450951 ELA left in an accumulator that was never
+distributed at a version handover: **+2.97238399 ELA**.
+
+The duplicate payment is **proven, not inferred**: blocks 435,243 and 435,244 —
+consecutive, 54 seconds apart — carry **89 byte-identical (value, address)
+reward pairs** totalling 63.29518528 ELA, differing only in the miner's own
+output. The *mechanism* is inferred from source and has not been demonstrated:
+the round-reward accumulator is cleared in only one function, and one branch of
+the height-increase path calls neither it nor the clearing routine.
+
+The excess went to ordinary arbiter and candidate addresses, so it is spendable
+and was almost certainly spent years ago. **No fix is shipped and none is
+proposed.** All five events used the V0 distribution routine, which — like the
+empty-slot path — has been unreachable since height 1,413,580 behind a monotone
+height test. Nothing in the evidence suggests intent; it has the shape of a bug
+in the era immediately before the CR committee existed.
 
 ---
 

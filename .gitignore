@@ -25,3 +25,6 @@ benchmark/process/run-to-height
 ela
 ela-cli
 ela-dns
+
+# checkpoint dir created by pow package tests
+cp_txPool/
