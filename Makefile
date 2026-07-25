@@ -5,7 +5,20 @@
 # binary must be built for a pinned target with a pinned toolchain. The
 # toolchain patch level lives in .go-version; GOAMD64 is pinned here so the
 # build does not silently inherit a builder-local microarchitecture level.
-GOAMD64 ?= v1
+# FV-24: `override ... :=`, not `?=` and not a bare `:=`. MEASURED here with GNU
+# Make 4.3:
+#   GOAMD64 ?= v1          -- `GOAMD64=v3 make release` resolves v3. `?=` treats an
+#                             environment variable as already defined, so the
+#                             environment wins outright.
+#   GOAMD64 := v1          -- the ENVIRONMENT is held at v1, but `make GOAMD64=v3
+#                             release` STILL resolves v3 and the recipe exports v3.
+#                             A command-line assignment overrides every ordinary
+#                             makefile assignment regardless of flavour; only an
+#                             `override` directive beats it.
+#   override GOAMD64 := v1 -- v1 in BOTH directions, which is the property this
+#                             block claims and which F-210's float-determinism
+#                             argument depends on.
+override GOAMD64 := v1
 export GOAMD64
 
 GOVER := $(shell go version)
@@ -24,7 +37,29 @@ DEV_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 DEV_VERSION := $(shell git rev-list HEAD -n 1 | cut -c 1-8)
 DEV_BUILD = go build -ldflags "-X main.Version=$(DEV_BRANCH)-$(DEV_VERSION) -X 'main.GoVersion=$(GOVER)'" #-race
 
-all:
+# check-toolchain enforces the .go-version pin OUTSIDE CI.
+#
+# FV-24: the pin F-210 rests on was advertised in .go-version and in the CI
+# matrix but nothing compared it to the toolchain actually in use, so binaries
+# could be (and on the engagement build host were) produced with a different
+# compiler than the one the float-determinism argument assumes. GOVER is only
+# stamped into ldflags; it was never checked. Set GOVERSION_CHECK=off for local
+# experiments -- release artifacts must be built with the pin.
+GOVERSION_PINNED := $(shell cat .go-version)
+GOVERSION_ACTUAL := $(shell go env GOVERSION 2>/dev/null | sed 's/^go//')
+
+check-toolchain:
+	@if [ "$(GOVERSION_CHECK)" = "off" ]; then \
+		echo "WARNING: toolchain pin check DISABLED (GOVERSION_CHECK=off); do not ship this binary"; \
+	elif [ "$(GOVERSION_ACTUAL)" != "$(GOVERSION_PINNED)" ]; then \
+		echo "TOOLCHAIN PIN VIOLATION: .go-version pins go$(GOVERSION_PINNED) but 'go' is go$(GOVERSION_ACTUAL)."; \
+		echo "Install the pinned toolchain, or set GOVERSION_CHECK=off for a NON-RELEASE build."; \
+		exit 1; \
+	fi
+
+.PHONY: check-toolchain all linux release repro-check
+
+all: check-toolchain
 	$(BUILD) -o ela log.go main.go
 	$(BUILD) -o ela-cli cmd/ela-cli.go
 	$(BUILD) -o ela-dns elanet/dns/main/main.go
@@ -34,7 +69,7 @@ dev:
 	$(DEV_BUILD) -o ela-cli cmd/ela-cli.go
 	$(DEV_BUILD) -o ela-dns elanet/dns/main/main.go
 
-linux:
+linux: check-toolchain
 	GOARCH=amd64 GOOS=linux $(BUILD) -o ela log.go main.go
 	GOARCH=amd64 GOOS=linux $(BUILD) -o ela-cli cmd/ela-cli.go
 	GOARCH=amd64 GOOS=linux $(BUILD) -o ela-dns elanet/dns/main/main.go
@@ -56,14 +91,14 @@ tools:
 RELEASE_ENV = GOOS=linux GOARCH=amd64 GOAMD64=$(GOAMD64) CGO_ENABLED=0
 RELEASE_FLAGS = -trimpath
 
-release:
+release: check-toolchain
 	$(RELEASE_ENV) $(BUILD) $(RELEASE_FLAGS) -o ela log.go main.go
 	$(RELEASE_ENV) $(BUILD) $(RELEASE_FLAGS) -o ela-cli cmd/ela-cli.go
 	$(RELEASE_ENV) $(BUILD) $(RELEASE_FLAGS) -o ela-dns elanet/dns/main/main.go
 
 # repro-check builds the node twice into separate outputs and fails if the
 # two binaries differ, i.e. if anything about the build is not pinned.
-repro-check:
+repro-check: check-toolchain
 	$(RELEASE_ENV) $(BUILD) $(RELEASE_FLAGS) -o ela.repro1 log.go main.go
 	$(RELEASE_ENV) $(BUILD) $(RELEASE_FLAGS) -o ela.repro2 log.go main.go
 	cmp ela.repro1 ela.repro2

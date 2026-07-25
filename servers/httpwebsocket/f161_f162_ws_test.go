@@ -186,3 +186,46 @@ func TestF162WSServerClosesSlowlorisConnection(t *testing.T) {
 			"timeout (Slowloris)", time.Since(start))
 	}
 }
+
+// TestF161ExactlyAtLimitMessageIsAccepted closes the FV-25 boundary gap: the shipped
+// F-161 test only ever proved that an OVER-limit message is refused, so a read limit
+// written one byte too tight -- rejecting the largest message a client may legitimately
+// send -- passed it. gorilla closes the connection with close code 1009 the moment a
+// message EXCEEDS SetReadLimit, so "the connection is still usable" is the exact
+// discriminator.
+//
+// Deliberately tolerant of whether the server ANSWERS the payload: the message is not
+// valid JSON, and what is under test is the read limit, not the request router. A read
+// TIMEOUT therefore passes (the limit did not fire); only a close/protocol error fails.
+func TestF161ExactlyAtLimitMessageIsAccepted(t *testing.T) {
+	addr := startTestWSServer(t)
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+addr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	atLimit := make([]byte, f161ExpectedMessageLimit)
+	for i := range atLimit {
+		atLimit[i] = 'a'
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, atLimit); err != nil {
+		t.Fatalf("F-161/FV-25: the server tore the connection down while receiving a "+
+			"message of EXACTLY the %d byte limit; the bound is off by one: %v",
+			f161ExpectedMessageLimit, err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		return // the server answered: the message was accepted in full
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return // no answer, but no close either: the read limit did not fire
+	}
+	t.Fatalf("F-161/FV-25: a message of EXACTLY the %d byte limit must be accepted; the "+
+		"server closed the connection instead: %v", f161ExpectedMessageLimit, err)
+}

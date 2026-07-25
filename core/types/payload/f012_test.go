@@ -7,6 +7,7 @@ package payload
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -25,8 +26,14 @@ func TestF012SidechainIllegalDataRejectsHugeSignLen(t *testing.T) {
 	common.WriteVarUint(&buf, uint64(1)<<40) // huge -> pre-fix `makeslice: len out of range` panic
 
 	var got SidechainIllegalData
-	if err := got.Deserialize(bytes.NewReader(buf.Bytes()), SidechainIllegalDataVersion); err == nil {
+	err := got.Deserialize(bytes.NewReader(buf.Bytes()), SidechainIllegalDataVersion)
+	if err == nil {
 		t.Fatal("F-012: expected rejection of signLen > MaxSidechainIllegalSigns (pre-fix: unbounded make())")
+	}
+	// FV-25: this probe IS correctly positioned (SerializeUnsigned writes every field
+	// through GenesisBlockAddress), but it only asserted "some error". Pin the guard.
+	if !strings.Contains(err.Error(), "sidechain illegal signLen exceeds maximum") {
+		t.Fatalf("F-012: rejected for the WRONG reason: %v", err)
 	}
 }
 
@@ -39,11 +46,28 @@ func TestF012BlockEvidenceRejectsHugeSigners(t *testing.T) {
 	if err := b.SerializeUnsigned(&buf); err != nil {
 		t.Skipf("serialize unavailable: %v", err)
 	}
-	// DeserializeOthers reads the signers-count varint first (before the make).
+	// FV-25: SerializeUnsigned writes ONLY the Header. DeserializeOthers reads the
+	// BlockConfirm varbytes FIRST and the signers count SECOND, so the huge varint
+	// used to stand here landed on the BlockConfirm LENGTH and was rejected by
+	// ReadVarBytes' pact.MaxBlockHeaderSize cap -- the F-012 guard was never reached
+	// and deleting it would not have failed this test. Write an empty BlockConfirm so
+	// the probe lands where the guard actually is.
+	if err := common.WriteVarBytes(&buf, nil); err != nil {
+		t.Fatalf("write empty BlockConfirm: %v", err)
+	}
 	common.WriteVarUint(&buf, uint64(1)<<40) // huge -> pre-fix `makeslice: cap out of range` panic
 
 	var got BlockEvidence
-	if err := got.Deserialize(bytes.NewReader(buf.Bytes())); err == nil {
+	err := got.Deserialize(bytes.NewReader(buf.Bytes()))
+	if err == nil {
 		t.Fatal("F-012: expected rejection of signers count > MaxDPoSIllegalSigners (pre-fix: unbounded make())")
+	}
+	// FV-25: and it must be rejected BY THE GUARD, not by an unrelated size cap the
+	// probe happened to trip on the way in. This assertion is what makes the test
+	// discriminate: delete the guard at dposillegalblocks.go and the error becomes a
+	// makeslice panic instead of this message.
+	if !strings.Contains(err.Error(), "dpos illegal signers length exceeds maximum") {
+		t.Fatalf("F-012: rejected for the WRONG reason -- the probe never reached the "+
+			"signers-count guard: %v", err)
 	}
 }

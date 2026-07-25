@@ -1338,17 +1338,52 @@ func checkDPOSElaIllegalBlockConfirms(d *payload.DPOSIllegalBlocks,
 		return nil, nil, err
 	}
 
-	if err := ConfirmSanityCheck(confirm); err != nil {
-		return nil, nil, err
-	}
+	// NX-12: run the CHEAP conjuncts before the expensive ones.
+	//
+	// An IllegalBlockEvidence transaction is zero-input, zero-output, zero-program,
+	// zero-fee and behind no height gate, so any unauthenticated peer can send one.
+	// Pristine ordering ran ConfirmSanityCheck FIRST -- one crypto.Verify for the
+	// proposal plus a crypto.DecodePoint + crypto.Verify per vote, with NO membership
+	// test and no short-circuit -- so a payload carrying MaxDPOSProposalVotes = 1024
+	// self-signed votes from ephemeral keypairs bought ~1025 EC verifications
+	// (measured ~111 ms for ~135 KB of wire) on the shared blockHandler goroutine
+	// before the first membership check could reject it.
+	//
+	// ACCEPTANCE IS UNCHANGED. The accept condition is the CONJUNCTION of these
+	// predicates; both are pure functions of the same immutable payload, neither
+	// mutates state, and IllegalConfirmContextCheck performs no signature
+	// verification at all (it is snapshot lookups plus a linear scan), so reordering
+	// leaves the accepted set byte-identical and changes only which error string a
+	// rejected payload produces. One documented message change: a confirm carrying
+	// only reject votes used to fail with "confirm contains reject vote" and now
+	// fails with "signers less than majority count", because
+	// IllegalConfirmContextCheck skips non-accept votes when building its signer set.
+	//
+	// UNGATED: no acceptance decision changes at any height, so retained history
+	// replays byte-identically. (Census: ZERO IllegalBlockEvidence transactions exist
+	// in all 2,260,597 retained blocks, so this path has never run on real history.)
+	//
+	// NOT DONE, deliberately: the finding also proposed hoisting the O(1)
+	// len(signers) != len(confirm.Votes) test out of checkDPOSElaIllegalBlockSigners
+	// to here. It was implemented, measured and WITHDRAWN. It buys nothing on top of
+	// the reorder -- the membership check below already rejects an unauthorized
+	// payload in O(1), before any signature verification -- while it does change which
+	// error two intermediate stages of the shipped
+	// test/unit/txvalidator_specailtx_test.go walk-through report, because that test
+	// builds the payload up one conjunct at a time and fills Signers last. Acceptance
+	// is identical either way; reshaping a consensus test to buy no measurable CPU is
+	// the wrong trade before a coordinated restart.
 	if err := IllegalConfirmContextCheck(confirm, d.BlockHeight, strictActive); err != nil {
 		return nil, nil, err
 	}
-
-	if err := ConfirmSanityCheck(compareConfirm); err != nil {
+	if err := ConfirmSanityCheck(confirm); err != nil {
 		return nil, nil, err
 	}
+
 	if err := IllegalConfirmContextCheck(compareConfirm, d.BlockHeight, strictActive); err != nil {
+		return nil, nil, err
+	}
+	if err := ConfirmSanityCheck(compareConfirm); err != nil {
 		return nil, nil, err
 	}
 

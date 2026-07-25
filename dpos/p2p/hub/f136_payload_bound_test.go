@@ -148,3 +148,32 @@ func TestF136_PipeBoundsRelayedPayload(t *testing.T) {
 			"claim from an unauthenticated peer", grew, claimed)
 	}
 }
+
+// TestF136_BoundIsExactlyMaxMessagePayload closes the FV-25 boundary gap: the shipped
+// tests only ever proved that an OVER-limit claim is refused, so a bound written as
+// `>=` instead of `>` -- which would reject the largest message a conforming peer may
+// legitimately send -- passed them all.
+//
+// The probe writes only the header and then closes, so nothing 32 MB is allocated:
+// at the limit readPayload must get PAST the bound and fail later on the truncated
+// body (io.ErrUnexpectedEOF), while one byte above it must fail ON the bound.
+func TestF136_BoundIsExactlyMaxMessagePayload(t *testing.T) {
+	atLimit := func(length uint32) error {
+		client, server := net.Pipe()
+		defer func() { _ = server.Close() }()
+		writeAll(client, headerFor(p2p.CmdVersion, length))
+		_, err := WrapConn(server)
+		return err
+	}
+
+	if err := atLimit(p2p.MaxMessagePayload); errors.Is(err, p2p.ErrMsgSizeExceeded) {
+		t.Fatalf("F-136/FV-25: a payload of EXACTLY p2p.MaxMessagePayload (%d) was "+
+			"rejected by the bound. That is the largest message p2p.WriteMessage will "+
+			"emit, so the bound is off by one and conforming peers are refused.",
+			p2p.MaxMessagePayload)
+	}
+	if err := atLimit(p2p.MaxMessagePayload + 1); !errors.Is(err, p2p.ErrMsgSizeExceeded) {
+		t.Fatalf("F-136: a payload one byte ABOVE p2p.MaxMessagePayload must be refused "+
+			"by the bound, got %v", err)
+	}
+}

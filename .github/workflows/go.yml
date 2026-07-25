@@ -13,14 +13,16 @@ jobs:
     steps:
 
     - name: Set up Go ${{ matrix.go }}
-      uses: actions/setup-go@v5
+      # FV-24: pinned by full commit SHA (v5 is a MUTABLE tag that upstream
+      # re-points; a consensus binary must not have a moving build input).
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
       with:
         go-version: ${{ matrix.go }}
         check-latest: false
       id: go
 
     - name: Check out code into the Go module directory
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Get dependencies
       run: |
@@ -30,7 +32,26 @@ jobs:
         # used to stand here re-resolved dependencies on every CI run; the
         # build now verifies the downloaded modules instead of retidying them.
         go mod verify
-        git diff --exit-code go.mod
+        # FV-24: prove the COMMITTED module set is sufficient to build with
+        # NOTHING resolved. -mod=readonly makes a missing go.sum entry a hard
+        # error instead of a silent rewrite, so this is the executable form of
+        # "a clean checkout builds" -- the property committing go.sum exists to
+        # hold -- and unlike the diff below it does not depend on the toolchain.
+        GOFLAGS=-mod=readonly go build ./...
+        # FV-24: go.sum is now COMMITTED (it used to be in .gitignore, so a clean
+        # checkout did not build and this diff could never see dependency
+        # content). Diff both files so any resolution drift fails the build.
+        #
+        # The committed go.sum is the set `go mod download` ITSELF resolves under
+        # the pinned toolchain (matrix above, .go-version, `make check-toolchain`),
+        # not the smaller build-only set. `go mod download` with no arguments is
+        # not read-only: it WRITES go.sum, adding a /go.mod hash for every module
+        # in the graph. MEASURED on go1.20.14: committing the build-only set made
+        # this diff fail on EVERY run (95 lines -> 587), which aborted Build
+        # before Test, lint and repro-check ever executed. Also measured
+        # idempotent -- three consecutive `go mod download` runs, `go mod verify`
+        # and the readonly build above all leave go.sum byte-identical.
+        git diff --exit-code go.mod go.sum
 
     - name: Test
       run: |
@@ -48,7 +69,11 @@ jobs:
         echo "PATH=$PATH"
         which go
         go env GOROOT
+        # FV-24: verify the downloaded linter against a committed digest before
+        # unpacking and executing it. The bare wget that stood here executed
+        # whatever the release URL happened to serve.
         wget -q https://github.com/mgechev/revive/releases/download/v1.2.1/revive_1.2.1_Linux_x86_64.tar.gz
+        sha256sum -c .github/revive-1.2.1.sha256
         tar xf revive_1.2.1_Linux_x86_64.tar.gz -C /tmp
         chmod +x /tmp/revive
         env GOROOT=$GOROOT GOPATH=$GOPATH PATH=$GOROOT/bin:$GOPATH/bin:$PATH /tmp/revive -config .revive.toml -formatter friendly -exclude vendor/... $(go list ./...)
@@ -60,7 +85,7 @@ jobs:
       run: make repro-check
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: ela-ubuntu
         path: ela

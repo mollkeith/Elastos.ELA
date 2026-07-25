@@ -235,4 +235,69 @@ func TestResidue2ForcedRollbackPurgesBlockStore(t *testing.T) {
 		assert.True(t, fdb.IsBlockInStore(&hash),
 			"retained block at height %d (<= target) must still be in store", h)
 	}
+
+	// FV-25: POST-REWIND FORWARD REPLAY.
+	//
+	// Every assertion above is about what the rollback REMOVED and what it KEPT. None
+	// of the reset tests ever drove the rewound store FORWARD again -- which is the
+	// only thing the coordinated restart actually does with it.
+	//
+	// HONEST SCOPE, measured rather than asserted: this leg is COVERAGE, not
+	// ENFORCEMENT. Disabling the forced rollback's header-index removal -- STEP 3 of
+	// rollbackOneBlock AND the HeaderRowsAbove sweep in PurgeForcedRollbackResidue,
+	// together -- leaves every assertion in THIS file green, including the ones below.
+	// The replayed block carries a different hash from the discarded one, so a stale
+	// index row for that height does not collide with it. The header-index removal is
+	// enforced elsewhere (the T1 family in test/unit fails on exactly that mutation:
+	// TestT1ForcedRollbackStepOrder, TestT1RollbackAtomicityNoRestartRatchet,
+	// TestT1RollbackResumeIsExactlyOnce, TestT1CheckForcedRollbackResidueAllowsHealthyNodes,
+	// TestT1ForcedRollbackInterruptStopsAtBlockBoundary,
+	// TestT1SweepHandlesDetachedSideBlockResidue). Kept because it exercises the
+	// post-rewind forward path the restart actually performs, which nothing else did --
+	// but it must not be counted as a fail-on-pristine guard.
+	{
+		replay := &types.Block{
+			Header: common2.Header{
+				Version:  0,
+				Height:   target + 1,
+				Previous: hashByHeight[target],
+				// Distinct from the DISCARDED block at this height, so the replay is a
+				// genuinely new block rather than a re-save of the one just purged.
+				Timestamp: 1700000000,
+				Bits:      0x1d03ffff,
+			},
+			Transactions: []interfaces.Transaction{residueCoinbase(target + 1)},
+		}
+		replayHash := replay.Hash()
+		discarded := hashByHeight[target+1]
+		assert.NotEqual(t, discarded, replayHash,
+			"the replayed block must differ from the discarded one at the same height")
+
+		node, lerr := chain.LoadBlockNode(&replay.Header, &replayHash)
+		assert.NoError(t, lerr, "post-rewind: LoadBlockNode at target+1 must succeed")
+		assert.NoError(t, chain.GetDB().SaveBlock(replay, node, nil,
+			blockchain.CalcPastMedianTime(node)),
+			"post-rewind: the rewound store must accept a NEW block at target+1")
+		chain.SetTip(node)
+		chain.BestChain = node
+
+		got, gerr := fdb.GetBlock(replayHash)
+		assert.NoError(t, gerr, "post-rewind: the replayed block must be served by hash")
+		assert.NotNil(t, got, "post-rewind: the replayed block must deserialize")
+		assert.True(t, fdb.IsBlockInStore(&replayHash),
+			"post-rewind: the replayed block must be in the raw block store")
+		assert.Equal(t, target+1, uint32(len(chain.Nodes)-1),
+			"post-rewind: the tip must advance to target+1")
+
+		// The purge must not be undone by the replay.
+		assert.False(t, fdb.IsBlockInStore(&discarded),
+			"post-rewind: the DISCARDED block at target+1 must not reappear once the "+
+				"chain moves forward again")
+	}
+
+	// STILL NOT COVERED HERE, and deliberately so: checkpoint-height restoration,
+	// on-disk checkpoint restore and the snapshot-ring purge. Those are the blind spot
+	// FV-01 and FV-12 live in; asserting them from this test would be asserting
+	// behaviour those findings say is currently wrong, so they belong with their own
+	// fixes, not with this one.
 }
