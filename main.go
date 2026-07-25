@@ -8,7 +8,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -179,7 +178,16 @@ func startNode(cfg *config.Configuration) {
 	// binary and restart, nothing else. The rollback is armed only when this node
 	// actually holds the targeted block, so it is idempotent and a no-op for
 	// fresh nodes.
-	forcedRollbackFired, e := chain.ForcedRollbackArmed()
+	//
+	// ARMED IS NOT APPLIED. The variable below says only "this node holds the chain
+	// the rollback targets". It is deliberately no longer used as a stand-in for
+	// "the rollback happened": that conflation is what made 48/48 rehearsal nodes
+	// decline a capacity-exceeded rewind here and then refuse to start further down,
+	// and -- in the silent variant, when the restored checkpoint happens to land
+	// below the target -- what let a node come up UN-ROLLED-BACK on the exploit
+	// chain. Whether the rollback was applied is established below by
+	// VerifyForcedRollbackApplied, against the persisted store.
+	forcedRollbackArmed, e := chain.ForcedRollbackArmed()
 	if e != nil {
 		printErrorAndExit(e)
 	}
@@ -189,37 +197,43 @@ func startNode(cfg *config.Configuration) {
 		// corrupt chain. Print configured vs actual so operators can catch it.
 		if actual, herr := chain.GetBlockHash(cfg.ForcedRollbackHeight + 1); herr == nil {
 			log.Warnf("forced rollback trigger check: configured=%s actual(block %d)=%s armed=%v",
-				cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight+1, actual.ReversedString(), forcedRollbackFired)
+				cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight+1, actual.ReversedString(), forcedRollbackArmed)
 		}
 	}
-	if forcedRollbackFired {
+	forcedRollbackApplied := false
+	if forcedRollbackArmed {
 		log.Warnf("forced rollback armed: this node holds block %s; rewinding to %d",
 			cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight)
-		if e := chain.ForceRollback(interrupt.C); e != nil {
-			if errors.Is(e, blockchain.ErrForcedRollbackExceedsCapacity) {
-				// Late-upgrade cohort: tip is beyond the incremental-rewind window.
-				// Do NOT brick the node into a permanent boot loop; log the remedy and
-				// continue booting on the current chain (pre-fix liveness preserved).
-				log.Warnf("forced rollback NOT applied: %v. Continuing boot on the current "+
-					"chain; recover via wipe+resync under the strict binary, or a manual "+
-					"`ela-cli rollback %d` then restart.", e, cfg.ForcedRollbackHeight)
-			} else {
-				// Includes ErrForcedRollbackInterrupted, which is NOT a corruption
-				// report: the rewind stops at a block boundary and continues on the
-				// next start, because a block's header-index row -- the row b.Nodes is
-				// rebuilt from, and therefore the row that both the arming predicate
-				// and the rewind bound depend on -- is now deleted only after all of
-				// that block's destructive work is durably committed.
-				printErrorAndExit(e)
-			}
+		// PRE-FLIGHT (B5). The armed path used to go straight into the rewind, so a
+		// store already damaged by an earlier interrupted rollback was discovered
+		// mid-rewind. MEASURED: it aborts on an internal transaction-index assertion
+		// that names two raw hashes, carries no sentinel and offers no remedy --
+		// "fails closed but opaquely", at the point in restart day where that costs
+		// the most. The scan runs BEFORE anything destructive, classifies the damage
+		// and names a remedy for it.
+		if e := chain.PreflightForcedRollback(); e != nil {
+			printErrorAndExit(e)
 		}
-		// The post-condition that used to sit here compared chain.GetHeight() against
-		// the target. GetHeight() is len(b.Nodes)-1 and the rewind loop's exit
-		// condition is exactly len(b.Nodes)-1 <= target, so the check restated the
-		// loop and could not fail for any store contents whatsoever. ForceRollback now
-		// asserts the PERSISTED store (VerifyForcedRollbackComplete: no main-chain
-		// entry, no header-index row, no raw by-hash entry and no best-chain state
-		// above the target) and surfaces the failure through the error above.
+		if e := chain.ForceRollback(interrupt.C); e != nil {
+			// EVERY failure is fatal, including ErrForcedRollbackExceedsCapacity.
+			// That sentinel used to be swallowed here so a late upgrader was not
+			// bricked into a boot loop -- but "not bricked" meant booting on the
+			// EXPLOIT chain, which is strictly worse: such a node joins the recovered
+			// network on the removed chain and, holding an on-duty arbiter seat,
+			// stalls it (rehearsal finding 3). A node that cannot complete the
+			// rollback must not join the recovered network. The remedies are in the
+			// error text and are operator-actionable; refusing to start is the loud,
+			// unambiguous outcome.
+			//
+			// ErrForcedRollbackInterrupted is fatal for a different reason: it is NOT
+			// a corruption report. The rewind stops at a block boundary and continues
+			// on the next start, because a block's header-index row -- the row
+			// b.Nodes is rebuilt from, and therefore the row both the arming predicate
+			// and the rewind bound depend on -- is now deleted only after all of that
+			// block's destructive work is durably committed.
+			printErrorAndExit(e)
+		}
+		forcedRollbackApplied = true
 	} else if cfg.ForcedRollbackTrigger != "" && cfg.ForcedRollbackHeight != 0 &&
 		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight {
 		// The boot a RATCHETED node comes up on. Under the shipped ordering each
@@ -229,11 +243,24 @@ func startNode(cfg *config.Configuration) {
 		// block 2,260,451 -- was still main-chain indexed, still in the raw store and
 		// still served by hash, with none of its UTXO/derived-state rollback applied.
 		// Neither shipped safety net could see it: the height assertion was
-		// tautological and the checkpoint assertion was guarded by
-		// `if forcedRollbackFired`, which is false on precisely this boot.
+		// tautological and the checkpoint assertion was guarded by the armed flag,
+		// which is false on precisely this boot.
 		if e := chain.CheckForcedRollbackResidue(); e != nil {
 			printErrorAndExit(e)
 		}
+	}
+	// THE post-condition, and it runs on EVERY boot of a configured node -- armed or
+	// not, rewound in this process or in an earlier one. The check it replaces
+	// compared chain.GetHeight() against the target; GetHeight() is len(b.Nodes)-1
+	// and the rewind loop's exit condition is exactly len(b.Nodes)-1 <= target, so it
+	// restated the loop and could not fail for any store contents whatsoever. This
+	// one asserts BYTES ON DISK: the targeted block must be absent from the
+	// main-chain index, the block-header index and the raw block store. It is three
+	// point lookups on the common path, and it is the check that makes it impossible
+	// for a configured node to reach the network above the target still holding the
+	// block the recovery removes.
+	if e := chain.VerifyForcedRollbackApplied(); e != nil {
+		printErrorAndExit(e)
 	}
 
 	if err = chain.Init(interrupt.C); err != nil {
@@ -369,13 +396,17 @@ func startNode(cfg *config.Configuration) {
 	// comparison of the derived arbiter/CR set at the target against a freshly-synced
 	// reference is the definitive check and is gated on the testnet reproduction.
 	//
-	// The condition is deliberately NOT `forcedRollbackFired` alone. That made the
-	// assertion skip exactly the boot on which an already-rewound node comes up --
-	// the rewind having happened in an earlier process -- so a snapshot that drifted
-	// to/above the target between runs was never caught. It now also runs whenever a
-	// forced rollback is configured and this node is sitting at or below the target,
-	// which is the state in which the pre-target-baseline property is load-bearing.
-	if forcedRollbackFired || (cfg.ForcedRollbackTrigger != "" &&
+	// The condition is deliberately NOT the ARMED flag. Armed means only that this
+	// node held the targeted chain when it booted; on the capacity-declined path it
+	// was true while the node sat, un-rewound, thousands of blocks ABOVE the target,
+	// where this assertion is not merely useless but actively misleading -- it fires
+	// on the exploit-era checkpoint of a node whose real defect is that it never
+	// rolled back. The first disjunct is now the APPLIED fact (the rewind ran in this
+	// process and the persisted store was verified), and the second covers the boot
+	// on which an already-rewound node comes up -- the rewind having happened in an
+	// earlier process -- so a snapshot that drifted to/above the target between runs
+	// is still caught.
+	if forcedRollbackApplied || (cfg.ForcedRollbackTrigger != "" &&
 		cfg.ForcedRollbackHeight != 0 &&
 		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight &&
 		chain.GetHeight() <= cfg.ForcedRollbackHeight) {

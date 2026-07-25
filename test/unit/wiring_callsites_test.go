@@ -280,6 +280,26 @@ var requiredCallSites = []callSite{
 			"not armed, tip at the target, exploit block still main-chain indexed and served",
 	},
 	{
+		finding: "B1 (armed is not applied)",
+		file:    "main.go", fn: "startNode",
+		callee: "VerifyForcedRollbackApplied",
+		why: "without it the boot path is back to reading the ARMED flag as if it meant " +
+			"APPLIED: a node that declined or skipped the rewind starts on the exploit " +
+			"chain, and for the depth band where the restored checkpoint lands below the " +
+			"target it does so SILENTLY -- this is the only check that reads the persisted " +
+			"store instead of len(b.Nodes)-1",
+	},
+	{
+		finding: "B5 (pre-flight store scan)",
+		file:    "main.go", fn: "startNode",
+		callee: "PreflightForcedRollback",
+		why: "without it the armed path runs the rewind on a store an earlier interrupted " +
+			"rollback already damaged, and (MEASURED) dies mid-rewind on an internal " +
+			"transaction-index assertion with no sentinel and no remedy — while the " +
+			"closing sweep it would otherwise reach deletes the stale main-chain entries " +
+			"of the blocks the rewind can never visit, leaving a store that LOOKS clean",
+	},
+	{
 		finding: "PURGE-GUARD",
 		file:    "blockchain/residuecleaner.go", fn: "PurgeForcedRollbackResidue",
 		callee:   "ScanForcedRollbackStore",
@@ -426,6 +446,25 @@ var forbiddenCallSites = []forbiddenCallSite{
 		callee: "CheckRecordSponsorBinding",
 		why: "the guard is DELETED, not merely unwired — a method with no production caller " +
 			"reads as armed while enforcing nothing",
+	},
+	{
+		finding: "B1 (capacity decline must be fatal)",
+		file:    "main.go", fn: "startNode",
+		callee: "ErrForcedRollbackExceedsCapacity",
+		why: "the ONLY way to swallow the capacity refusal again is to name the sentinel " +
+			"and branch on it; that branch let 48/48 rehearsal nodes decline the rewind " +
+			"and keep booting ON THE EXPLOIT CHAIN. A node that cannot complete the " +
+			"rollback must not join the recovered network — every ForceRollback error is " +
+			"fatal at the boot path, and the remedies live in the error text",
+	},
+	{
+		finding: "FV-18 (the remedy must not be a no-op)",
+		file:    "cmd/rollback/rollback.go", fn: "rollbackAction",
+		callee: "NumFlags",
+		why: "`if c.NumFlags() == 0 { ShowSubcommandHelp; return nil }` is what made " +
+			"`ela-cli rollback <N>` -- the positional form our own remedy strings printed " +
+			"-- print help and EXIT 0 without touching the store, so a runbook step that " +
+			"checks the exit status recorded success for an operation that never happened",
 	},
 }
 

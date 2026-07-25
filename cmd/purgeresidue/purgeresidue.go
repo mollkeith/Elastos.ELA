@@ -7,6 +7,7 @@ package purgeresidue
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/elastos/Elastos.ELA/blockchain"
 	cmdcom "github.com/elastos/Elastos.ELA/cmd/common"
@@ -19,8 +20,26 @@ import (
 
 var (
 	appSettings = settings.NewSettings()
-	dataDir     = "elastos/data"
 )
+
+// dataPath mirrors main.go: the chain data lives under <datadir>/data.
+const dataPath = "data"
+
+// resolveDataDir builds the chain-data path the same way main.go does, honouring
+// --datadir. The package-level "elastos/data" it replaces was passed straight to
+// NewChainStore, so --datadir was advertised and INERT (FV-18, measured): the
+// command silently created and cleaned a store under the CWD instead of the one the
+// operator named.
+func resolveDataDir(c *cli.Context, cfg *config.Configuration) string {
+	flagDataDir := config.DataDir
+	if cfg != nil && cfg.DataDir != "" {
+		flagDataDir = cfg.DataDir
+	}
+	if c != nil && c.String("datadir") != "" {
+		flagDataDir = c.String("datadir")
+	}
+	return filepath.Join(flagDataDir, dataPath)
+}
 
 // NewCommand builds the `ela-cli purgeresidue` subcommand: an offline cleaner that
 // removes forced-rollback block-store residue (residue #2) left behind on an
@@ -48,6 +67,11 @@ func NewCommand() *cli.Command {
 }
 
 func purgeResidueAction(c *cli.Context) error {
+	// NOTE: --conf is still inert here -- SetupConfig falls back to the
+	// config.ConfigFile CONSTANT, which cannot be assigned -- so the ActiveNet, and
+	// with it the ForcedRollbackHeight this command purges above, comes from
+	// ./config.json relative to the CURRENT DIRECTORY. Run it from the node's
+	// working directory. See the note in cmd/rollback.
 	cfg := appSettings.SetupConfig(false, "", "")
 
 	target := cfg.ForcedRollbackHeight
@@ -57,6 +81,8 @@ func purgeResidueAction(c *cli.Context) error {
 	}
 
 	log.NewDefault("logs/node", 0, 0, 0)
+	dataDir := resolveDataDir(c, cfg)
+	fmt.Println("purging residue above height", target, "in the chain store at", dataDir)
 	chainStore, err := blockchain.NewChainStore(dataDir, cfg)
 	if err != nil {
 		fmt.Println("create chain store failed, ", err)
@@ -67,7 +93,7 @@ func purgeResidueAction(c *cli.Context) error {
 	n, err := blockchain.PurgeForcedRollbackResidue(chainStore.GetFFLDB(), target)
 	if err != nil {
 		fmt.Println("purge residue failed, ", err)
-		return err
+		return cli.NewExitError(fmt.Sprint("purge residue failed: ", err), 1)
 	}
 	fmt.Printf("purged %d residual block(s) above forced-rollback height %d\n", n, target)
 	return nil

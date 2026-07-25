@@ -136,10 +136,20 @@ func TestBattleTriggerByteOrderIdentities(t *testing.T) {
 
 // ---- DEPTH-GUARD (audit finding): a node whose tip is > the incremental-rewind
 // window (maxHistoryCapacity=720) past the target must refuse with the sentinel
-// error, and that error must be non-fatally detectable by main.go via errors.Is,
-// so a late upgrader is not bricked into a permanent boot loop. ForcedRollbackArmed
-// deliberately does NOT depth-check (the guard lives in ForceRollback), so it still
-// arms -- the safety net is the sentinel + main.go continuing to boot.
+// error. ForcedRollbackArmed deliberately does NOT depth-check (the guard lives in
+// ForceRollback), so it still arms.
+//
+// CORRECTION (B1). This comment used to claim the sentinel's purpose was to be
+// "non-fatally detectable by main.go via errors.Is, so a late upgrader is not
+// bricked into a permanent boot loop", and main.go did exactly that. That was wrong,
+// and the rehearsal measured how wrong: 48/48 nodes declined here and then refused
+// to start further down anyway (alive 0/48), and in the depth band where the
+// restored checkpoint lands below the target they would instead have come up
+// UN-ROLLED-BACK on the exploit chain. A node that cannot complete the rollback must
+// not join the recovered network, so the sentinel is now FATAL at the boot path and
+// carries the operator remedy in its text. The sentinel is still a sentinel because
+// the remedy differs from every other rewind failure -- not because anyone is meant
+// to swallow it. See test/unit/b1b5_rollback_outcome_test.go.
 func TestBattleForcedRollbackDepthGuard(t *testing.T) {
 	const target = uint32(10)
 	trigger := hashAt(11).ReversedString()
@@ -168,11 +178,21 @@ func TestBattleForcedRollbackDepthGuard(t *testing.T) {
 			t.Fatalf("depth 5000 must return the non-fatal sentinel, got %v", e)
 		}
 	})
-	t.Run("error-text-names-a-remedy", func(t *testing.T) {
+	t.Run("error-text-names-a-remedy-that-is-not-a-no-op", func(t *testing.T) {
 		b := armChain(t, int(target)+800, target, trigger)
 		e := b.ForceRollback(nil)
-		if e == nil || (!contains(e.Error(), "ela-cli rollback") && !contains(e.Error(), "forcedrollbacktrigger")) {
-			t.Fatalf("capacity error must name a remedy, got: %v", e)
+		if e == nil {
+			t.Fatal("capacity error must name a remedy, got nil")
+		}
+		// FV-18: the remedy used to print the POSITIONAL form `ela-cli rollback <N>`,
+		// which -- measured on this tree -- prints the subcommand help and exits 0
+		// without touching the store, so a runbook step checking the exit status
+		// recorded success for an operation that never happened.
+		if !contains(e.Error(), "ela-cli rollback --height") {
+			t.Fatalf("the remedy must print the --height FLAG form, got: %v", e)
+		}
+		if !contains(e.Error(), "refusing to start") {
+			t.Fatalf("the capacity refusal must say the node will not start, got: %v", e)
 		}
 	})
 }

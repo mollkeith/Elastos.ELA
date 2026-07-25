@@ -89,7 +89,17 @@ func (b *BlockChain) ForcedRollbackArmed() (bool, error) {
 // ErrForcedRollbackExceedsCapacity is returned when this node's tip is more than
 // the incremental-rewind window (maxHistoryCapacity) past the rollback target, so
 // the auto-rollback cannot proceed without violating the pre-target-checkpoint
-// baseline. It is operator-actionable, NOT fatal.
+// baseline.
+//
+// It is operator-actionable, and it is FATAL at the boot path. It used to be
+// swallowed there so a late upgrader was not bricked into a boot loop -- but the
+// node that kept booting kept booting ON THE EXPLOIT CHAIN. Measured in the 48-node
+// rehearsal: 48/48 declined here and then died further down on the checkpoint
+// baseline assertion (alive 0/48), and in the variant where the restored snapshot
+// lands below the target that assertion PASSES and the node comes up
+// un-rolled-back, becoming the straggler that stalls the recovered chain from an
+// on-duty arbiter seat. Declining the rewind and continuing is not a liveness
+// concession, it is a correctness failure.
 var ErrForcedRollbackExceedsCapacity = errors.New("forced rollback depth exceeds history capacity")
 
 // ErrForcedRollbackInterrupted is returned when the operator interrupts the rewind.
@@ -326,9 +336,21 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 	depth := start - target
 
 	if depth >= maxHistoryCapacity {
+		// FV-18: the remedy used to print the POSITIONAL form `ela-cli rollback <N>`,
+		// which -- measured on this tree -- prints the subcommand help and exits 0
+		// without touching the store, so a runbook step checking the exit status
+		// recorded success for an operation that never happened. --height is required
+		// and is now the form printed.
 		return fmt.Errorf("forced rollback depth %d exceeds history capacity %d; "+
-			"refusing to rewind incrementally -- run `ela-cli rollback %d` below the target "+
-			"then restart, or unset --forcedrollbacktrigger to disarm: %w",
+			"refusing to rewind incrementally, and refusing to start -- a node that "+
+			"cannot complete the rollback must not join the recovered network on the "+
+			"chain the recovery removes. Remedy: stop the node and, from the node's "+
+			"working directory, run `ela-cli rollback --height %d --datadir <your "+
+			"data dir>` (the --height FLAG is required; a bare positional height "+
+			"prints help and does nothing), then restart; "+
+			"or wipe the data directory and resync under this binary. Unsetting "+
+			"--forcedrollbacktrigger also lets this node start, but only as a node "+
+			"that deliberately stays on the removed chain: %w",
 			depth, maxHistoryCapacity, target, ErrForcedRollbackExceedsCapacity)
 	}
 
