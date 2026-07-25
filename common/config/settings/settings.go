@@ -168,6 +168,45 @@ func enforceCrossChainUTXORestrictionHeights(configuration *config.Configuration
 	}
 }
 
+// announceDiscardedRollbackOverride reports, on stderr, a --forcedrollbacktrigger or
+// --forcedrollbackheight (equivalently a config.json ForcedRollbackTrigger /
+// ForcedRollbackHeight) that the mainnet pin is about to throw away.
+//
+// MEASURED on the shipped binary: passing an EMPTY --forcedrollbacktrigger together
+// with the disabled sentinel as --forcedrollbackheight still resolved to the
+// coordinated mainnet target and left the node armed, and said nothing at all.
+// That is not a cosmetic gap. The node's OWN capacity-refusal text used to tell the
+// operator that unsetting the trigger would let the node start, so an operator who
+// followed our instructions got a node that was still armed and an explanation that
+// was still missing. The text is fixed in blockchain/forcedrollback.go; this is the
+// other half -- the discard itself now says so.
+//
+// A correctly configured mainnet node -- which is every node in the fleet, since these
+// are the compiled-in defaults -- supplies neither value and prints nothing, so this
+// cannot become boilerplate operators learn to skip.
+//
+// It writes to os.Stderr rather than through common/log because SetupConfig runs
+// before setupLog: the package logger is still nil here and a log call would panic.
+// enforceMainnetSchnorrActivationHeights announces its discards the same way.
+func announceDiscardedRollbackOverride(configuration *config.Configuration) {
+	if configuration.ForcedRollbackTrigger != config.MainNetForcedRollbackTrigger {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: ignoring mainnet --forcedrollbacktrigger %q - pinned to the "+
+				"coordinated mainnet trigger %s. There is NO way to disarm the forced "+
+				"rollback on a mainnet node: it is a coordinated one-shot consensus "+
+				"rewind, and a node that skipped it would rejoin on the chain the "+
+				"recovery removes.\n",
+			configuration.ForcedRollbackTrigger, config.MainNetForcedRollbackTrigger)
+	}
+	if configuration.ForcedRollbackHeight != config.MainNetForcedRollbackHeight {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: ignoring mainnet --forcedrollbackheight %d - pinned to the "+
+				"coordinated mainnet rollback target %d. This node WILL rewind to that "+
+				"height if it holds the block above it.\n",
+			configuration.ForcedRollbackHeight, config.MainNetForcedRollbackHeight)
+	}
+}
+
 // enforceStrictMoneyAndRollbackHeights prevents local configuration from changing
 // the coordinated mainnet strict-money activation, forced-rollback height and
 // forced-rollback trigger. On a coordinated one-shot restart a single mismatched
@@ -176,6 +215,11 @@ func enforceCrossChainUTXORestrictionHeights(configuration *config.Configuration
 func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
 	case "", "mainnet", "main":
+		// Announce BEFORE the assignments below overwrite the evidence. A silently
+		// discarded forced-rollback override is the one pin whose loss the operator
+		// is guaranteed to notice only when it is too late (see the function's own
+		// comment), so it is the one pin that must not be silent.
+		announceDiscardedRollbackOverride(configuration)
 		configuration.StrictMoneyRangeHeight = config.MainNetStrictMoneyRangeHeight
 		// Pin RevisedDPoSRewardHeight too: it is a --reviseddposrewardheight-overridable,
 		// consensus-affecting coordinated height (F-212/F-032 reward gate). Leaving it

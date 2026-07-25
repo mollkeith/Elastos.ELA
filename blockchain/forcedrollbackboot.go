@@ -229,6 +229,72 @@ func (b *BlockChain) LocateForcedRollbackTrigger() (*ForcedRollbackTriggerLocati
 	return loc, nil
 }
 
+// forcedRollbackTriggerHeight resolves, from the PERSISTED store, the height the
+// configured trigger block actually occupies. ok is false when the store cannot say,
+// in which case no claim is made and the caller carries on unchanged.
+//
+// The header-index probe in LocateForcedRollbackTrigger is keyed on (hash, target+1),
+// so a hit there IS target+1 by construction; the other two sources are read from the
+// store itself.
+func (b *BlockChain) forcedRollbackTriggerHeight(
+	loc *ForcedRollbackTriggerLocation) (uint32, bool) {
+	if loc == nil {
+		return 0, false
+	}
+	if loc.OnMainChain {
+		return loc.MainChainHeight, true
+	}
+	if loc.HeaderRow {
+		return b.chainParams.ForcedRollbackHeight + 1, true
+	}
+	if loc.InBlockStore {
+		if hdr, err := b.db.GetFFLDB().GetHeader(loc.Hash); err == nil && hdr != nil {
+			return hdr.Height, true
+		}
+	}
+	return 0, false
+}
+
+// announceForcedRollbackSettled turns ONCE-ONLY from a property of the code into a
+// statement an operator can read off the console.
+//
+// The once-only property itself needs no new machinery and none is added here. Arming
+// requires the block at ForcedRollbackHeight+1 to hash to the configured trigger, and
+// the rewind is precisely the operation that removes that block, so the predicate that
+// authorises the rewind is falsified BY the rewind; once the chain re-mines a
+// different block at that height it is falsified twice over. What was missing is that
+// a node in that state took every early return in this file and said NOTHING, leaving
+// the operator to infer safety from an absence of output -- which is also what a
+// binary that never ran the check looks like.
+//
+// The claim made here is deliberately exactly what the store supports: the CONFIGURED
+// trigger is absent from all three persisted indexes, and (above the target) a named,
+// different block occupies target+1. It does not claim the trigger is the right one --
+// on mainnet that is guaranteed by the pin, not by this function.
+func (b *BlockChain) announceForcedRollbackSettled(tip uint32) {
+	target := b.chainParams.ForcedRollbackHeight
+	if tip <= target {
+		log.Operatorf("FORCED ROLLBACK: nothing to roll back on this node -- its tip is "+
+			"%d, at or below the target %d, and the trigger block %s is absent from the "+
+			"main-chain index, the block-header index and the raw block store. The "+
+			"rewind will not run on this boot.",
+			tip, target, b.chainParams.ForcedRollbackTrigger)
+		return
+	}
+	occupant := "<unreadable>"
+	if h, err := b.GetBlockHash(target + 1); err == nil {
+		occupant = h.ReversedString()
+	}
+	log.Operatorf("FORCED ROLLBACK: ALREADY APPLIED -- and it will not run again. "+
+		"Evidence from this node's store: the trigger block %s is absent from the "+
+		"main-chain index, the block-header index and the raw block store, height %d "+
+		"is now held by block %s instead, and the tip is %d. The rewind arms only "+
+		"while the block at height %d hashes to the trigger, so it cannot arm on this "+
+		"store; only restoring a pre-rollback copy of the data directory could put "+
+		"that block back.",
+		b.chainParams.ForcedRollbackTrigger, target+1, occupant, tip, target+1)
+}
+
 // VerifyForcedRollbackApplied is the boot-time post-condition that replaces reading
 // the ARMED flag as if it meant APPLIED.
 //
@@ -256,14 +322,39 @@ func (b *BlockChain) VerifyForcedRollbackApplied() error {
 	if err != nil {
 		return err
 	}
-	if loc == nil || !loc.Present() {
-		return nil
-	}
 
 	target := b.chainParams.ForcedRollbackHeight
 	var tip uint32
 	if len(b.Nodes) > 0 {
 		tip = uint32(len(b.Nodes) - 1)
+	}
+
+	if loc == nil || !loc.Present() {
+		// The rollback is settled on this store. Say so, with the evidence: a silent
+		// nil is indistinguishable from a binary that never looked.
+		b.announceForcedRollbackSettled(tip)
+		return nil
+	}
+
+	// The trigger block is HERE, but is it the block this rollback is about? Every
+	// branch below assumes the configured trigger names the block at target+1 and
+	// nothing has ever checked that it does. When it does not, the disagreement is
+	// between two configured values, not inside the database, and the answers below
+	// (refuse with "restore a backup or wipe and resync", or purge the named block
+	// from the store) are both destructive answers to a typo. Diagnose it first.
+	if h, ok := b.forcedRollbackTriggerHeight(loc); ok && h != target+1 {
+		return fmt.Errorf("forced rollback: CONFIGURATION ERROR -- the configured "+
+			"trigger %s names the block at height %d, but the forced rollback is "+
+			"defined as the removal of the block at height %d (target %d + 1). The "+
+			"block store is not damaged: the two values that disagree are both "+
+			"configuration, and one of them is wrong. Refusing to start rather than "+
+			"acting on a rollback this node cannot make sense of. Remedy: set "+
+			"ForcedRollbackTrigger / --forcedrollbacktrigger to the hash of the block "+
+			"at height %d, or set ForcedRollbackHeight / --forcedrollbackheight to one "+
+			"below %d, then restart. Neither restoring a backup nor resyncing from "+
+			"scratch helps here, and both are hours of work: a resynced node reads the "+
+			"same configuration and stops in the same place",
+			b.chainParams.ForcedRollbackTrigger, h, target+1, target, target+1, h)
 	}
 
 	if loc.OnMainChain {
@@ -288,7 +379,7 @@ func (b *BlockChain) VerifyForcedRollbackApplied() error {
 	// Retention residue only. Both keys are keyed on the trigger, whose height is
 	// target+1 by construction, so a targeted removal can never touch retained
 	// history and does not need the full store walk.
-	log.Warnf("FORCED ROLLBACK: the rolled-back block %s is off the main chain but "+
+	log.Operatorf("FORCED ROLLBACK: the rolled-back block %s is off the main chain but "+
 		"still %s; purging so this node cannot serve it by hash",
 		loc.Hash.String(), loc.String())
 	hash := loc.Hash
@@ -322,7 +413,7 @@ func (b *BlockChain) VerifyForcedRollbackApplied() error {
 		return fmt.Errorf("%w: block %s survived the targeted purge (%s)",
 			ErrForcedRollbackNotApplied, hash.String(), after.String())
 	}
-	log.Warnf("FORCED ROLLBACK: verified -- block %s is absent from the main-chain "+
+	log.Operatorf("FORCED ROLLBACK: verified -- block %s is absent from the main-chain "+
 		"index, the block-header index and the raw block store", hash.String())
 	return nil
 }
@@ -376,7 +467,7 @@ func (b *BlockChain) PreflightForcedRollback() error {
 		// below by maxHistoryCapacity rather than by an unbounded tip-target: a node
 		// that ran far past the target must not be asked to build a reachability set
 		// proportional to how far it ran.
-		log.Warnf("FORCED ROLLBACK: pre-flight skipped -- depth %d already exceeds the "+
+		log.Operatorf("FORCED ROLLBACK: pre-flight skipped -- depth %d already exceeds the "+
 			"incremental rewind window %d, so the rewind refuses before doing anything "+
 			"and this node will not start", depth, maxHistoryCapacity)
 		return nil
@@ -432,7 +523,7 @@ func (b *BlockChain) PreflightForcedRollback() error {
 			refsString(bodyless))
 	}
 
-	log.Warnf("FORCED ROLLBACK: pre-flight OK -- %s; %d block(s) to rewind, every one "+
+	log.Operatorf("FORCED ROLLBACK: pre-flight OK -- %s; %d block(s) to rewind, every one "+
 		"reachable from the loaded block index and complete in the store; anything "+
 		"left over is retention residue and is swept by the rewind",
 		scan.Summary(), tip-target)

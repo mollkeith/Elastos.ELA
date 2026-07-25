@@ -107,6 +107,28 @@ var ErrForcedRollbackExceedsCapacity = errors.New("forced rollback depth exceeds
 // remedy is simply to restart the node and let it continue.
 var ErrForcedRollbackInterrupted = errors.New("forced rollback interrupted by operator")
 
+// forcedRollbackDisarmRemedy is the sentence a refusal ends with when it offers
+// "or just do not roll back" as a way out.
+//
+// MEASURED: the shipped text told every operator that unsetting
+// --forcedrollbacktrigger lets the node start. On mainnet that is FALSE --
+// settings.enforceStrictMoneyAndRollbackHeights discards both the flag and the
+// config.json field and re-pins the coordinated values, so
+// `ela --forcedrollbacktrigger= --forcedrollbackheight=4294967295` still resolves to
+// target 2260450 and still arms. An operator following our own instructions on
+// restart day would have got a node that did not start and an explanation that was
+// not true. The predicate is config.IsMainNetActiveNet, the same label set the pin
+// switches on.
+func (b *BlockChain) forcedRollbackDisarmRemedy() string {
+	if config.IsMainNetActiveNet(b.chainParams.ActiveNet) {
+		return "There is NO disarm on mainnet: --forcedrollbacktrigger and " +
+			"--forcedrollbackheight are discarded and re-pinned to the coordinated " +
+			"values, so unsetting them does not let this node start"
+	}
+	return "Unsetting --forcedrollbacktrigger also lets this node start, but only " +
+		"as a node that deliberately stays on the removed chain"
+}
+
 // forcedRollbackMarkerKeyName is the ffldb metadata key holding the durable
 // "a forced rollback is in progress" marker.
 //
@@ -315,7 +337,7 @@ func (b *BlockChain) rollbackOneBlock(node, prevNode *BlockNode) error {
 			return fmt.Errorf("forced rollback: RollbackBlock %d: %w", node.Height, rerr)
 		}
 	} else {
-		log.Warnf("FORCED ROLLBACK: resuming -- block %d was already rolled back by "+
+		log.Operatorf("FORCED ROLLBACK: resuming -- block %d was already rolled back by "+
 			"an earlier, interrupted run; skipping its rollback transaction",
 			node.Height)
 	}
@@ -383,10 +405,9 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 			"working directory, run `ela-cli rollback --height %d --datadir <your "+
 			"data dir>` (the --height FLAG is required; a bare positional height "+
 			"prints help and does nothing), then restart; "+
-			"or wipe the data directory and resync under this binary. Unsetting "+
-			"--forcedrollbacktrigger also lets this node start, but only as a node "+
-			"that deliberately stays on the removed chain: %w",
-			depth, maxHistoryCapacity, target, ErrForcedRollbackExceedsCapacity)
+			"or wipe the data directory and resync under this binary. %s: %w",
+			depth, maxHistoryCapacity, target, b.forcedRollbackDisarmRemedy(),
+			ErrForcedRollbackExceedsCapacity)
 	}
 
 	// The marker is written BEFORE anything destructive, so an interrupted run is
@@ -401,14 +422,14 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 				"for target %d; refusing to mix two rollbacks -- restore a backup "+
 				"or wipe and resync", marker.Target, marker.Start, target)
 		}
-		log.Warnf("FORCED ROLLBACK: RESUMING an interrupted rewind -- original start "+
+		log.Operatorf("FORCED ROLLBACK: RESUMING an interrupted rewind -- original start "+
 			"height %d, target %d, %d block(s) still to discard",
 			marker.Start, marker.Target, depth)
 	} else if werr := b.writeForcedRollbackMarker(target, start); werr != nil {
 		return fmt.Errorf("forced rollback: write in-progress marker: %w", werr)
 	}
 
-	log.Warnf("FORCED ROLLBACK: rewinding chain store from height %d to %d (%d blocks). "+
+	log.Operatorf("FORCED ROLLBACK: rewinding chain store from height %d to %d (%d blocks). "+
 		"This is a one-shot consensus rewind over the whole block store and may take "+
 		"a long time on a large database. It is RESUMABLE: if it is interrupted, "+
 		"restart the node and it continues from where it stopped.", start, target, depth)
@@ -451,7 +472,7 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 
 		done := start - uint32(i-1)
 		if done%uint32(logEvery) == 0 || uint32(i) == target+1 || done == 1 {
-			log.Warnf("FORCED ROLLBACK: %d/%d blocks discarded (%d%%), store tip now %d, "+
+			log.Operatorf("FORCED ROLLBACK: %d/%d blocks discarded (%d%%), store tip now %d, "+
 				"elapsed %s", done, depth, done*100/depth, i-1,
 				time.Since(began).Truncate(time.Second))
 		}
@@ -470,7 +491,7 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 	if swept, serr := PurgeForcedRollbackResidue(b.db.GetFFLDB(), target); serr != nil {
 		return fmt.Errorf("forced rollback: sweep above-target orphan residue: %w", serr)
 	} else if swept > 0 {
-		log.Warnf("FORCED ROLLBACK: swept %d above-target orphan/side block(s) that were "+
+		log.Operatorf("FORCED ROLLBACK: swept %d above-target orphan/side block(s) that were "+
 			"stored but never on the main chain", swept)
 	}
 
@@ -497,7 +518,7 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 		return ferr
 	}
 
-	log.Warnf("FORCED ROLLBACK: block store rewound to %d in %s; the rewind and the "+
+	log.Operatorf("FORCED ROLLBACK: block store rewound to %d in %s; the rewind and the "+
 		"clearing of its in-progress marker are both on disk. Derived state will be "+
 		"rebuilt by InitCheckpoint from a pre-target snapshot (asserted < target)",
 		len(b.Nodes)-1, time.Since(began).Truncate(time.Second))
@@ -526,7 +547,7 @@ func (b *BlockChain) VerifyForcedRollbackComplete() error {
 			refsString(scan.MainChainAbove), refsString(scan.StoredAbove),
 			refsString(scan.HeaderRowsAbove))
 	}
-	log.Warnf("FORCED ROLLBACK: persisted store verified clean above target %d "+
+	log.Operatorf("FORCED ROLLBACK: persisted store verified clean above target %d "+
 		"(best-state height %d)", target, scan.BestStateHeight)
 	return nil
 }
@@ -574,7 +595,7 @@ func (b *BlockChain) CheckForcedRollbackResidue() error {
 		return interruptedRollbackError(scan, tip)
 	}
 	if len(scan.StoredAbove) > 0 || len(scan.HeaderRowsAbove) > 0 {
-		log.Warnf("FORCED ROLLBACK: node is at height %d (target %d) but the store still "+
+		log.Operatorf("FORCED ROLLBACK: node is at height %d (target %d) but the store still "+
 			"holds %d discarded block(s) and %d orphaned header row(s) above the target; "+
 			"purging (retention residue only -- the main chain is consistent)",
 			tip, target, len(scan.StoredAbove), len(scan.HeaderRowsAbove))
@@ -582,7 +603,7 @@ func (b *BlockChain) CheckForcedRollbackResidue() error {
 		if perr != nil {
 			return fmt.Errorf("forced rollback: purge residue at boot: %w", perr)
 		}
-		log.Warnf("FORCED ROLLBACK: purged %d residual block(s) above target %d",
+		log.Operatorf("FORCED ROLLBACK: purged %d residual block(s) above target %d",
 			purged, target)
 		// The message below states the store is verified clean, and clearing the
 		// marker retires the only durable evidence that a rewind was ever under way.
@@ -592,7 +613,7 @@ func (b *BlockChain) CheckForcedRollbackResidue() error {
 		}
 	}
 	if marker, merr := b.ReadForcedRollbackMarker(); merr == nil && marker != nil {
-		log.Warnf("FORCED ROLLBACK: clearing a stale in-progress marker (target %d, "+
+		log.Operatorf("FORCED ROLLBACK: clearing a stale in-progress marker (target %d, "+
 			"start %d); the persisted store is verified clean above the target",
 			marker.Target, marker.Start)
 		if cerr := b.ClearForcedRollbackMarker(); cerr != nil {

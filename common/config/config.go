@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -216,6 +217,28 @@ var (
 // never on a private/forked net, which uses a different foundation.
 func IsMainNetFoundationProgramHash(h *common.Uint168) bool {
 	return h != nil && h.IsEqual(*mainNetFoundationProgramHash)
+}
+
+// IsMainNetActiveNet reports whether an ActiveNet label selects the mainnet
+// parameter set.
+//
+// It exists so that code OUTSIDE this package can answer "will this node have the
+// coordinated mainnet forced-rollback trigger pinned on it whatever the operator
+// supplies?" without copying the label set. The forced rollback's own error text has
+// to answer exactly that: on mainnet the pin re-installs the trigger, so telling the
+// operator to unset --forcedrollbacktrigger is telling them to do something that does
+// not work, while on every other net that remedy is real.
+//
+// The label set is the one the enforce* pins in common/config/settings switch on, and
+// the OPS2 suite asserts the agreement against the PRODUCTION pin rather than against
+// a copy of the list, so the two cannot drift apart silently.
+func IsMainNetActiveNet(activeNet string) bool {
+	switch strings.ToLower(strings.TrimSpace(activeNet)) {
+	case "", "mainnet", "main":
+		return true
+	default:
+		return false
+	}
 }
 
 func SetParameters(configuration *Configuration) {

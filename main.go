@@ -217,14 +217,20 @@ func startNode(cfg *config.Configuration) {
 		// trigger silently disarms the rollback and leaves the node on the
 		// corrupt chain. Print configured vs actual so operators can catch it.
 		if actual, herr := chain.GetBlockHash(cfg.ForcedRollbackHeight + 1); herr == nil {
-			log.Warnf("forced rollback trigger check: configured=%s actual(block %d)=%s armed=%v",
+			log.Operatorf("forced rollback trigger check: configured=%s actual(block %d)=%s armed=%v",
 				cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight+1, actual.ReversedString(), forcedRollbackArmed)
 		}
 	}
 	forcedRollbackApplied := false
 	if forcedRollbackArmed {
-		log.Warnf("forced rollback armed: this node holds block %s; rewinding to %d",
-			cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight)
+		log.Operatorf("FORCED ROLLBACK: ARMED -- this node holds block %s at height %d, "+
+			"which is the block the recovery removes, so it is about to rewind to %d. "+
+			"This is expected on the coordinated restart. AFTER the restart it means "+
+			"this data directory was rolled back to a state that still contains that "+
+			"block -- almost always a restored pre-rollback backup or an old copy of "+
+			"the data directory -- and rewinding it again is correct.",
+			cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight+1,
+			cfg.ForcedRollbackHeight)
 		// PRE-FLIGHT (B5). The armed path used to go straight into the rewind, so a
 		// store already damaged by an earlier interrupted rollback was discovered
 		// mid-rewind. MEASURED: it aborts on an internal transaction-index assertion
@@ -438,7 +444,7 @@ func startNode(cfg *config.Configuration) {
 					"snapshot is not strictly pre-target, derived state may be exploit-era -- "+
 					"refusing to start", mh, cfg.ForcedRollbackHeight))
 		}
-		log.Warnf("forced rollback: post-rebuild baseline OK (max restored checkpoint %d < target %d, tip %d)",
+		log.Operatorf("forced rollback: post-rebuild baseline OK (max restored checkpoint %d < target %d, tip %d)",
 			mh, cfg.ForcedRollbackHeight, chain.GetHeight())
 	}
 
@@ -489,8 +495,17 @@ func startNode(cfg *config.Configuration) {
 	<-interrupt.C
 }
 
+// printErrorAndExit is the node's only fatal path, and every forced-rollback refusal
+// leaves through it.
+//
+// MEASURED: log.Error is level-filtered (Logger.Error keeps a record only while
+// l.level <= errorLog), so at PrintLevel 4 or above a node that REFUSED TO START
+// exited 255 having written nothing to stdout, nothing to stderr and nothing to the
+// log file. On restart day that is a node an operator cannot diagnose at all.
+// log.OperatorError writes to stderr, which no print level filters, and records the
+// line unconditionally.
 func printErrorAndExit(err error) {
-	log.Error(err)
+	log.OperatorError(err)
 	os.Exit(-1)
 }
 
