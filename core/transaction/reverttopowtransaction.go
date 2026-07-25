@@ -11,6 +11,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/elastos/Elastos.ELA/blockchain"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	elaerr "github.com/elastos/Elastos.ELA/errors"
 )
@@ -90,6 +91,16 @@ func (t *RevertToPOWTransaction) SpecialContextCheck() (result elaerr.ELAError, 
 
 		if t.parameters.TimeStamp == 0 {
 			// is not in block, check by local time.
+			//
+			// FV-22: this leg DELIBERATELY keeps the node's own clock and is
+			// DELIBERATELY not gated. TimeStamp==0 means "no block carries this
+			// transaction yet" -- the mempool-admission and mining paths. That is a
+			// local relay/inclusion policy decision, not a block-acceptance decision,
+			// so a node-local, peer-set-dependent quantity is legitimate here: two
+			// nodes disagreeing about whether to hold a transaction in their own pool
+			// costs a relay, not a chain split. The moment the transaction is put in a
+			// block the in-block branch below decides, and that branch consults no
+			// clock at all. Do not "unify" the two legs.
 			localTime := t.MedianAdjustedTime().Unix()
 			if localTime-lastBlockTime < noBlockTime {
 				return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid block time")), true
@@ -97,41 +108,72 @@ func (t *RevertToPOWTransaction) SpecialContextCheck() (result elaerr.ELAError, 
 		} else {
 			// is in block, check by the time of existed block.
 			//
-			// FV-22 (gate 1, StrictMoneyRangeHeight): F-057 additionally required the
-			// VALIDATING NODE'S OWN peer-adjusted clock to confirm the interval, to stop
-			// a producer future-dating one header by RevertToPOWNoBlockTimeV1 (which
-			// equals MaxTimeOffsetSeconds) and forcing DPoS->POW with zero elapsed time.
-			// That leg is WITHDRAWN here: MedianAdjustedTime is TimeSource.AdjustedTime,
-			// i.e. local wall clock plus a median offset over up to 199 peer samples, so
-			// two honest nodes with identical chain state and different peer sets can
-			// reach opposite ACCEPT/REJECT verdicts on the same block. A node-local,
-			// peer-set-dependent quantity must not decide block acceptance.
+			// FV-22 option (b) -- DECIDED BY THE OWNER AND SHIPPED HERE. At and above
+			// gate 1 (StrictMoneyRangeHeight) the demanded gap is
+			// noBlockTime + MaxTimeOffsetSeconds. Below the gate the legacy comparison
+			// is kept verbatim so retained history replays byte-identically.
 			//
-			// The replacement proposed in review -- header.Timestamp minus
-			// CalcPastMedianTime(parent) -- was NOT taken, and the reason is measured,
-			// not asserted. CalcPastMedianTime returns the median of the parent and its
-			// 10 ancestors, so it sits BELOW the parent's own timestamp on any normally
-			// spaced chain. Over the retained mainnet copy that holds without exception:
-			// for ALL 30 RevertToPOW blocks in history the median lies below the parent
-			// (by 76s to 17,131s), and in a 2,241-height control sample spread over the
-			// whole chain it is below in 2,241 of 2,241 with a mean gap of 601.5s.
-			// Substituting it would therefore have made the at/above-gate leg STRICTLY
-			// MORE PERMISSIVE -- by ~600s of forgeable slack -- than the pre-gate leg it
-			// replaces: it would have removed F-057's protection and weakened upstream's
-			// as well. (For reference the 29 NoBlock reverts clear the parent-bound
-			// threshold with margins of +12s upward, so the deterministic rule kept below
-			// still admits every genuine historical rescue.)
+			// WHAT IT CLOSES (F-057). A block's own header timestamp is written by its
+			// producer, and CheckBlockSanity only bounds it at
+			// AdjustedTime + MaxTimeOffsetSeconds. Since RevertToPOWNoBlockTimeV1
+			// (7200s) EQUALS MaxTimeOffsetSeconds (7200s), a producer could future-date
+			// one header by exactly the stall window and satisfy the legacy comparison
+			// with ZERO real elapsed time, forcing DPoS->POW at will. Requiring
+			// noBlockTime + MaxTimeOffsetSeconds makes the most a producer can forge
+			// (MaxTimeOffsetSeconds) insufficient on its own: whatever it post-dates,
+			// at least noBlockTime of REAL time must have passed since the parent.
+			// The rule is deterministic and ancestry-only -- header timestamp minus
+			// PARENT timestamp, both consensus data -- so it consults no wall clock,
+			// no peer set and nothing else node-local.
 			//
-			// What remains is the deterministic, ancestry-only condition below. The
-			// residual it leaves open is stated plainly rather than papered over: a
-			// producer able to mine a block can still claim a stall by future-dating its
-			// header, exactly as upstream allows. Closing that deterministically requires
-			// the demanded gap to exceed what a producer can forge (i.e.
-			// noBlockTime + MaxTimeOffsetSeconds), which doubles the emergency failsafe's
-			// latency from 2h to 4h -- a consensus-policy decision, not a defect fix, and
-			// therefore left to the owner rather than taken here.
-			if int64(t.parameters.TimeStamp)-lastBlockTime < noBlockTime {
-				return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid block time")), true
+			// WHAT IT COSTS, MEASURED not asserted. An honest producer dates its header
+			// at ~now, so the emergency failsafe now needs ~4h of stall instead of ~2h
+			// (V1 era: 7200 -> 14400s; the pre-V1 43200 -> 50400s pairing exists only
+			// below ChangeViewV1Height=1911200, which is far below the gate, so 4h is
+			// the only threshold that can ever be live). Census over the retained
+			// mainnet copy (2,260,597 stored block records, CRC-clean, every parent
+			// hash verified): 30 RevertToPOW transactions in history, 29 NoBlock and 1
+			// NoProducers; ALL of them at heights 1184559..2129088, i.e. ALL below gate
+			// 1 (2260451), so not one retained block changes verdict. Of the 29 NoBlock
+			// rescues, 28 would have MISSED this threshold and had to wait longer --
+			// between 1h53m27s and 1h59m48s more (mean 7,081.9s) -- and 1 (height
+			// 1405191, gap 85,240s) would still have passed. That is the price of the
+			// decision, and it is the number the restart runbook carries.
+			//
+			// WHAT WAS TRIED AND REJECTED, so nobody re-proposes it:
+			//
+			//   - F-057's original leg required the VALIDATING NODE'S OWN peer-adjusted
+			//     clock (MedianAdjustedTime = TimeSource.AdjustedTime, i.e. local wall
+			//     clock plus a median offset over up to 199 PEER samples) to confirm the
+			//     interval. WITHDRAWN and never to return: two honest nodes with
+			//     identical chain state and different peer sets reach opposite
+			//     ACCEPT/REJECT verdicts on the same block. A node-local, peer-set-
+			//     dependent quantity must not decide block acceptance.
+			//
+			//   - The replacement proposed in review -- header.Timestamp minus
+			//     CalcPastMedianTime(parent) -- was MEASURED and rejected.
+			//     CalcPastMedianTime returns the median of the parent and its 10
+			//     ancestors, so it sits BELOW the parent's own timestamp on any normally
+			//     spaced chain. Over the retained mainnet copy that holds without
+			//     exception: for ALL 30 RevertToPOW blocks in history the median lies
+			//     below the parent (by 76s to 17,131s), and in a 2,241-height control
+			//     sample spread over the whole chain it is below in 2,241 of 2,241 with
+			//     a mean gap of 601.5s. Substituting it would have made this leg
+			//     STRICTLY MORE PERMISSIVE -- by ~600s of forgeable slack -- than the
+			//     legacy rule it replaces: it would have removed F-057's protection AND
+			//     weakened upstream's. Do not resurrect it.
+			//
+			// This is gate-1-able and introduces NO new height constant: a third gate is
+			// never permitted, so this had to be decided before the restart, and it was.
+			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+				if int64(t.parameters.TimeStamp)-lastBlockTime <
+					noBlockTime+blockchain.MaxTimeOffsetSeconds {
+					return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid block time")), true
+				}
+			} else {
+				if int64(t.parameters.TimeStamp)-lastBlockTime < noBlockTime {
+					return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid block time")), true
+				}
 			}
 		}
 	case payload.NoProducers:

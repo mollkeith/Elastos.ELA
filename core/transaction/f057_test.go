@@ -8,6 +8,7 @@ package transaction
 import (
 	"time"
 
+	"github.com/elastos/Elastos.ELA/blockchain"
 	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/functions"
 	"github.com/elastos/Elastos.ELA/core/types/interfaces"
@@ -73,14 +74,23 @@ func (s *txValidatorTestSuite) f057BuildNoBlock(height, blockTs uint32) interfac
 //     protection AND weakening upstream's. It was measured over the retained chain rather
 //     than assumed; see the batch report.
 //
-//   - WHAT REMAINS OPEN, stated rather than hidden. A producer able to mine a block can
-//     still claim a stall by future-dating its header, exactly as upstream allows.
-//     Closing that deterministically requires demanding a gap larger than a producer can
-//     forge (noBlockTime + MaxTimeOffsetSeconds), which doubles the emergency failsafe's
-//     latency from 2h to 4h. That is a consensus-policy decision for the owner, not a
-//     defect fix, and it is deliberately not taken here.
+//   - HOW F-057 IS CLOSED INSTEAD -- OPTION (b), DECIDED BY THE OWNER AND SHIPPED. At
+//     and above gate 1 the demanded gap is noBlockTime + MaxTimeOffsetSeconds: more than
+//     a producer can manufacture by post-dating its own header, so whatever it forges at
+//     least noBlockTime of REAL time must have passed since the parent. It is
+//     deterministic and ancestry-only (header timestamp minus PARENT timestamp, both
+//     consensus data), needs no third height, and consults no clock. Below the gate the
+//     legacy comparison is kept verbatim so retained history replays byte-identically.
+//     The accepted cost is failsafe latency 2h -> 4h; the measured cost over the retained
+//     chain is that 28 of the 29 historical NoBlock rescues would have had to wait
+//     between 1h53m27s and 1h59m48s longer (all 30 historical RevertToPOW transactions
+//     sit at heights 1184559..2129088, i.e. entirely below gate 1, so no retained block
+//     changes verdict).
 //
-// What IS asserted below is the determinism contract that replaced it.
+// What IS asserted below is the determinism contract plus the option-(b) threshold. The
+// forgery itself is proven rejected through the PRODUCTION BLOCK PATH in
+// blockchain/fv22_prevblock_test.go (TestFV22OptionBRejectsTheForgedStall); these are
+// the unit-level companions.
 
 // f057BuildNoBlockFromParent is f057BuildNoBlock with the parent of the block under
 // validation made explicit -- the FV-22 change-1 input.
@@ -120,14 +130,25 @@ func (s *txValidatorTestSuite) f057BuildNoBlockFromParent(
 //
 //  1. the verdict is a function of the block's OWN parent, not the validating node's tip
 //  2. the verdict does not move when the node's clock moves
-//  3. the verdict is the same above and below gate 1 (no acceptance discontinuity)
+//  3. gate 1 moves the THRESHOLD (option (b)) and nothing else: below the gate the
+//     legacy noBlockTime, at/above it noBlockTime+MaxTimeOffsetSeconds, and the rule
+//     does not move a second time above the gate
 //
 // MUTATION PROOF: re-add the MedianAdjustedTime condition at/above the gate and (2)
-// and (3) fail; make lastBlockTime read BestChain.Timestamp again and (1) fails.
+// fails; make lastBlockTime read BestChain.Timestamp again and (1) fails; revert the
+// option-(b) hunk and (3) fails.
 func (s *txValidatorTestSuite) TestFV22NoBlockRevertIsDeterministic() {
 	params := s.Chain.GetParams()
 	gate := params.StrictMoneyRangeHeight
 	noBlockTime := uint32(params.DPoSConfiguration.RevertToPOWNoBlockTimeV1)
+	// f057Demanded is the gap the production rule demands at a height: the legacy value
+	// below gate 1, the option-(b) value at and above it.
+	f057Demanded := func(h uint32) uint32 {
+		if h >= gate {
+			return noBlockTime + uint32(blockchain.MaxTimeOffsetSeconds)
+		}
+		return noBlockTime
+	}
 
 	origHeight := s.Chain.BestChain.Height
 	origTs := s.Chain.BestChain.Timestamp
@@ -150,14 +171,14 @@ func (s *txValidatorTestSuite) TestFV22NoBlockRevertIsDeterministic() {
 		s.Chain.MedianTimePast = time.Unix(1, 0)
 
 		// Node tip says NO time elapsed; the block's own parent says a full interval did.
-		s.Chain.BestChain.Timestamp = base + noBlockTime
-		err, end := s.f057BuildNoBlockFromParent(h, base+noBlockTime, base).SpecialContextCheck()
+		s.Chain.BestChain.Timestamp = base + f057Demanded(h)
+		err, end := s.f057BuildNoBlockFromParent(h, base+f057Demanded(h), base).SpecialContextCheck()
 		s.True(end, "RevertToPOW check must be terminal")
 		s.NoError(err, "FV-22: the no-block interval must be measured against the "+
 			"block's OWN parent, not the validating node's tip; height=%d", h)
 
 		// Node tip says a full interval elapsed; the block's own parent says none did.
-		s.Chain.BestChain.Timestamp = base - noBlockTime
+		s.Chain.BestChain.Timestamp = base - f057Demanded(h)
 		err, _ = s.f057BuildNoBlockFromParent(h, base+100, base).SpecialContextCheck()
 		s.Error(err, "FV-22: a revert with no genuine gap against its OWN parent must "+
 			"be rejected however old the validating node's unrelated tip is; height=%d", h)
@@ -170,11 +191,11 @@ func (s *txValidatorTestSuite) TestFV22NoBlockRevertIsDeterministic() {
 		var first bool
 		for i, floor := range []time.Time{
 			time.Unix(1, 0),
-			time.Unix(int64(base)+int64(noBlockTime)+1, 0),
+			time.Unix(int64(base)+int64(f057Demanded(h))+1, 0),
 			time.Unix(int64(base), 0),
 		} {
 			s.Chain.MedianTimePast = floor
-			err, _ := s.f057BuildNoBlockFromParent(h, base+noBlockTime, base).SpecialContextCheck()
+			err, _ := s.f057BuildNoBlockFromParent(h, base+f057Demanded(h), base).SpecialContextCheck()
 			if i == 0 {
 				first = err == nil
 				s.NoError(err, "FV-22: a genuine gap against the parent must be accepted "+
@@ -186,26 +207,41 @@ func (s *txValidatorTestSuite) TestFV22NoBlockRevertIsDeterministic() {
 		}
 	}
 
-	// ---- 3. no acceptance discontinuity at gate 1 ----
+	// ---- 3. gate 1 moves the THRESHOLD, exactly once, in exactly one direction ----
+	optB := noBlockTime + uint32(blockchain.MaxTimeOffsetSeconds)
 	s.Chain.MedianTimePast = time.Unix(1, 0)
-	for _, delta := range []uint32{noBlockTime, noBlockTime - 1, 10 * noBlockTime} {
+	for _, c := range []struct {
+		delta         uint32
+		wantBelow     bool
+		wantAtOrAbove bool
+	}{
+		{noBlockTime - 1, false, false},
+		{noBlockTime, true, false}, // the forgeable band opens here ...
+		{optB - 1, true, false},    // ... and closes here
+		{optB, true, true},
+		{10 * optB, true, true},
+	} {
 		var verdicts []bool
 		for _, h := range []uint32{gate - 1, gate, gate + 1} {
 			s.Chain.BestChain.Height = h
 			s.Chain.BestChain.Timestamp = base
-			err, _ := s.f057BuildNoBlockFromParent(h, base+delta, base).SpecialContextCheck()
+			err, _ := s.f057BuildNoBlockFromParent(h, base+c.delta, base).SpecialContextCheck()
 			verdicts = append(verdicts, err == nil)
 		}
-		s.Equal(verdicts[0], verdicts[1], "gate-1 discontinuity re-introduced; delta=%d", delta)
-		s.Equal(verdicts[1], verdicts[2], "gate-1 discontinuity re-introduced; delta=%d", delta)
+		s.Equal(c.wantBelow, verdicts[0], "below gate 1 the legacy comparison must be "+
+			"unchanged (retained history replays byte-identically); delta=%d", c.delta)
+		s.Equal(c.wantAtOrAbove, verdicts[1], "at gate 1 option (b) must demand "+
+			"noBlockTime+MaxTimeOffsetSeconds; delta=%d", c.delta)
+		s.Equal(verdicts[1], verdicts[2], "the rule must not move a SECOND time above "+
+			"gate 1 — a third activation height has appeared; delta=%d", c.delta)
 	}
 
 	// ---- 4. positive control: the deterministic threshold still bites ----
 	for _, h := range heights {
 		s.Chain.BestChain.Height = h
 		s.Chain.BestChain.Timestamp = base
-		err, _ := s.f057BuildNoBlockFromParent(h, base+noBlockTime-1, base).SpecialContextCheck()
-		s.Error(err, "a gap one second short of noBlockTime must still be rejected — the "+
+		err, _ := s.f057BuildNoBlockFromParent(h, base+f057Demanded(h)-1, base).SpecialContextCheck()
+		s.Error(err, "a gap one second short of the demanded threshold must still be rejected — the "+
 			"condition must be deterministic, not absent; height=%d", h)
 		if err != nil {
 			s.Contains(err.Error(), "invalid block time")
@@ -218,7 +254,9 @@ func (s *txValidatorTestSuite) TestFV22NoBlockRevertIsDeterministic() {
 // supplies one) still gets exactly the previous behaviour.
 func (s *txValidatorTestSuite) TestFV22FallsBackToBestChainWhenNoParentSupplied() {
 	params := s.Chain.GetParams()
-	noBlockTime := uint32(params.DPoSConfiguration.RevertToPOWNoBlockTimeV1)
+	// h is at gate 1, so the demanded gap is the option-(b) threshold.
+	noBlockTime := uint32(params.DPoSConfiguration.RevertToPOWNoBlockTimeV1) +
+		uint32(blockchain.MaxTimeOffsetSeconds)
 	h := params.StrictMoneyRangeHeight
 
 	origHeight := s.Chain.BestChain.Height

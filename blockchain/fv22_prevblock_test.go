@@ -14,6 +14,11 @@
 //	change 2 (gate 1)   F-057 additionally consulted the node's peer-adjusted WALL
 //	                    CLOCK (MedianAdjustedTime). Two honest nodes with identical
 //	                    chain state and different peer sets could disagree. Withdrawn.
+//	change 3 (gate 1)   OPTION (b), the owner's decision: withdrawing change 2 re-opened
+//	                    F-057, so at/above gate 1 the demanded gap is now
+//	                    noBlockTime + MaxTimeOffsetSeconds — more than a producer can
+//	                    forge by post-dating its own header. Deterministic and
+//	                    ancestry-only; costs failsafe latency 2h -> 4h.
 //
 // These tests drive the PRODUCTION function that owns the call site,
 // (*BlockChain).checkTxsContext — the same function CheckBlockContext calls on every
@@ -21,13 +26,19 @@
 // about the decision is re-implemented here; the only inputs varied are the parent
 // timestamp, the block timestamp, the node's best tip and the node's clock floor.
 //
-// FAIL-ON-PRISTINE, both halves:
+// FAIL-ON-PRISTINE, all three halves:
 //   - change 1: at pristine HEAD the verdict follows BestChain, so every case below
 //     where parent and tip disagree comes out inverted.
 //   - change 2: at pristine HEAD, at/above gate 1, a block whose timestamps sit in the
 //     future is REJECTED however genuine the stall, because the node's clock has not
 //     reached them — and the same inputs yield a DIFFERENT verdict once the clock floor
 //     moves. Both assertions are made explicitly.
+//   - change 3: revert the option-(b) hunk and TestFV22OptionBRejectsTheForgedStall
+//     fails at/above gate 1 with the forged block ACCEPTED — which is F-057 live.
+//     DELETE the production call site instead (the SpecialContextCheck call in
+//     core/transaction/transactionchecker.go ContextCheck, or the
+//     CheckTransactionContextWithPrev call in checkTxsContext) and it still fails,
+//     because these tests enter through the block path, not through the check.
 package blockchain
 
 import (
@@ -122,9 +133,20 @@ func fv22Verdict(t *testing.T, b *BlockChain, height, parentTs, blockTs, bestTs 
 	return false, err.Error()
 }
 
-// fv22NoBlockTime is RevertToPOWNoBlockTimeV1 (2h) — the threshold in force at every
-// height used here (all above ChangeViewV1Height).
+// fv22NoBlockTime is RevertToPOWNoBlockTimeV1 (2h) — the legacy threshold, in force at
+// every height used here (all above ChangeViewV1Height) BELOW gate 1.
 const fv22NoBlockTime = uint32(2 * 3600)
+
+// fv22Threshold is the gap the production rule demands at `height`: the legacy
+// noBlockTime below gate 1, and the option-(b) noBlockTime + MaxTimeOffsetSeconds at
+// and above it. Written from the two source constants, not from a literal, so a change
+// to either constant moves the tests with the production rule.
+func fv22Threshold(height uint32) uint32 {
+	if height >= wiringGate {
+		return fv22NoBlockTime + uint32(MaxTimeOffsetSeconds)
+	}
+	return fv22NoBlockTime
+}
 
 // TestFV22NoBlockRevertBindsToTheBlocksOwnParent is the change-1 proof, run in BOTH
 // directions so neither outcome can be produced by an accident of the fixture, and at
@@ -142,7 +164,7 @@ func TestFV22NoBlockRevertBindsToTheBlocksOwnParent(t *testing.T) {
 	for _, h := range []uint32{wiringBelowGate, wiringGate, wiringGate + 1, 3_000_000} {
 		// Direction 1: the PARENT says a full no-block interval elapsed; the node's own
 		// tip says none did. Binding to the parent must ACCEPT.
-		ok, msg := fv22Verdict(t, b, h, base, base+fv22NoBlockTime, base+fv22NoBlockTime)
+		ok, msg := fv22Verdict(t, b, h, base, base+fv22Threshold(h), base+fv22Threshold(h))
 		if !ok {
 			t.Fatalf("FV-22 UNWIRED at height %d: the no-block interval is measured "+
 				"against the validating node's tip, not the block's own parent "+
@@ -151,7 +173,7 @@ func TestFV22NoBlockRevertBindsToTheBlocksOwnParent(t *testing.T) {
 
 		// Direction 2: the PARENT says almost no time elapsed; the node's own tip says a
 		// full interval did. Binding to the parent must REJECT.
-		ok, _ = fv22Verdict(t, b, h, base, base+100, base-fv22NoBlockTime)
+		ok, _ = fv22Verdict(t, b, h, base, base+100, base-fv22Threshold(h))
 		if ok {
 			t.Fatalf("FV-22 UNWIRED at height %d: a RevertToPOW with no genuine gap "+
 				"against its OWN parent was accepted because the validating node's "+
@@ -182,7 +204,8 @@ func TestFV22NoBlockRevertIsIndependentOfTheNodeClock(t *testing.T) {
 		floor time.Time
 	}{
 		{"node clock far behind the block timestamps", time.Unix(1, 0)},
-		{"node clock past the block timestamps", time.Unix(int64(base)+int64(fv22NoBlockTime)+1, 0)},
+		{"node clock past the block timestamps",
+			time.Unix(int64(base)+int64(fv22NoBlockTime)+int64(MaxTimeOffsetSeconds)+1, 0)},
 		{"node clock at the parent", time.Unix(int64(base), 0)},
 	}
 
@@ -190,7 +213,7 @@ func TestFV22NoBlockRevertIsIndependentOfTheNodeClock(t *testing.T) {
 		var first bool
 		for i, cs := range clockStates {
 			b.MedianTimePast = cs.floor
-			ok, msg := fv22Verdict(t, b, h, base, base+fv22NoBlockTime, base)
+			ok, msg := fv22Verdict(t, b, h, base, base+fv22Threshold(h), base)
 			if i == 0 {
 				first = ok
 				if !ok {
@@ -211,53 +234,213 @@ func TestFV22NoBlockRevertIsIndependentOfTheNodeClock(t *testing.T) {
 	b.MedianTimePast = time.Time{}
 }
 
-// TestFV22GateOneIsNoLongerADiscontinuity records the shipped contract: after the
-// withdrawal the NoBlock rule is the SAME rule above and below gate 1, so no
-// coordinated activation is needed for it and no third gate exists. A future change
-// that re-introduces a gate-1-only leg makes this fail.
-func TestFV22GateOneIsNoLongerADiscontinuity(t *testing.T) {
+// TestFV22OptionBGateOneDiscontinuityIsExactlyTheIntendedOne pins the ONE behavioural
+// step option (b) introduces at gate 1 — no more and no less.
+//
+// Below the gate the legacy rule must be untouched (retained history replays
+// byte-identically); at and above it the demanded gap is noBlockTime +
+// MaxTimeOffsetSeconds. The band in between — a gap that clears noBlockTime but not
+// noBlockTime+MaxTimeOffsetSeconds — is the forgeable band, and it is precisely where
+// the two verdicts must differ. Everything outside that band must still agree, so a
+// sloppier gate (e.g. one that also moved the rule for gaps that already cleared both
+// thresholds) fails here.
+func TestFV22OptionBGateOneDiscontinuityIsExactlyTheIntendedOne(t *testing.T) {
 	b := fv22Chain(t)
 	base := uint32(time.Now().Unix()) + 3_000_000
+	optB := fv22NoBlockTime + uint32(MaxTimeOffsetSeconds)
 
 	for _, c := range []struct {
-		name     string
-		parentTs uint32
-		blockTs  uint32
+		name          string
+		gap           uint32
+		wantBelow     bool
+		wantAtOrAbove bool
 	}{
-		{"gap exactly at the threshold", base, base + fv22NoBlockTime},
-		{"gap one second short", base, base + fv22NoBlockTime - 1},
-		{"gap far beyond the threshold", base, base + 10*fv22NoBlockTime},
+		{"gap one second short of the legacy threshold", fv22NoBlockTime - 1, false, false},
+		{"gap exactly at the legacy threshold", fv22NoBlockTime, true, false},
+		{"gap inside the forgeable band", fv22NoBlockTime + uint32(MaxTimeOffsetSeconds)/2, true, false},
+		{"gap one second short of the option-(b) threshold", optB - 1, true, false},
+		{"gap exactly at the option-(b) threshold", optB, true, true},
+		{"gap far beyond both thresholds", 10 * fv22NoBlockTime, true, true},
 	} {
-		below, _ := fv22Verdict(t, b, wiringBelowGate, c.parentTs, c.blockTs, c.parentTs)
-		at, _ := fv22Verdict(t, b, wiringGate, c.parentTs, c.blockTs, c.parentTs)
-		above, _ := fv22Verdict(t, b, wiringGate+500_000, c.parentTs, c.blockTs, c.parentTs)
-		if below != at || at != above {
-			t.Fatalf("%s: the NoBlock rule is not gate-uniform (below=%v at=%v above=%v) — "+
-				"an acceptance discontinuity has been re-introduced at gate 1",
-				c.name, below, at, above)
+		below, belowMsg := fv22Verdict(t, b, wiringBelowGate, base, base+c.gap, base)
+		at, atMsg := fv22Verdict(t, b, wiringGate, base, base+c.gap, base)
+		above, _ := fv22Verdict(t, b, wiringGate+500_000, base, base+c.gap, base)
+
+		if below != c.wantBelow {
+			t.Fatalf("%s: BELOW gate 1 the legacy rule must be untouched — want accept=%v, "+
+				"got accept=%v (%s). Retained history no longer replays byte-identically.",
+				c.name, c.wantBelow, below, belowMsg)
+		}
+		if at != c.wantAtOrAbove {
+			t.Fatalf("%s: AT gate 1 option (b) must demand noBlockTime+MaxTimeOffsetSeconds — "+
+				"want accept=%v, got accept=%v (%s)", c.name, c.wantAtOrAbove, at, atMsg)
+		}
+		if above != at {
+			t.Fatalf("%s: the rule must not move again above gate 1 (at=%v above=%v) — "+
+				"a second activation height has appeared", c.name, at, above)
+		}
+	}
+}
+
+// TestFV22OptionBRejectsTheForgedStall is the F-057 fail-on-pristine proof, driven
+// through the production block path.
+//
+// THE FORGERY. RevertToPOWNoBlockTimeV1 (7200s) EQUALS MaxTimeOffsetSeconds (7200s),
+// and CheckBlockSanity only bounds a header at AdjustedTime+MaxTimeOffsetSeconds. So a
+// producer can post-date its own header by exactly MaxTimeOffsetSeconds and claim a
+// full stall with ZERO elapsed time since the parent. Below gate 1 that is upstream
+// behaviour and must still be ACCEPTED (retained history). At and above gate 1 option
+// (b) must REJECT it.
+//
+// MUTATION PROOF: revert the option-(b) hunk in
+// core/transaction/reverttopowtransaction.go and the at/above-gate cases below are
+// ACCEPTED — the assertion fails naming the exploit. DELETE the production call site
+// instead — the `SpecialContextCheck()` call in
+// core/transaction/transactionchecker.go ContextCheck, or the
+// `CheckTransactionContextWithPrev(prevNode, ...)` call in checkTxsContext — and it
+// STILL fails, because the forged block is submitted to the block path and every
+// no-block condition disappears with the call site.
+func TestFV22OptionBRejectsTheForgedStall(t *testing.T) {
+	b := fv22Chain(t)
+	// A healthy chain: the parent landed "just now", so ZERO real time has elapsed.
+	parentTs := uint32(time.Now().Unix())
+	// The most a producer can forge: the header is post-dated by the full sanity
+	// allowance. It lands exactly on the legacy threshold with no genuine stall.
+	forged := parentTs + uint32(MaxTimeOffsetSeconds)
+
+	for _, h := range []uint32{wiringGate, wiringGate + 1, 3_000_000} {
+		ok, _ := fv22Verdict(t, b, h, parentTs, forged, parentTs)
+		if ok {
+			t.Fatalf("F-057 LIVE at height %d: a RevertToPOW(NoBlock) block whose header is "+
+				"post-dated by MaxTimeOffsetSeconds (%d) over a parent that landed with ZERO "+
+				"elapsed time was ACCEPTED — a producer can force DPoS->POW at will",
+				h, MaxTimeOffsetSeconds)
+		}
+	}
+
+	// Below the gate the same forgery must still be accepted: that is what mainnet ran,
+	// and changing it would break replay of the retained chain.
+	for _, h := range []uint32{wiringBelowGate, wiringBelowGate - 100_000} {
+		if ok, msg := fv22Verdict(t, b, h, parentTs, forged, parentTs); !ok {
+			t.Fatalf("height %d is BELOW gate 1: the legacy comparison must be unchanged, "+
+				"but the block was rejected (%s) — retained history would no longer replay",
+				h, msg)
+		}
+	}
+}
+
+// TestFV22OptionBAcceptsAGenuineStall is the no-false-rejects control: option (b)
+// raises the bar, it does not remove the failsafe. A stall that genuinely exceeds the
+// new threshold must still be accepted at and above gate 1.
+func TestFV22OptionBAcceptsAGenuineStall(t *testing.T) {
+	b := fv22Chain(t)
+	base := uint32(time.Now().Unix()) + 3_000_000
+	optB := fv22NoBlockTime + uint32(MaxTimeOffsetSeconds)
+
+	for _, h := range []uint32{wiringGate, wiringGate + 1, 3_000_000} {
+		for _, gap := range []uint32{optB, optB + 1, optB + 3600, 10 * optB} {
+			if ok, msg := fv22Verdict(t, b, h, base, base+gap, base); !ok {
+				t.Fatalf("height %d: a genuine stall of %ds clears the option-(b) threshold "+
+					"(%ds) and must be ACCEPTED — the emergency failsafe has been disabled, "+
+					"not hardened: %s", h, gap, optB, msg)
+			}
 		}
 	}
 }
 
 // TestFV22ThresholdStillBites is the positive control for the whole file: the
-// deterministic condition that remains must still reject a block that does not clear
-// the no-block interval against its own parent, and accept one that does. Without this
-// a fix that simply deleted the check would satisfy every test above.
+// deterministic condition must still reject a block that does not clear the no-block
+// interval against its own parent, and accept one that does. Without this a fix that
+// simply deleted the check would satisfy every test above.
 func TestFV22ThresholdStillBites(t *testing.T) {
 	b := fv22Chain(t)
 	base := uint32(time.Now().Unix()) + 3_000_000
 
 	for _, h := range []uint32{wiringBelowGate, wiringGate, 3_000_000} {
-		if ok, msg := fv22Verdict(t, b, h, base, base+fv22NoBlockTime, base); !ok {
-			t.Fatalf("height %d: a gap of exactly noBlockTime must be accepted: %s", h, msg)
+		want := fv22Threshold(h)
+		if ok, msg := fv22Verdict(t, b, h, base, base+want, base); !ok {
+			t.Fatalf("height %d: a gap of exactly the demanded threshold (%d) must be "+
+				"accepted: %s", h, want, msg)
 		}
-		ok, msg := fv22Verdict(t, b, h, base, base+fv22NoBlockTime-1, base)
+		ok, msg := fv22Verdict(t, b, h, base, base+want-1, base)
 		if ok {
-			t.Fatalf("height %d: a gap one second short of noBlockTime must be REJECTED — "+
-				"the no-block condition has been removed, not made deterministic", h)
+			t.Fatalf("height %d: a gap one second short of the demanded threshold (%d) must "+
+				"be REJECTED — the no-block condition has been removed, not made "+
+				"deterministic", h, want)
 		}
 		if !strings.Contains(msg, "CheckTransactionContext failed when verify block") {
 			t.Fatalf("height %d: rejected for the wrong reason: %s", h, msg)
 		}
+	}
+}
+
+// fv22CountingTimeSource wraps a real MedianTimeSource and counts every read of the
+// node's clock. It is the instrument for the regression test below.
+type fv22CountingTimeSource struct {
+	MedianTimeSource
+	reads int
+}
+
+func (c *fv22CountingTimeSource) AdjustedTime() time.Time {
+	c.reads++
+	return c.MedianTimeSource.AdjustedTime()
+}
+
+// TestFV22OptionBConsultsNoNodeLocalTimeSource is the regression guard that makes the
+// F-057 mistake unreintroducible.
+//
+// The at/above-gate in-block decision must be a pure function of consensus data —
+// the block's header timestamp and its parent's timestamp. If ANY node-local clock is
+// consulted there, two honest nodes with identical chain state can disagree, which is
+// exactly why change 2 was withdrawn. The assertion is behavioural, not textual: the
+// node's own time source is replaced by a counting wrapper and the count must be zero
+// across the whole production block path.
+//
+// The counter is positive-controlled against the mempool-admission leg
+// (CheckTransactionContext with timeStamp == 0), which DELIBERATELY still uses local
+// time — a relay decision, not a block-acceptance decision. That leg must show reads,
+// which proves the instrument works and that a zero above is a real result rather than
+// a wrapper that never got installed.
+func TestFV22OptionBConsultsNoNodeLocalTimeSource(t *testing.T) {
+	b := fv22Chain(t)
+	counter := &fv22CountingTimeSource{MedianTimeSource: b.TimeSource}
+	b.TimeSource = counter
+
+	base := uint32(time.Now().Unix()) + 3_000_000
+	optB := fv22NoBlockTime + uint32(MaxTimeOffsetSeconds)
+
+	for _, h := range []uint32{wiringGate, wiringGate + 1, 3_000_000} {
+		for _, gap := range []uint32{0, fv22NoBlockTime, optB - 1, optB, 10 * optB} {
+			fv22Verdict(t, b, h, base, base+gap, base)
+		}
+	}
+	if counter.reads != 0 {
+		t.Fatalf("CLOCK IN CONSENSUS: the at/above-gate in-block RevertToPOW decision read "+
+			"the node's own time source %d times. F-057's withdrawn leg (or an equivalent) "+
+			"has been reintroduced: two honest nodes with identical chain state and "+
+			"different peer sets can now reach opposite verdicts on the same block",
+			counter.reads)
+	}
+
+	// Positive control: the mempool-admission leg (timeStamp == 0) is the production
+	// call the tx pool makes, and it is meant to consult local time.
+	b.BestChain = &BlockNode{Hash: &common.Uint256{0xAA}, Height: wiringGate - 1, Timestamp: base}
+	poolTx := functions.CreateTransaction(
+		common2.TxVersion09,
+		common2.RevertToPOW,
+		payload.RevertToPOWVersion,
+		&payload.RevertToPOW{Type: payload.NoBlock, WorkingHeight: wiringGate},
+		[]*common2.Attribute{},
+		[]*common2.Input{},
+		[]*common2.Output{},
+		0,
+		nil,
+	)
+	if _, err := b.CheckTransactionContext(wiringGate, poolTx, 0, 0); err == nil {
+		t.Fatal("fixture: the mempool leg was expected to reject this transaction")
+	}
+	if counter.reads == 0 {
+		t.Fatal("instrument broken: the counting time source recorded no reads even on the " +
+			"mempool leg, which does use local time — the zero above proves nothing")
 	}
 }
