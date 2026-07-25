@@ -9,9 +9,17 @@ GOAMD64 ?= v1
 export GOAMD64
 
 GOVER := $(shell go version)
-VERSION := $(shell git describe --abbrev=4 --dirty --always --tags)
-BUILD = go build -ldflags "-X main.Version=$(VERSION) -X 'main.GoVersion=$(GOVER)'"
 
+# The release version is NOT injected here. It is the compiled-in constant in
+# utils/version, so `ela --version` is a property of the SOURCE and not of the
+# builder's working copy. Stamping `git describe --dirty --always --tags` (what
+# stood here) made the release binary's bytes depend on which tags the builder
+# had fetched and on whether its tree was dirty, which defeats `repro-check`
+# across machines and makes an exported tarball report the empty string.
+BUILD = go build -ldflags "-X 'main.GoVersion=$(GOVER)'"
+
+# A DEVELOPMENT build is deliberately still stamped from git, so a binary built
+# off a feature branch is self-identifying and cannot be mistaken for a release.
 DEV_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 DEV_VERSION := $(shell git rev-list HEAD -n 1 | cut -c 1-8)
 DEV_BUILD = go build -ldflags "-X main.Version=$(DEV_BRANCH)-$(DEV_VERSION) -X 'main.GoVersion=$(GOVER)'" #-race

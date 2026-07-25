@@ -20,11 +20,14 @@ import (
 	"github.com/elastos/Elastos.ELA/common/config"
 	transaction2 "github.com/elastos/Elastos.ELA/core/transaction"
 	"github.com/elastos/Elastos.ELA/core/types/functions"
+	"github.com/elastos/Elastos.ELA/utils/version"
 
 	"github.com/urfave/cli"
 )
 
-var Version string
+// Version is reported by `ela-cli --version`. Same source of truth as the
+// node: the constant in utils/version, overridable by -ldflags for dev builds.
+var Version = version.Version
 
 func main() {
 	initFunctions()

@@ -20,6 +20,7 @@ import (
 	"github.com/elastos/Elastos.ELA/p2p/server"
 	"github.com/elastos/Elastos.ELA/utils/elalog"
 	"github.com/elastos/Elastos.ELA/utils/signal"
+	"github.com/elastos/Elastos.ELA/utils/version"
 )
 
 const (
@@ -37,8 +38,10 @@ const (
 )
 
 var (
-	// Build version generated when build program.
-	Version string
+	// Version is reported by `ela-dns -v` and advertised as the DNS seeder's
+	// P2P user agent (nodePrefix+Version). Same source of truth as the node:
+	// the constant in utils/version, overridable by -ldflags for dev builds.
+	Version = version.Version
 
 	// The go source code version at build.
 	GoVersion string

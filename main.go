@@ -43,6 +43,7 @@ import (
 	"github.com/elastos/Elastos.ELA/utils"
 	"github.com/elastos/Elastos.ELA/utils/elalog"
 	"github.com/elastos/Elastos.ELA/utils/signal"
+	"github.com/elastos/Elastos.ELA/utils/version"
 )
 
 const (
@@ -60,8 +61,15 @@ const (
 )
 
 var (
-	// Version generated when build program.
-	Version string
+	// Version is the node version reported by `ela --version`, the startup
+	// banner, the P2P user agent (nodePrefix+Version) and the RPC "compile"
+	// field. The authoritative value is the compiled-in constant in
+	// utils/version, so a binary built from an exported tarball reports the
+	// same version as one built from the repository and the release build is
+	// not a function of the builder's git metadata. The Makefile's `dev`
+	// target still overrides it with -ldflags -X main.Version=<branch>-<sha>
+	// so a development build is self-identifying.
+	Version = version.Version
 
 	// GoVersion version at build.
 	GoVersion string
