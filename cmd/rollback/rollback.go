@@ -74,7 +74,11 @@ func resolveDataDir(c *cli.Context, cfg *config.Configuration) string {
 	if cfg != nil && cfg.DataDir != "" {
 		flagDataDir = cfg.DataDir
 	}
-	if c != nil && c.String("datadir") != "" {
+	// c.IsSet, NOT c.String != "": cmdcom.DataDirFlag is declared with
+	// Value: config.DataDir, so c.String("datadir") is NEVER empty and the flag
+	// DEFAULT would silently shadow a configured DataDir. IsSet is true only when
+	// the operator actually named the flag.
+	if c != nil && c.IsSet("datadir") {
 		flagDataDir = c.String("datadir")
 	}
 	return filepath.Join(flagDataDir, dataPath)
