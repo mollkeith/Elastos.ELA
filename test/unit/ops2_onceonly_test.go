@@ -174,6 +174,11 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 		// too weak an assertion: it passes for any output at all, including the
 		// wrong cell's message.
 		wantPhrase string
+		// wantRefusalPhrase is the same requirement for a cell that REFUSES. A
+		// refusal is returned rather than printed here; in production every one of
+		// them reaches the operator through main.go's printErrorAndExit, which the
+		// root package's ops2_fatal_test.go proves is audible at every print level.
+		wantRefusalPhrase string
 	}
 
 	rows := []row{
@@ -263,6 +268,59 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 			},
 			wantArmed: false, wantRefused: false, wantLoud: false,
 		},
+		{
+			// The band 48/48 rehearsal nodes landed in: too far past the target for
+			// the incremental rewind. It must refuse rather than boot on the removed
+			// chain, and the refusal must not prescribe a disarm mainnet discards.
+			name: "G/holds-the-removed-chain/beyond-the-rewind-window",
+			setup: func(t *testing.T) (string, *config.Configuration) {
+				dir := t.TempDir()
+				p := t1Params(target)
+				t1BuildChain(t, dir, p, target+b1b5CapacityDepth)
+				return dir, p
+			},
+			wantArmed: true, wantRefused: true, wantLoud: true,
+			wantRefusalPhrase: "NO disarm on mainnet",
+		},
+		{
+			// The typo cell: a trigger naming a healthy block at another height.
+			name: "H/healthy-store/trigger-names-the-wrong-block",
+			setup: func(t *testing.T) (string, *config.Configuration) {
+				dir := t.TempDir()
+				p := t1Params(target)
+				hashes := t1BuildChain(t, dir, p, target+3)
+				p.ForcedRollbackTrigger = hashes[target+3].ReversedString()
+				return dir, p
+			},
+			wantArmed: false, wantRefused: true, wantLoud: false,
+			wantRefusalPhrase: "CONFIGURATION ERROR",
+		},
+		{
+			// The disarm trap: a rewind started, did not finish, and the operator
+			// then removed the trigger. Starting here is how a node rejoins on the
+			// removed chain unnoticed, so it must refuse.
+			name: "I/interrupted-rewind/operator-then-disarmed",
+			setup: func(t *testing.T) (string, *config.Configuration) {
+				dir := t.TempDir()
+				p := t1Params(target)
+				t1BuildChain(t, dir, p, target+3)
+				func() {
+					chain, store := t1Open(t, dir, p, nil, nil)
+					defer t1Close(store)
+					stop := make(chan struct{})
+					close(stop)
+					if err := chain.ForceRollback(stop); err == nil {
+						t.Fatal("harness is wrong: the rewind was not interrupted")
+					}
+				}()
+				disarmed := t1Params(target)
+				disarmed.ForcedRollbackTrigger = ""
+				disarmed.ForcedRollbackHeight = config.DisabledForcedRollbackHeight
+				return dir, disarmed
+			},
+			wantArmed: false, wantRefused: true, wantLoud: false,
+			wantRefusalPhrase: "in-progress rollback this node is not configured to finish",
+		},
 	}
 
 	var table strings.Builder
@@ -292,6 +350,14 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 			if r.wantPhrase != "" && !strings.Contains(b.Stderr, r.wantPhrase) {
 				t.Errorf("this cell did not make its statement (%q missing); "+
 					"stderr was:\n%s", r.wantPhrase, b.Stderr)
+			}
+			if r.wantRefusalPhrase != "" {
+				if b.Refused == nil {
+					t.Errorf("this cell must refuse with %q", r.wantRefusalPhrase)
+				} else if !strings.Contains(b.Refused.Error(), r.wantRefusalPhrase) {
+					t.Errorf("the refusal does not say %q; it said:\n%v",
+						r.wantRefusalPhrase, b.Refused)
+				}
 			}
 		})
 	}
