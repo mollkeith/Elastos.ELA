@@ -28,3 +28,7 @@ ela-dns
 
 # checkpoint dir created by pow package tests
 cp_txPool/
+
+# macOS AppleDouble resource forks
+._*
+.DS_Store
