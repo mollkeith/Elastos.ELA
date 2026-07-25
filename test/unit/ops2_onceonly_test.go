@@ -170,6 +170,10 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 		// is neither armed nor refused nor loud is a silent cell, and a silent cell
 		// on a one-shot destructive operation is the defect this file exists for.
 		wantLoud bool
+		// wantPhrase is the statement this cell must actually make. "Loud" alone is
+		// too weak an assertion: it passes for any output at all, including the
+		// wrong cell's message.
+		wantPhrase string
 	}
 
 	rows := []row{
@@ -182,6 +186,7 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 				return dir, p
 			},
 			wantArmed: true, wantRefused: false, wantLoud: true,
+			wantPhrase: "rewinding chain store from height",
 		},
 		{
 			name: "B/already-rewound/sitting-at-target",
@@ -193,6 +198,7 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 				return dir, p
 			},
 			wantArmed: false, wantRefused: false, wantLoud: true,
+			wantPhrase: "nothing to roll back on this node",
 		},
 		{
 			name: "C/already-rewound/moved-forward-on-the-recovered-chain",
@@ -211,6 +217,7 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 				return dir, p
 			},
 			wantArmed: false, wantRefused: false, wantLoud: true,
+			wantPhrase: "ALREADY APPLIED",
 		},
 		{
 			name: "D/fresh-node-below-the-target",
@@ -227,6 +234,7 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 				return dir, p
 			},
 			wantArmed: false, wantRefused: false, wantLoud: true,
+			wantPhrase: "nothing to roll back on this node",
 		},
 		{
 			name: "E/old-backup-restored-after-the-restart",
@@ -241,6 +249,7 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 				return dir, p
 			},
 			wantArmed: true, wantRefused: false, wantLoud: true,
+			wantPhrase: "rewinding chain store from height",
 		},
 		{
 			name: "F/holds-the-removed-chain/rollback-not-configured",
@@ -279,6 +288,10 @@ func TestOps2OnceOnlyTruthTable(t *testing.T) {
 			}
 			if loud != r.wantLoud {
 				t.Errorf("loud=%v want %v; stderr was:\n%s", loud, r.wantLoud, b.Stderr)
+			}
+			if r.wantPhrase != "" && !strings.Contains(b.Stderr, r.wantPhrase) {
+				t.Errorf("this cell did not make its statement (%q missing); "+
+					"stderr was:\n%s", r.wantPhrase, b.Stderr)
 			}
 		})
 	}

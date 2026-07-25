@@ -170,3 +170,44 @@ func TestOps2CorrectTriggerStillDiagnosesRealStoreDamage(t *testing.T) {
 		t.Errorf("the real, correct destructive remedy was lost: %v", verr)
 	}
 }
+
+// TestOps2WrongHeightTriggerWithNoBodyIsStillAConfigError closes the one shape the
+// two tests above cannot reach: a trigger naming a main-chain block whose BODY is no
+// longer in the store.
+//
+// It matters because it is the only shape in which the main-chain index is the ONLY
+// source of the trigger's real height -- with the body present the store's own header
+// answers the same question. Without that source the boot falls through to the
+// un-applied-rollback diagnosis and prescribes wipe-and-resync for a typo again.
+func TestOps2WrongHeightTriggerWithNoBodyIsStillAConfigError(t *testing.T) {
+	const target = uint32(5)
+	dir := t.TempDir()
+	params := t1Params(target)
+	hashes := t1BuildChain(t, dir, params, target+3)
+
+	// A healthy main-chain block well BELOW the target, so nothing about it is
+	// residue -- it is simply not the block the rollback is about.
+	wrong := hashes[2]
+	params.ForcedRollbackTrigger = wrong.ReversedString()
+
+	chain, store := t1Open(t, dir, params, nil, nil)
+	defer t1Close(store)
+
+	if err := chain.GetDB().GetFFLDB().DeleteBlockFromStore(wrong); err != nil {
+		t.Fatalf("remove the block body: %v", err)
+	}
+
+	verr := chain.VerifyForcedRollbackApplied()
+	if verr == nil {
+		t.Fatal("a trigger that names the wrong block must not be accepted silently")
+	}
+	ops2RequireNonDestructive(t, verr.Error())
+	if !strings.Contains(strings.ToLower(verr.Error()), "configur") {
+		t.Errorf("the diagnosis does not tell the operator this is a configuration "+
+			"problem.\nfull message:\n%s", verr.Error())
+	}
+	if !strings.Contains(verr.Error(), "height 2") {
+		t.Errorf("the message never names the height that block really sits at.\n"+
+			"full message:\n%s", verr.Error())
+	}
+}

@@ -86,3 +86,47 @@ func TestOps2PrintErrorAndExitIsAudibleAtEveryLevel(t *testing.T) {
 			"stderr was: %q\nstdout was: %q", stderr.String(), stdout.String())
 	}
 }
+
+// TestOps2MainForcedRollbackLinesUseTheOperatorChannel is a STRUCTURAL assertion over
+// main.go, and it is labelled as one.
+//
+// main.go emits three lines of its own on the forced-rollback path: the ARMED
+// announcement, the configured-vs-actual trigger diagnostic and the post-rebuild
+// baseline confirmation. Reaching them behaviourally means running startNode, which
+// opens stores, binds ports and blocks; the OPS2 suite instead replays that sequence
+// against the production blockchain entry points, and so cannot see which channel
+// main.go itself used. This closes that gap the only cheap way there is: by reading
+// the source.
+//
+// What it can prove: the call was not reverted to the level-filtered channel. What it
+// cannot prove: that the call is reached. The behavioural half of item 1 -- that the
+// channel works at any print level, and that printErrorAndExit uses it -- is proven
+// above and in common/log.
+func TestOps2MainForcedRollbackLinesUseTheOperatorChannel(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	text := string(src)
+
+	for _, want := range []string{
+		`log.Operatorf("FORCED ROLLBACK: ARMED`,
+		`log.Operatorf("forced rollback trigger check`,
+		`log.Operatorf("forced rollback: post-rebuild baseline OK`,
+		"log.OperatorError(err)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("main.go no longer emits %q through the operator channel, so this "+
+				"line is invisible on a node at PrintLevel 3 or above", want)
+		}
+	}
+	// Nothing on this path may go back to the level-filtered channel.
+	for _, forbidden := range []string{
+		`log.Warnf("FORCED ROLLBACK`,
+		`log.Warnf("forced rollback`,
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("main.go emits %q through the level-filtered channel", forbidden)
+		}
+	}
+}
