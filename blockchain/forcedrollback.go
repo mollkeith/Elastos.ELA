@@ -110,12 +110,19 @@ var ErrForcedRollbackInterrupted = errors.New("forced rollback interrupted by op
 // forcedRollbackMarkerKeyName is the ffldb metadata key holding the durable
 // "a forced rollback is in progress" marker.
 //
-// The marker is a DIAGNOSTIC, not the correctness mechanism. Correctness rests on
-// the per-block ordering (a block's header-index row is deleted only after all of
-// its destructive work is durably committed) and on the phase probe, both of which
-// work on a store written by the SHIPPED binary, which never wrote a marker. The
-// marker's job is to make an interrupted rewind self-describing in the logs and to
-// let the node say "resuming" rather than silently starting over.
+// The marker is not what makes the rewind CORRECT. That rests on the per-block
+// ordering (a block's header-index row is deleted only after all of its destructive
+// work is durably committed) and on the phase probe, both of which work on a store
+// written by the SHIPPED binary, which never wrote a marker.
+//
+// It is, however, load-bearing for one thing, and that is why it is written and
+// FLUSHED before the first destructive step and retired only after the completed
+// rewind is on disk (see writeForcedRollbackMarker and ForceRollback): its survival
+// is the only durable evidence that a rewind was started and did not report
+// finishing. CheckAbandonedForcedRollback refuses to start a node on that evidence
+// when the operator has disarmed the trigger -- the boot on which every other check
+// here declines. Treating the marker as a pure diagnostic, as this comment once did,
+// is what left that boot unguarded.
 var forcedRollbackMarkerKeyName = []byte("forcedrollbackinprogress")
 
 // forcedRollbackMarkerVersion prefixes the marker so its layout can change.
@@ -131,6 +138,24 @@ type ForcedRollbackMarker struct {
 	// Start is the tip height the rewind began from, so progress can be reported
 	// across restarts.
 	Start uint32
+}
+
+// flushStore makes everything the rewind has written so far durable, so that the
+// next statement about the store -- a census, a log line an operator acts on, or the
+// clearing of the in-progress marker -- describes disk rather than the ffldb write
+// cache. `what` names the work being made durable, for the error message.
+//
+// It is deliberately explicit at each call site rather than hidden inside the write
+// helpers: the rewind commits many small transactions, and flushing every one would
+// turn a 145-block mainnet rewind into 145 leveldb table writes without buying any
+// correctness -- the per-block ordering already makes an interrupted rewind resumable
+// whatever has reached disk. What matters is that a flush has run before anything
+// CLAIMS the work is done.
+func (b *BlockChain) flushStore(what string) error {
+	if err := b.db.GetFFLDB().FlushCache(); err != nil {
+		return fmt.Errorf("forced rollback: flush %s to disk: %w", what, err)
+	}
+	return nil
 }
 
 // ReadForcedRollbackMarker returns the durable in-progress marker, or nil.
@@ -154,15 +179,25 @@ func (b *BlockChain) ReadForcedRollbackMarker() (*ForcedRollbackMarker, error) {
 	return marker, err
 }
 
-// writeForcedRollbackMarker records that a rewind is under way.
+// writeForcedRollbackMarker records that a rewind is under way, DURABLY.
+//
+// The flush is what makes the marker worth anything across a crash. A marker that is
+// only in the ffldb write cache disappears in exactly the crash it is meant to
+// describe, and a node whose rewind was lost with it then comes back looking like a
+// node that never started one -- which is what an operator who has disarmed the
+// trigger is left holding. Written and flushed before the first destructive step, it
+// is instead the durable fact CheckAbandonedForcedRollback refuses on.
 func (b *BlockChain) writeForcedRollbackMarker(target, start uint32) error {
 	raw := make([]byte, forcedRollbackMarkerLen)
 	raw[0] = forcedRollbackMarkerVersion
 	byteOrder.PutUint32(raw[1:5], target)
 	byteOrder.PutUint32(raw[5:9], start)
-	return b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
+	if err := b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
 		return dbTx.Metadata().Put(forcedRollbackMarkerKeyName, raw)
-	})
+	}); err != nil {
+		return err
+	}
+	return b.flushStore("the in-progress marker")
 }
 
 // ClearForcedRollbackMarker removes the in-progress marker. It is exported because
@@ -449,8 +484,21 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 	if cerr := b.ClearForcedRollbackMarker(); cerr != nil {
 		return fmt.Errorf("forced rollback: clear in-progress marker: %w", cerr)
 	}
+	// Nothing may announce completion until completion is on disk. The line below is
+	// the one an operator reads before deciding the rewind is done -- and, in the
+	// runbook, before unsetting --forcedrollbacktrigger. Printed over a rewind still
+	// buffered in the ffldb cache it is an invitation to a silent revert: an unclean
+	// exit inside the flush window discards every byte of the rewind AND the marker
+	// clear, and a node restarted disarmed then comes up on the pre-rollback chain,
+	// serving the discarded blocks, with nothing left to say so. After this flush the
+	// completion line means what it says, and if the flush fails the line is never
+	// printed and the node exits on the error instead.
+	if ferr := b.flushStore("the completed rewind"); ferr != nil {
+		return ferr
+	}
 
-	log.Warnf("FORCED ROLLBACK: block store rewound to %d in %s; derived state will be "+
+	log.Warnf("FORCED ROLLBACK: block store rewound to %d in %s; the rewind and the "+
+		"clearing of its in-progress marker are both on disk. Derived state will be "+
 		"rebuilt by InitCheckpoint from a pre-target snapshot (asserted < target)",
 		len(b.Nodes)-1, time.Since(began).Truncate(time.Second))
 	return nil
@@ -536,6 +584,12 @@ func (b *BlockChain) CheckForcedRollbackResidue() error {
 		}
 		log.Warnf("FORCED ROLLBACK: purged %d residual block(s) above target %d",
 			purged, target)
+		// The message below states the store is verified clean, and clearing the
+		// marker retires the only durable evidence that a rewind was ever under way.
+		// Both are claims about disk, so the purge has to BE on disk first.
+		if ferr := b.flushStore("the boot-time residue purge"); ferr != nil {
+			return ferr
+		}
 	}
 	if marker, merr := b.ReadForcedRollbackMarker(); merr == nil && marker != nil {
 		log.Warnf("FORCED ROLLBACK: clearing a stale in-progress marker (target %d, "+
@@ -543,6 +597,12 @@ func (b *BlockChain) CheckForcedRollbackResidue() error {
 			marker.Target, marker.Start)
 		if cerr := b.ClearForcedRollbackMarker(); cerr != nil {
 			return fmt.Errorf("forced rollback: clear stale marker: %w", cerr)
+		}
+		// A marker clear left in the write cache is resurrected by an unclean exit,
+		// and CheckAbandonedForcedRollback would then refuse to start a node whose
+		// store is provably clean. Make the retirement stick.
+		if ferr := b.flushStore("the stale-marker clear"); ferr != nil {
+			return ferr
 		}
 	}
 	return nil

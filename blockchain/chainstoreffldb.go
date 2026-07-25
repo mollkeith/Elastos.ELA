@@ -324,6 +324,16 @@ func (c *ChainStoreFFLDB) GetBlock(hash Uint256) (*DposBlock, error) {
 	return b, nil
 }
 
+// FlushCache forwards to the underlying database, so a caller holding an
+// IFFLDBChainStore can make buffered writes durable. See database.DB.FlushCache
+// for exactly what that does and does not guarantee.
+//
+// Note that it says nothing about the in-RAM block LRU below, which is a separate
+// cache and is dropped by EvictBlockCache.
+func (c *ChainStoreFFLDB) FlushCache() error {
+	return c.db.FlushCache()
+}
+
 // EvictBlockCache drops a hash from the in-RAM block LRU (blocksCache /
 // blockHashesCache). GetBlock populates this small cache on every fetch, so a block
 // purged from the persistent store (DBRemoveBlockFromStore) must also be evicted

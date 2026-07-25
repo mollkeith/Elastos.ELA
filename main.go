@@ -169,6 +169,19 @@ func startNode(cfg *config.Configuration) {
 	if err != nil {
 		printErrorAndExit(err)
 	}
+	// BEFORE anything else, and on every boot regardless of configuration: refuse to
+	// start a node whose store still records a forced rollback as started-and-
+	// unfinished while this node is not configured to finish it. Every other check
+	// below is gated on the trigger being set, which is precisely what an operator
+	// removes after reading the completion line -- and if the process died inside the
+	// ffldb flush window, that line described a rewind that had not reached disk.
+	// Disarming there used to bring the node back up on the pre-rollback chain,
+	// serving the discarded blocks, silently. The marker outlives that crash by
+	// construction (it is flushed before the first destructive step), so this check
+	// sees it.
+	if e := chain.CheckAbandonedForcedRollback(); e != nil {
+		printErrorAndExit(e)
+	}
 	// Forced rollback runs BEFORE chain.Init so that checkpoint restoration and
 	// derived-state rebuild happen against the already-rewound chain rather than
 	// against state from a height that no longer exists. blockchain.New has

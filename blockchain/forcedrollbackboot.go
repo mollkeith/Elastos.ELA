@@ -56,6 +56,86 @@ const forcedRollbackRemedy = "Remedy: this is not repairable in place. Restore a
 	"rewind is resumable, so an interrupted run continues rather than ratcheting), " +
 	"or wipe the data directory and resync from the network under this binary."
 
+// ErrForcedRollbackAbandoned reports a store that carries a DURABLE in-progress
+// forced-rollback marker which this node is not configured to finish -- the operator
+// has unset (or retargeted) --forcedrollbacktrigger while a rewind was under way.
+var ErrForcedRollbackAbandoned = errors.New(
+	"forced rollback: the store carries an in-progress rollback this node is not configured to finish")
+
+// CheckAbandonedForcedRollback closes the disarm trap, and it is the ONE check in
+// this file that must run on every boot of every node whether or not a forced
+// rollback is configured.
+//
+// THE TRAP. ffldb buffers committed writes in RAM for up to 20 MiB / 300 s. Before
+// the flushes added alongside this check, a rewind could complete, verify itself,
+// clear its marker and log "block store rewound" with not one byte of any of it on
+// disk. An unclean exit inside that window silently discarded the whole rewind. If
+// the operator had by then acted on the completion line and disarmed the trigger,
+// the next boot took every early return in this file -- forcedRollbackConfigured is
+// false, so LocateForcedRollbackTrigger, VerifyForcedRollbackApplied and
+// CheckForcedRollbackResidue all decline -- and the node came up on the
+// PRE-ROLLBACK chain, serving the exploit block, with nothing anywhere saying so.
+//
+// The remedy has two halves and needs both. The flushes make the marker durable
+// BEFORE the first destructive step and the marker's clearing durable BEFORE the
+// completion line, so "a rewind started here and did not report finishing" is a fact
+// that survives the crash. This check is what reads that fact on a boot the operator
+// has disarmed, and refuses.
+//
+// It is deliberately NOT gated on configuration: gating it is the bug. It costs one
+// metadata point lookup on a node that has never run a rollback, and it is silent
+// when a marker exists but this node IS configured for that same target -- that node
+// is resuming, and the armed path owns it.
+//
+// LIMITS, stated so nothing here reads as more than it is. It can only refuse on
+// evidence THIS binary's rewind wrote: a store rewound by the shipped binary, or
+// offline by `ela-cli rollback`, carries no marker and is invisible to it. Neither
+// has the flush-window trap this closes -- the shipped rewind ratchets instead, which
+// VerifyForcedRollbackApplied catches, and the offline command flushes on close -- but
+// a node whose data directory was assembled some other way is outside what this can
+// see, and the runbook control (disarm only after a clean shutdown plus an offline
+// residue census reading zero) is what covers that case.
+func (b *BlockChain) CheckAbandonedForcedRollback() error {
+	marker, err := b.ReadForcedRollbackMarker()
+	if err != nil {
+		return err
+	}
+	if marker == nil {
+		return nil
+	}
+	if b.forcedRollbackConfigured() &&
+		b.chainParams.ForcedRollbackHeight == marker.Target {
+		// Configured to finish exactly this rewind: the armed path, the residue
+		// check and VerifyForcedRollbackApplied take it from here.
+		return nil
+	}
+
+	configured := "this node has NO forced rollback configured"
+	if b.chainParams.ForcedRollbackTrigger != "" &&
+		b.chainParams.ForcedRollbackHeight != config.DisabledForcedRollbackHeight {
+		configured = fmt.Sprintf("this node is configured for target %d instead",
+			b.chainParams.ForcedRollbackHeight)
+	}
+	var tip uint32
+	if len(b.Nodes) > 0 {
+		tip = uint32(len(b.Nodes) - 1)
+	}
+	return fmt.Errorf("%w: the block database records a forced rollback to target %d "+
+		"as STARTED (from height %d) and never finished, but %s (loaded tip %d). The "+
+		"marker is written and flushed to disk before the first destructive step and "+
+		"retired only after the completed rewind is on disk, so its survival means the "+
+		"rewind did not provably complete -- most often an unclean exit inside the "+
+		"database flush window, which silently reverts the whole rewind and leaves this "+
+		"node back on the chain the recovery removes. Starting disarmed here is exactly "+
+		"how a node rejoins on that chain unnoticed, so this node refuses to start. "+
+		"Remedy: re-arm --forcedrollbacktrigger/--forcedrollbackheight for target %d and "+
+		"restart -- the rewind is resumable and idempotent, and it clears the marker "+
+		"once it is durably complete. Only if you intend this node to stay off the "+
+		"recovered network should you instead wipe the data directory and resync",
+		ErrForcedRollbackAbandoned, marker.Target, marker.Start, configured, tip,
+		marker.Target)
+}
+
 // forcedRollbackConfigured reports whether a forced rollback is active on this
 // network. The disabled sentinel is math.MaxUint32, which would otherwise satisfy
 // every `tip <= target` test and pay for a full store walk on every boot.
@@ -225,6 +305,12 @@ func (b *BlockChain) VerifyForcedRollbackApplied() error {
 			return fmt.Errorf("forced rollback: purge residual block %s: %w",
 				hash.String(), err)
 		}
+	}
+
+	// The purge is a claim about disk and the re-probe below reads through the ffldb
+	// write cache, which would report the purge either way. Make it true first.
+	if ferr := b.flushStore("the targeted trigger-block purge"); ferr != nil {
+		return ferr
 	}
 
 	// Re-probe: the purge is only worth anything if it actually took.

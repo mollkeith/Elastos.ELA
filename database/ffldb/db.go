@@ -1891,6 +1891,39 @@ func (db *db) Update(fn func(database.Tx) error) error {
 	return tx.Commit()
 }
 
+// FlushCache pushes every buffered write through to the underlying leveldb and
+// fsyncs the block flat file, so that what a subsequent read reports is what a
+// restarted process would find.
+//
+// WHAT IT GUARANTEES, precisely. dbCache.flush syncs the current block file
+// (blockStore.syncBlocks -> File.Sync) and then replays the cached metadata treaps
+// into leveldb inside one transaction; goleveldb writes and fsyncs the resulting
+// table file and fsyncs its manifest journal (openDB does not set opt.NoSync), so
+// on return the writes have been handed to the operating system with an fsync
+// behind them. That is what makes a rewind survive an abrupt process death.
+//
+// WHAT IT DOES NOT GUARANTEE: anything about hardware write caches, and anything
+// about writes made after it returned.
+//
+// Locking mirrors a write transaction: dbCache.flush must be called with the
+// database write lock held, which also serialises it against commitTx, and the
+// close read-lock makes Close wait rather than race. Consequently it must NOT be
+// called from inside an open transaction on the same database.
+//
+// This function is part of the database.DB interface implementation.
+func (db *db) FlushCache() error {
+	db.writeLock.Lock()
+	defer db.writeLock.Unlock()
+
+	db.closeLock.RLock()
+	defer db.closeLock.RUnlock()
+
+	if db.closed {
+		return makeDbErr(database.ErrDbNotOpen, errDbNotOpenStr, nil)
+	}
+	return db.cache.flush()
+}
+
 // Close cleanly shuts down the database and syncs all data.  It will block
 // until all database transactions have been finalized (rolled back or
 // committed).

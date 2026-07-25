@@ -300,6 +300,42 @@ var requiredCallSites = []callSite{
 			"of the blocks the rewind can never visit, leaving a store that LOOKS clean",
 	},
 	{
+		finding: "B4-2 (the disarm trap)",
+		file:    "main.go", fn: "startNode",
+		callee: "CheckAbandonedForcedRollback",
+		why: "this is the ONLY forced-rollback check that is not gated on the trigger " +
+			"being configured, and the trigger is exactly what an operator unsets after " +
+			"reading the completion line. If the process died inside the ffldb flush " +
+			"window that line described a rewind still entirely in RAM, and every other " +
+			"check in the boot block then declines: the node comes up on the pre-rollback " +
+			"chain, serving the block the recovery removes, silently",
+	},
+	{
+		finding: "B4-1 (the census must read disk)",
+		file:    "blockchain/forcedrollbackscan.go", fn: "ScanForcedRollbackStore",
+		callee: "FlushCache",
+		why: "ffldb answers reads THROUGH its write cache, so without this the census -- " +
+			"and the \"persisted store verified clean above target\" line built on it -- " +
+			"reports RAM. Measured: 320 above-target entries still uncommitted at the " +
+			"moment the production node logged the store clean",
+	},
+	{
+		finding: "B4-2 (the marker must outlive the crash)",
+		file:    "blockchain/forcedrollback.go", fn: "writeForcedRollbackMarker",
+		callee: "flushStore",
+		why: "a marker that is only in the write cache disappears in exactly the crash it " +
+			"exists to describe; flushed before the first destructive step it is the " +
+			"durable fact CheckAbandonedForcedRollback refuses on",
+	},
+	{
+		finding: "B4-1 (completion must precede the announcement)",
+		file:    "blockchain/forcedrollback.go", fn: "ForceRollback",
+		callee: "flushStore",
+		why: "the completion line is what an operator acts on, including by disarming; " +
+			"printed over a rewind and a marker-clear still buffered in RAM it is an " +
+			"invitation to a silent revert",
+	},
+	{
 		finding: "PURGE-GUARD",
 		file:    "blockchain/residuecleaner.go", fn: "PurgeForcedRollbackResidue",
 		callee:   "ScanForcedRollbackStore",

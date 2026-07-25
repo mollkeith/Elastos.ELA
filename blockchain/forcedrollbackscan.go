@@ -25,8 +25,20 @@ type ResidueRef struct {
 	Height uint32
 }
 
-// ForcedRollbackStoreScan is a read-only census of what the PERSISTED block store
-// still holds strictly above a forced-rollback target.
+// ForcedRollbackStoreScan is a census of what the PERSISTED block store still holds
+// strictly above a forced-rollback target.
+//
+// "PERSISTED" is load-bearing and was, until this was fixed, untrue. ffldb answers
+// every read THROUGH its in-memory dbCache, which holds committed writes for up to
+// 20 MiB / 300 s (both hardcoded, database/ffldb/db.go openDB) before they reach
+// leveldb. A census taken without forcing that cache out therefore reports the
+// store as the WRITER sees it, not as a restarted process would find it -- measured
+// on two nodes differing only in the flush interval, the production one reported a
+// fully clean store at the same instant 320 above-target entries were still only in
+// RAM, and reproduced in test/unit/b4_rollback_durability_test.go, where the pristine
+// tree logs the store "verified clean" with the entire rewind still in the cache.
+// ScanForcedRollbackStore now flushes before it counts, which is what lets everything
+// below, and every message derived from it, say "persisted" honestly.
 //
 // It exists because the shipped safety nets asserted nothing about the database:
 // main.go's post-rollback height check compared chain.GetHeight() -- which is just
@@ -129,6 +141,14 @@ func refsString(refs []ResidueRef) string {
 
 // ScanForcedRollbackStore censuses the persisted store above target.
 //
+// It FLUSHES the database cache before reading. That is not incidental: ffldb reads
+// through its write cache, so without the flush this function -- and every claim
+// built on it, including "persisted store verified clean above target N" -- would
+// describe RAM. The flush publishes only writes that are already committed, so it
+// changes no logical content; it just makes the census answer the question its name
+// asks. Because it takes the database write lock, this function must not be called
+// from inside an open transaction.
+//
 // Cost note: the raw-store pass would be prohibitive on a 25GB mainnet store if it
 // fetched a header for all ~2.26M entries, so the cheap main-chain lookup is kept
 // as a SKIP FILTER rather than a keep-decision: an entry that is main-chain-indexed
@@ -146,6 +166,12 @@ func ScanForcedRollbackStore(fflDB IFFLDBChainStore, target uint32) (
 	// its cost is logged: it is a real, if one-off, addition to boot time on a node
 	// sitting at the rollback target, and the restart runbook should show it.
 	began := time.Now()
+
+	// Census the DISK, not the write cache. See the function comment.
+	if ferr := fflDB.FlushCache(); ferr != nil {
+		return nil, fmt.Errorf("forced rollback scan: flush the store before "+
+			"censusing it: %w", ferr)
+	}
 
 	err := fflDB.View(func(dbTx database.Tx) error {
 		meta := dbTx.Metadata()
