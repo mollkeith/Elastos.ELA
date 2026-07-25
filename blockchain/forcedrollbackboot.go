@@ -315,66 +315,23 @@ func (b *BlockChain) announceForcedRollbackSettled(tip uint32) {
 //     the exploit block by hash (PROVEN live). Both records are provably above the
 //     target, so remove exactly those two keys and continue.
 func (b *BlockChain) VerifyForcedRollbackApplied() error {
-	if !b.forcedRollbackConfigured() {
-		return nil
-	}
-	loc, err := b.LocateForcedRollbackTrigger()
+	d, err := b.DiagnoseForcedRollbackApplied()
 	if err != nil {
 		return err
 	}
-
-	target := b.chainParams.ForcedRollbackHeight
-	var tip uint32
-	if len(b.Nodes) > 0 {
-		tip = uint32(len(b.Nodes) - 1)
-	}
-
-	if loc == nil || !loc.Present() {
+	switch d.State {
+	case ApplyNotConfigured:
+		return nil
+	case ApplySettled:
 		// The rollback is settled on this store. Say so, with the evidence: a silent
 		// nil is indistinguishable from a binary that never looked.
-		b.announceForcedRollbackSettled(tip)
+		b.announceForcedRollbackSettled(d.Tip)
 		return nil
+	case ApplyTriggerHeightMismatch, ApplyTriggerOnMainChain:
+		return d.Err
 	}
 
-	// The trigger block is HERE, but is it the block this rollback is about? Every
-	// branch below assumes the configured trigger names the block at target+1 and
-	// nothing has ever checked that it does. When it does not, the disagreement is
-	// between two configured values, not inside the database, and the answers below
-	// (refuse with "restore a backup or wipe and resync", or purge the named block
-	// from the store) are both destructive answers to a typo. Diagnose it first.
-	if h, ok := b.forcedRollbackTriggerHeight(loc); ok && h != target+1 {
-		return fmt.Errorf("forced rollback: CONFIGURATION ERROR -- the configured "+
-			"trigger %s names the block at height %d, but the forced rollback is "+
-			"defined as the removal of the block at height %d (target %d + 1). The "+
-			"block store is not damaged: the two values that disagree are both "+
-			"configuration, and one of them is wrong. Refusing to start rather than "+
-			"acting on a rollback this node cannot make sense of. Remedy: set "+
-			"ForcedRollbackTrigger / --forcedrollbacktrigger to the hash of the block "+
-			"at height %d, or set ForcedRollbackHeight / --forcedrollbackheight to one "+
-			"below %d, then restart. Neither restoring a backup nor resyncing from "+
-			"scratch helps here, and both are hours of work: a resynced node reads the "+
-			"same configuration and stops in the same place",
-			b.chainParams.ForcedRollbackTrigger, h, target+1, target, target+1, h)
-	}
-
-	if loc.OnMainChain {
-		cause := "an INTERRUPTED rewind that never committed this block's rollback " +
-			"transaction"
-		if tip > target {
-			cause = "a rewind that was DECLINED or never ran -- this node is still on " +
-				"the chain the recovery removes"
-		}
-		return fmt.Errorf("%w: block %s is still recorded on the MAIN CHAIN at height "+
-			"%d (loaded tip %d, rollback target %d). Signature of %s. Its UTXO and "+
-			"derived-state processors have not been reverted, so this node would join "+
-			"the recovered network on the exploit chain and stall it -- refusing to "+
-			"start. %s Rewinding manually first also works: stop the node and, from "+
-			"its working directory, run `ela-cli rollback --height %d --datadir <your "+
-			"data dir>` (the --height FLAG is required; a bare positional height "+
-			"prints help and does nothing), then restart.",
-			ErrForcedRollbackNotApplied, loc.Hash.String(), loc.MainChainHeight, tip,
-			target, cause, forcedRollbackRemedy, target)
-	}
+	loc, target := d.Loc, d.Target
 
 	// Retention residue only. Both keys are keyed on the trigger, whose height is
 	// target+1 by construction, so a targeted removal can never touch retained
@@ -450,33 +407,97 @@ func (b *BlockChain) VerifyForcedRollbackApplied() error {
 //
 // Caller must have verified ForcedRollbackArmed first.
 func (b *BlockChain) PreflightForcedRollback() error {
-	if !b.forcedRollbackConfigured() {
+	// The census and the classification live in DiagnoseForcedRollbackPreflight, so
+	// that `ela-cli preflight` predicts this boot with the code that decides it
+	// rather than with a copy of its conditions -- and can report the census this
+	// scan already paid for instead of running a second one.
+	d, err := b.DiagnoseForcedRollbackPreflight()
+	if err != nil {
+		return err
+	}
+	switch d.State {
+	case RewindPreflightNotApplicable:
 		return nil
-	}
-	target := b.chainParams.ForcedRollbackHeight
-	if len(b.Nodes) == 0 {
-		return errors.New("forced rollback pre-flight: the block index is empty")
-	}
-	tip := uint32(len(b.Nodes) - 1)
-	if tip <= target {
-		return nil
-	}
-	if depth := tip - target; depth >= maxHistoryCapacity {
+	case RewindPreflightCapacitySkipped:
 		// ForceRollback refuses on capacity before it touches anything, and that
-		// refusal IS this node's diagnosis. Returning here also bounds everything
-		// below by maxHistoryCapacity rather than by an unbounded tip-target: a node
-		// that ran far past the target must not be asked to build a reachability set
-		// proportional to how far it ran.
+		// refusal IS this node's diagnosis. Stopping here also bounds the
+		// reachability set by maxHistoryCapacity rather than by an unbounded
+		// tip-target: a node that ran far past the target must not be asked to
+		// build a set proportional to how far it ran.
 		log.Operatorf("FORCED ROLLBACK: pre-flight skipped -- depth %d already exceeds the "+
 			"incremental rewind window %d, so the rewind refuses before doing anything "+
-			"and this node will not start", depth, maxHistoryCapacity)
+			"and this node will not start", d.Depth, maxHistoryCapacity)
 		return nil
+	case RewindPreflightDamaged:
+		return d.Err
+	}
+
+	log.Operatorf("FORCED ROLLBACK: pre-flight OK -- %s; %d block(s) to rewind, every one "+
+		"reachable from the loaded block index and complete in the store; anything "+
+		"left over is retention residue and is swept by the rewind",
+		d.Scan.Summary(), d.Depth)
+	return nil
+}
+
+// ForcedRollbackPreflightState is what DiagnoseForcedRollbackPreflight found.
+type ForcedRollbackPreflightState int
+
+const (
+	// RewindPreflightNotApplicable -- no rollback configured, or the tip is
+	// already at or below the target.
+	RewindPreflightNotApplicable ForcedRollbackPreflightState = iota
+	// RewindPreflightCapacitySkipped -- the depth already exceeds the incremental
+	// window, so ForceRollback refuses and nothing below is worth computing.
+	RewindPreflightCapacitySkipped
+	// RewindPreflightDamaged -- the store carries damage the rewind cannot repair.
+	RewindPreflightDamaged
+	// RewindPreflightOK -- every block the rewind must visit is reachable and
+	// complete.
+	RewindPreflightOK
+)
+
+// ForcedRollbackPreflightDiagnosis is the read-only result of the armed path's
+// pre-flight scan.
+type ForcedRollbackPreflightDiagnosis struct {
+	State ForcedRollbackPreflightState
+	// Scan is the store census, nil when no census was taken.
+	Scan               *ForcedRollbackStoreScan
+	Tip, Target, Depth uint32
+	// Orphaned are main-chain records above the target the loaded index cannot
+	// reach; Bodyless are blocks the rewind must visit whose body is gone.
+	Orphaned, Bodyless []ResidueRef
+	// Err is EXACTLY the error PreflightForcedRollback returns when damaged.
+	Err error
+}
+
+// DiagnoseForcedRollbackPreflight censuses the store for the ARMED path without
+// touching anything. Caller must have verified ForcedRollbackArmed first.
+func (b *BlockChain) DiagnoseForcedRollbackPreflight() (
+	*ForcedRollbackPreflightDiagnosis, error) {
+	d := &ForcedRollbackPreflightDiagnosis{Target: b.chainParams.ForcedRollbackHeight}
+	if !b.forcedRollbackConfigured() {
+		return d, nil
+	}
+	target := d.Target
+	if len(b.Nodes) == 0 {
+		return nil, errors.New("forced rollback pre-flight: the block index is empty")
+	}
+	tip := uint32(len(b.Nodes) - 1)
+	d.Tip = tip
+	if tip <= target {
+		return d, nil
+	}
+	d.Depth = tip - target
+	if forcedRollbackExceedsCapacity(tip, target) {
+		d.State = RewindPreflightCapacitySkipped
+		return d, nil
 	}
 
 	scan, err := ScanForcedRollbackStore(b.db.GetFFLDB(), target)
 	if err != nil {
-		return fmt.Errorf("forced rollback pre-flight: scan store: %w", err)
+		return nil, fmt.Errorf("forced rollback pre-flight: scan store: %w", err)
 	}
+	d.Scan = scan
 
 	// reachable is exactly the set the rewind loop will visit: b.Nodes above target.
 	reachable := make(map[common.Uint256]struct{}, tip-target)
@@ -484,48 +505,47 @@ func (b *BlockChain) PreflightForcedRollback() error {
 		reachable[*b.Nodes[h].Hash] = struct{}{}
 	}
 
-	var orphaned []ResidueRef
 	for _, ref := range scan.MainChainAbove {
 		if _, ok := reachable[ref.Hash]; !ok {
-			orphaned = append(orphaned, ref)
+			d.Orphaned = append(d.Orphaned, ref)
 		}
 	}
-	if len(orphaned) > 0 || scan.BestStateHeight > tip {
-		return fmt.Errorf("%w: the block database records %d block(s) above the "+
+	if len(d.Orphaned) > 0 || scan.BestStateHeight > tip {
+		d.State = RewindPreflightDamaged
+		d.Err = fmt.Errorf("%w: the block database records %d block(s) above the "+
 			"forced-rollback target %d as MAIN CHAIN that the loaded block index does "+
 			"not carry (best-state height %d, loaded tip %d), so the rewind can never "+
 			"visit them and their UTXO/derived-state effects can never be reverted. "+
 			"This is the store an earlier rollback under the shipped ordering left "+
 			"behind. %s Unreachable: %s",
-			ErrForcedRollbackStoreDamaged, len(orphaned), target, scan.BestStateHeight,
-			tip, forcedRollbackRemedy, refsString(orphaned))
+			ErrForcedRollbackStoreDamaged, len(d.Orphaned), target, scan.BestStateHeight,
+			tip, forcedRollbackRemedy, refsString(d.Orphaned))
+		return d, nil
 	}
 
 	// Every block the rewind must visit needs its body: RollbackBlock is built from
 	// the deserialized block, so a missing raw entry under a live main-chain index
 	// aborts the rewind mid-flight instead of before it starts.
-	var bodyless []ResidueRef
 	for h := target + 1; h <= tip; h++ {
 		node := b.Nodes[h]
 		phase, perr := b.forcedRollbackPhase(node.Hash)
 		if perr != nil {
-			return fmt.Errorf("forced rollback pre-flight: probe %d: %w", h, perr)
+			return nil, fmt.Errorf("forced rollback pre-flight: probe %d: %w", h, perr)
 		}
 		if phase.onMainChain && !phase.inStore {
-			bodyless = append(bodyless, ResidueRef{Hash: *node.Hash, Height: h})
+			d.Bodyless = append(d.Bodyless, ResidueRef{Hash: *node.Hash, Height: h})
 		}
 	}
-	if len(bodyless) > 0 {
-		return fmt.Errorf("%w: %d block(s) above the target %d are still main-chain "+
+	if len(d.Bodyless) > 0 {
+		d.State = RewindPreflightDamaged
+		d.Err = fmt.Errorf("%w: %d block(s) above the target %d are still main-chain "+
 			"indexed but no longer in the block store, so their rollback transactions "+
 			"cannot be built. %s Missing bodies: %s",
-			ErrForcedRollbackStoreDamaged, len(bodyless), target, forcedRollbackRemedy,
-			refsString(bodyless))
+			ErrForcedRollbackStoreDamaged, len(d.Bodyless), target, forcedRollbackRemedy,
+			refsString(d.Bodyless))
+		return d, nil
 	}
 
-	log.Operatorf("FORCED ROLLBACK: pre-flight OK -- %s; %d block(s) to rewind, every one "+
-		"reachable from the loaded block index and complete in the store; anything "+
-		"left over is retention residue and is swept by the rewind",
-		scan.Summary(), tip-target)
-	return nil
+	d.State = RewindPreflightOK
+	return d, nil
 }

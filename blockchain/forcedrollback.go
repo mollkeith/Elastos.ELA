@@ -392,7 +392,7 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 	}
 	depth := start - target
 
-	if depth >= maxHistoryCapacity {
+	if forcedRollbackExceedsCapacity(start, target) {
 		// FV-18: the remedy used to print the POSITIONAL form `ela-cli rollback <N>`,
 		// which -- measured on this tree -- prints the subcommand help and exits 0
 		// without touching the store, so a runbook step checking the exit status
@@ -569,32 +569,21 @@ func (b *BlockChain) VerifyForcedRollbackComplete() error {
 //
 // It must only be called when a forced rollback is configured for this network.
 func (b *BlockChain) CheckForcedRollbackResidue() error {
-	target := b.chainParams.ForcedRollbackHeight
-	// Intrinsic guard, so the scan can never be provoked on a network where forced
-	// rollback is inactive (the disabled sentinel is math.MaxUint32, which would
-	// otherwise satisfy every `tip <= target` test and pay for a full store walk).
-	if b.chainParams.ForcedRollbackTrigger == "" || target == 0 ||
-		target == config.DisabledForcedRollbackHeight {
-		return nil
-	}
-	if len(b.Nodes) == 0 {
-		return nil
-	}
-	tip := uint32(len(b.Nodes) - 1)
-	if tip > target {
-		// The node legitimately holds blocks above the target (it is on a different
-		// chain, or has already resynced forward). Nothing to assert.
-		return nil
-	}
-
-	scan, err := ScanForcedRollbackStore(b.db.GetFFLDB(), target)
+	// The census and the classification live in DiagnoseForcedRollbackResidue, so
+	// that `ela-cli preflight` predicts this boot with the code that decides it
+	// rather than with a copy of its conditions.
+	d, err := b.DiagnoseForcedRollbackResidue()
 	if err != nil {
-		return fmt.Errorf("forced rollback: scan store: %w", err)
+		return err
 	}
-	if len(scan.MainChainAbove) > 0 || scan.BestStateHeight > target {
-		return interruptedRollbackError(scan, tip)
+	if d.State == ResidueNotApplicable {
+		return nil
 	}
-	if len(scan.StoredAbove) > 0 || len(scan.HeaderRowsAbove) > 0 {
+	target, tip, scan := d.Target, d.Tip, d.Scan
+	if d.State == ResidueInterrupted {
+		return d.Err
+	}
+	if d.State == ResidueRetentionOnly {
 		log.Operatorf("FORCED ROLLBACK: node is at height %d (target %d) but the store still "+
 			"holds %d discarded block(s) and %d orphaned header row(s) above the target; "+
 			"purging (retention residue only -- the main chain is consistent)",
@@ -612,7 +601,7 @@ func (b *BlockChain) CheckForcedRollbackResidue() error {
 			return ferr
 		}
 	}
-	if marker, merr := b.ReadForcedRollbackMarker(); merr == nil && marker != nil {
+	if marker, merr := d.Marker, d.MarkerErr; merr == nil && marker != nil {
 		log.Operatorf("FORCED ROLLBACK: clearing a stale in-progress marker (target %d, "+
 			"start %d); the persisted store is verified clean above the target",
 			marker.Target, marker.Start)

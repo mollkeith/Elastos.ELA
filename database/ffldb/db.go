@@ -1725,6 +1725,18 @@ type db struct {
 	closed    bool         // Is the database closed?
 	store     *blockStore  // Handles read/writing blocks to flat files.
 	cache     *dbCache     // Cache layer which wraps underlying leveldb DB.
+
+	// readOnly is set only by the "ffldb-ro" driver (see readonly.go). It is
+	// the in-process half of the read-only guarantee: the leveldb below is
+	// already opened read-only, but the FLAT BLOCK FILES are not protected by
+	// that, so a writable transaction must be refused before it can reach
+	// blockStore.writeBlock.
+	readOnly bool
+
+	// pendingRepair records the unclean-shutdown flat-file rollback that a
+	// read-write open would have performed on this store, and that a read-only
+	// open deliberately did not. nil on every other path.
+	pendingRepair *UncleanShutdownRepair
 }
 
 // Enforce db implements the database.DB interface.
@@ -1745,6 +1757,17 @@ func (db *db) Type() string {
 // which is used by the managed transaction code while the database method
 // returns the interface.
 func (db *db) begin(writable bool) (*transaction, error) {
+	// A database opened read-only has no writable transaction at all. This is
+	// checked FIRST, before any lock is taken, so the refusal cannot itself
+	// change any state. leveldb would refuse the metadata commit on its own,
+	// but only at Commit time -- by which point StoreBlock has already appended
+	// bytes to a flat block file, because those writes do not go through
+	// leveldb. Refusing here is what makes "read-only" mean the files too.
+	if writable && db.readOnly {
+		return nil, makeDbErr(database.ErrTxNotWritable,
+			ErrReadOnlyDatabase.Error(), nil)
+	}
+
 	// Whenever a new writable transaction is started, grab the write lock
 	// to ensure only a single write transaction can be active at the same
 	// time.  This lock will not be released until the transaction is
@@ -1912,6 +1935,15 @@ func (db *db) Update(fn func(database.Tx) error) error {
 //
 // This function is part of the database.DB interface implementation.
 func (db *db) FlushCache() error {
+	// Nothing can be buffered on a read-only database -- begin() refuses every
+	// writable transaction -- so the flush has nothing to publish, and taking
+	// the write path to discover that would be the one call on this database
+	// that touches leveldb's writer. Answering "already durable" is both true
+	// and the only non-writing answer.
+	if db.readOnly {
+		return nil
+	}
+
 	db.writeLock.Lock()
 	defer db.writeLock.Unlock()
 

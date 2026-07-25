@@ -116,6 +116,28 @@ func NewDefault(path string, level uint8, maxPerLogSizeMb, maxLogsSizeMb int64) 
 	return logger
 }
 
+// NewDiscardDefault installs a package logger that writes nowhere.
+//
+// The package-level helpers (Infof, Warnf, ...) dereference `logger` with no nil
+// check, so a command that calls into production code which logs MUST install one
+// before it does -- ScanForcedRollbackStore's Infof would otherwise panic. Every
+// other constructor opens a ROTATING FILE, which is the wrong answer for a
+// strictly read-only command: `ela-cli preflight` must not create a logs directory
+// as a side effect of predicting a boot, and cmd/purgeresidue's
+// log.NewDefault("logs/node", ...) does exactly that under whatever the current
+// directory happens to be.
+//
+// Operator-facing output is unaffected: Operatorf and OperatorError write to
+// os.Stderr directly and are already nil-logger safe.
+func NewDiscardDefault(level uint8) *Logger {
+	logger = &Logger{
+		level:  level,
+		writer: io.Discard,
+		logger: log.New(io.Discard, "", 0),
+	}
+	return logger
+}
+
 func (l *Logger) Writer() io.Writer {
 	return l.writer
 }
