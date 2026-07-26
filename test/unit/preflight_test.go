@@ -74,6 +74,13 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 		wantCell    string
 		// wantHeadline is the statement this cell must make to the operator.
 		wantHeadline string
+		// wantTrigger is where the store must say the targeted block still is.
+		// Reported from the persisted indexes, so a report that stopped reading
+		// them fails here rather than passing on a plausible-looking headline.
+		wantTriggerPresent, wantTriggerOnMainChain bool
+		// wantMainChainAbove, when >= 0, is the census the boot's own scan must
+		// have produced and the report must have carried over.
+		wantMainChainAbove int
 	}
 
 	rows := []row{
@@ -85,9 +92,11 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 				t1BuildChain(t, dir, p, target+3)
 				return dir, p
 			},
-			wantOutcome:  blockchain.PreflightWillRewind,
-			wantCell:     "A-or-E/holds-the-chain-the-recovery-removes",
-			wantHeadline: "WILL REWIND on start",
+			wantOutcome:        blockchain.PreflightWillRewind,
+			wantCell:           "A-or-E/holds-the-chain-the-recovery-removes",
+			wantHeadline:       "WILL REWIND on start",
+			wantTriggerPresent: true, wantTriggerOnMainChain: true,
+			wantMainChainAbove: 3,
 		},
 		{
 			name: "B/already-rewound/sitting-at-target",
@@ -98,9 +107,10 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 				ops2BootOnce(t, dir, p)
 				return dir, p
 			},
-			wantOutcome:  blockchain.PreflightNothingToDo,
-			wantCell:     "B-or-D/at-the-target",
-			wantHeadline: "Nothing to roll back",
+			wantOutcome:        blockchain.PreflightNothingToDo,
+			wantCell:           "B-or-D/at-the-target",
+			wantHeadline:       "Nothing to roll back",
+			wantMainChainAbove: 0,
 		},
 		{
 			name: "C/already-rewound/moved-forward-on-the-recovered-chain",
@@ -148,9 +158,11 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 				t1BuildChain(t, dir, p, target+3)
 				return dir, p
 			},
-			wantOutcome:  blockchain.PreflightWillRewind,
-			wantCell:     "A-or-E/holds-the-chain-the-recovery-removes",
-			wantHeadline: "WILL REWIND on start",
+			wantOutcome:        blockchain.PreflightWillRewind,
+			wantCell:           "A-or-E/holds-the-chain-the-recovery-removes",
+			wantHeadline:       "WILL REWIND on start",
+			wantTriggerPresent: true, wantTriggerOnMainChain: true,
+			wantMainChainAbove: 3,
 		},
 		{
 			name: "F/holds-the-removed-chain/rollback-not-configured",
@@ -164,7 +176,7 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 			},
 			wantOutcome:  blockchain.PreflightNothingToDo,
 			wantCell:     "F/no-forced-rollback-configured",
-			wantHeadline: "No forced rollback is configured",
+			wantHeadline: "No forced rollback is configured for network",
 		},
 		{
 			name: "G/holds-the-removed-chain/beyond-the-rewind-window",
@@ -174,9 +186,10 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 				t1BuildChain(t, dir, p, target+b1b5CapacityDepth)
 				return dir, p
 			},
-			wantOutcome:  blockchain.PreflightWillRefuse,
-			wantCell:     "G",
-			wantHeadline: "beyond the",
+			wantOutcome:        blockchain.PreflightWillRefuse,
+			wantCell:           "G",
+			wantHeadline:       "beyond the",
+			wantTriggerPresent: true, wantTriggerOnMainChain: true,
 		},
 		{
 			name: "H/healthy-store/trigger-names-the-wrong-block",
@@ -187,9 +200,11 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 				p.ForcedRollbackTrigger = hashes[target+3].ReversedString()
 				return dir, p
 			},
-			wantOutcome:  blockchain.PreflightWillRefuse,
-			wantCell:     "H",
-			wantHeadline: "One of the two configured values is wrong",
+			wantOutcome:        blockchain.PreflightWillRefuse,
+			wantCell:           "H",
+			wantHeadline:       "One of the two configured values is wrong",
+			wantTriggerPresent: true, wantTriggerOnMainChain: true,
+			wantMainChainAbove: -1,
 		},
 		{
 			name: "I/interrupted-rewind/operator-then-disarmed",
@@ -217,6 +232,19 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 		},
 	}
 
+	// Rows that say nothing about the census opt out with -1; Go's zero value is
+	// 0, which would silently mean "assert an empty census", so the opt-out is
+	// applied here rather than left to each row.
+	for i := range rows {
+		switch rows[i].name {
+		case "A/holds-the-removed-chain/armed-config",
+			"B/already-rewound/sitting-at-target",
+			"E/old-backup-restored-after-the-restart":
+		default:
+			rows[i].wantMainChainAbove = -1
+		}
+	}
+
 	var table strings.Builder
 	table.WriteString("\npre-flight prediction vs the production boot it predicts\n")
 	fmt.Fprintf(&table, "%-52s %-22s %-8s %-8s %s\n", "cell", "predicted", "armed",
@@ -236,6 +264,18 @@ func TestPreflightPredictsEveryTruthTableCell(t *testing.T) {
 			assert.Containsf(t, report.Headline, r.wantHeadline,
 				"the headline does not make this cell's statement; it said: %s",
 				report.Headline)
+			assert.NotEmpty(t, report.Version,
+				"every report must name the binary it describes")
+			assert.Equal(t, r.wantTriggerPresent, report.Store.TriggerPresent,
+				"where the store says the targeted block is")
+			assert.Equal(t, r.wantTriggerOnMainChain, report.Store.OnMainChain,
+				"whether the targeted block is still main-chain indexed")
+			if r.wantMainChainAbove >= 0 {
+				assert.True(t, report.Store.Scanned,
+					"this boot runs a full store census, so the report must carry it")
+				assert.Equal(t, r.wantMainChainAbove, report.Store.MainChainAbove,
+					"main-chain records above the target")
+			}
 
 			// Now actually boot, and require the prediction to have been right.
 			b := ops2BootOnce(t, dir, params)
