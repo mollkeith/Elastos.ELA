@@ -3721,11 +3721,50 @@ func (s *State) updateInactiveCountV2(lastPosition, needReset, workedInRound boo
 		// had zeroed on firing), so `>= 3` was always false on rollback and
 		// revertSettingInactiveProducer never ran -> producer stuck Inactive after a reorg
 		// across the threshold. Reorg revert-symmetry (ungated).
+		//
+		// F-064b (revert-symmetry harness finding, test/revsym): restoring the producer's
+		// STATE and map membership is not enough. setInactiveProducer also writes
+		// inactiveSince, activateRequestHeight and selected, and
+		// revertSettingInactiveProducer COMPUTES their inverse instead of restoring the
+		// captured originals: it hard-sets inactiveSince = 0 and
+		// activateRequestHeight = math.MaxUint32 and never touches `selected` at all. A
+		// reorg across the inactivity threshold therefore
+		//   - destroys a pending ActivateProducer request (activateRequestHeight is what
+		//     processTransactions:1746/1779 tests to decide when an inactive producer is
+		//     put back on duty),
+		//   - rewrites inactiveSince, which gates how long the producer must wait, and
+		//   - clears `selected`, which arbitrators.go:2615 reads when it picks the random
+		//     candidate.
+		// All three feed the arbiter set, so two nodes that disagree about a reorg
+		// disagree about who may produce. Penalty is captured for the same reason: the
+		// forward charges it only at/above ChangeCommitteeNewCRHeight while the undo
+		// subtracts unconditionally (and clamps at zero), so below that height the undo
+		// refunds a penalty that was never charged.
+		//
+		// This is the pattern FV-11 already applies at the emergency-inactive site in this
+		// same file (processEmergencyInactiveArbitrators): capture-and-restore, never
+		// compute-the-inverse. Captured INSIDE the forward so a producer touched twice in
+		// one block restores its true origin (see the contract on utils.History.Append).
+		//
+		// GATE: none. Only the rollback closure changes; the forward/accept path is
+		// byte-identical, and rollback closures execute solely on live reorgs -- never
+		// during linear replay or checkpoint re-derivation -- so retained history through
+		// 2,260,450 keeps its verdict. Same doctrine as F-064/F-109/F-168/F-180/F-181/F-215.
 		fired := false
+		var (
+			oriInactiveSince         uint32
+			oriActivateRequestHeight uint32
+			oriSelected              bool
+			oriPenalty               common.Fixed64
+		)
 		s.History.Append(height, func() {
 			fired = false
 			producer.inactiveCountV2 += 1
 			if producer.inactiveCountV2 >= 3 {
+				oriInactiveSince = producer.inactiveSince
+				oriActivateRequestHeight = producer.activateRequestHeight
+				oriSelected = producer.selected
+				oriPenalty = producer.penalty
 				s.setInactiveProducer(producer, key, height, false)
 				producer.inactiveCountV2 = 0
 				fired = true
@@ -3733,6 +3772,10 @@ func (s *State) updateInactiveCountV2(lastPosition, needReset, workedInRound boo
 		}, func() {
 			if fired {
 				s.revertSettingInactiveProducer(producer, key, height, false)
+				producer.inactiveSince = oriInactiveSince
+				producer.activateRequestHeight = oriActivateRequestHeight
+				producer.selected = oriSelected
+				producer.penalty = oriPenalty
 			}
 			producer.inactiveCountV2 = originInactiveCountV2
 		})
