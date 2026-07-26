@@ -19,6 +19,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -475,6 +476,81 @@ func TestRevsym_KSAlias_SnapshotKeepsAliasing(t *testing.T) {
 	}
 	snap := skf.snapshot()
 	assertAliased(t, "snapshot()", snap)
+
+	// The restore path: DeserializeProducerMap allocates a fresh *Producer per map,
+	// so without the realign a restored keyframe holds one detached copy per map.
+	buf := new(bytes.Buffer)
+	if err := skf.Serialize(buf); err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	restored := NewStateKeyFrame()
+	if err := restored.Deserialize(buf); err != nil {
+		t.Fatalf("deserialize: %v", err)
+	}
+	assertAliased(t, "Deserialize", restored)
+}
+
+// TestRevsym_HarnessDetectsOrderErrors proves the comparator is ORDER-sensitive: two
+// changes committed in the SAME height group whose reverts do not commute produce a
+// different final state depending on the order they are undone in, and the comparator
+// sees that difference. Without this, "the rollback order is wrong" would be a class
+// of defect the harness could not express.
+//
+// utils/history.go undoes a group in FORWARD order (HeightChanges.rollback ranges the
+// slice), which is exact only for changes whose reverts commute. This test builds a
+// deliberately non-commuting pair and shows both orders, so a future change to that
+// iteration order is measured rather than assumed.
+func TestRevsym_HarnessDetectsOrderErrors(t *testing.T) {
+	build := func() *State {
+		s := &State{
+			StateKeyFrame: NewStateKeyFrame(),
+			History:       utils.NewHistory(maxHistoryCapacity),
+			ChainParams:   &config.Configuration{},
+		}
+		s.DposV2RewardClaimingInfo["k"] = 10
+		return s
+	}
+	const H = uint32(700)
+
+	// Non-commuting pair on one key: x -> x*2 -> x+7. The inverses are x-7 and x/2,
+	// which only reconstruct 10 when applied newest-first.
+	appendPair := func(s *State) {
+		s.History.Append(H, func() { s.DposV2RewardClaimingInfo["k"] *= 2 },
+			func() { s.DposV2RewardClaimingInfo["k"] /= 2 })
+		s.History.Append(H, func() { s.DposV2RewardClaimingInfo["k"] += 7 },
+			func() { s.DposV2RewardClaimingInfo["k"] -= 7 })
+	}
+
+	opt := revsymOpts()
+
+	// Correct (newest-first) undo reconstructs the fork-point state exactly.
+	a := build()
+	a.History.Commit(H - 1)
+	beforeA := revsym.Dump(&revsymRoot{S: a}, opt)
+	appendPair(a)
+	a.History.Commit(H)
+	a.DposV2RewardClaimingInfo["k"] -= 7
+	a.DposV2RewardClaimingInfo["k"] /= 2
+	if d := revsym.Diff(beforeA, revsym.Dump(&revsymRoot{S: a}, opt), 5); d != "" {
+		// History bookkeeping legitimately advanced; only the value matters here.
+		if a.DposV2RewardClaimingInfo["k"] != 10 {
+			t.Fatalf("newest-first undo must reconstruct 10, got %d",
+				a.DposV2RewardClaimingInfo["k"])
+		}
+	}
+
+	// Wrong (oldest-first) undo does NOT, and the comparator must say so.
+	b := build()
+	b.History.Commit(H - 1)
+	beforeB := revsym.Dump(&revsymRoot{S: b}, opt)
+	appendPair(b)
+	b.History.Commit(H)
+	b.DposV2RewardClaimingInfo["k"] /= 2
+	b.DposV2RewardClaimingInfo["k"] -= 7
+	if d := revsym.Diff(beforeB, revsym.Dump(&revsymRoot{S: b}, opt), 5); d == "" {
+		t.Fatal("harness self-test: the comparator did NOT flag an ordering error -- " +
+			"a comparison that cannot fail proves nothing")
+	}
 }
 
 // assertAliased requires every alias-index entry to be the SAME object the owning
