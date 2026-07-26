@@ -812,12 +812,39 @@ func checkFrozenAddresses(txn interfaces.Transaction,
 	return nil
 }
 
-// tx interfaces.Transaction,
+// CheckTransactionFee gates the minimum fee AND stores the fee on the transaction.
+//
+// XM-03: pre-fix both used getTransactionFee (core/transaction/crcproposalwithdraw.go),
+// an ASSET-BLIND aggregate -- it sums every input Value and every output Value with no
+// regard to AssetID -- while ContextCheck computed the authoritative per-asset
+// blockchain.GetTxFeeStrict(ELAAssetID) result two steps earlier and threw it away
+// (`if _, err := ...`). Two different fee numbers were therefore live for the same
+// transaction. The stored one is the damaging one: txn.SetFee is what
+// interfaces.Transaction.Fee() returns, and dpos/state/arbitrators.go getBlockDPOSReward
+// sums exactly that into a.accumulativeReward -> distributeDPOSReward -> arbitersRoundReward,
+// the pool that becomes claimable, spendable ELA. A non-ELA input therefore raised the
+// arbiter reward without any ELA backing it -- our F-011 fix corrected the block-validation
+// site (checkTxsContext) and missed this one.
+//
+// At and above StrictMoneyRangeHeight the minimum-fee gate and the stored fee now BOTH use
+// the same authoritative GetTxFeeStrict(ELAAssetID) value that block validation uses. Below
+// the gate the original asset-blind expression is preserved exactly, so retained history
+// replays unchanged.
+//
+// Note the ordering dependency with XM-02: the asset-blind aggregate was, by accident, the
+// only bound on how much foreign-asset value a transaction could emit (a large fabricated
+// output made the aggregate fee negative and tripped the minimum-fee gate). Switching this
+// gate to the ELA-only fee WITHOUT the XM-02 per-asset non-negativity rule would remove that
+// accidental bound. The two changes must ship together.
 func (t *DefaultChecker) CheckTransactionFee(references map[*common2.Input]common2.Output) error {
 	log.Debug("DefaultChecker checkTransactionFee begin")
 	txn := t.parameters.Transaction
-	//blockHeight := t.parameters.BlockHeight
-	fee := getTransactionFee(txn, references)
+	fee, err := t.authoritativeFee(references)
+	if err != nil {
+		log.Warn("[CheckTransactionFee],", err)
+
+		return err
+	}
 	if t.isSmallThanMinTransactionFee(fee) {
 		log.Debug("DefaultChecker checkTransactionFee fee too small end")
 
@@ -831,6 +858,19 @@ func (t *DefaultChecker) CheckTransactionFee(references map[*common2.Input]commo
 	log.Debug("DefaultChecker checkTransactionFee end")
 
 	return nil
+}
+
+// authoritativeFee returns THE fee for this transaction: the strict, per-asset,
+// ELA-only result at and above StrictMoneyRangeHeight, and the legacy asset-blind
+// aggregate below it. See CheckTransactionFee (XM-03).
+func (t *DefaultChecker) authoritativeFee(
+	references map[*common2.Input]common2.Output) (common.Fixed64, error) {
+	if t.parameters.BlockHeight < t.parameters.Config.StrictMoneyRangeHeight {
+		return getTransactionFee(t.parameters.Transaction, references), nil
+	}
+
+	return blockchain.GetTxFeeStrict(t.parameters.Transaction,
+		core.ELAAssetID, references)
 }
 
 func checkOutputProgramHash(height uint32, programHash common.Uint168) error {

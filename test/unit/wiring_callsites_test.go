@@ -364,6 +364,65 @@ var requiredCallSites = []callSite{
 		why: "the cleaner must decide on the block's OWN header height, not on main-chain " +
 			"membership -- the index an interrupted rollback leaves stale",
 	},
+	{
+		finding: "XM-01 (COINBASE CROSS-ASSET MINT)",
+		file:    "core/transaction/coinbasetransaction.go", fn: "CheckTransactionOutput",
+		callee:   "checkCoinbaseOutputAssets",
+		mustArgs: []string{"blockHeight", "chainParams.StrictMoneyRangeHeight"},
+		why: "the coinbase is the one transaction that creates outputs with no inputs, and " +
+			"above PublicDPOSHeight it had NO AssetID constraint at all; without this call a " +
+			"block producer can stamp any 32-byte asset id onto real, spendable chain state",
+	},
+	{
+		finding: "XM-02 (PER-ASSET CONSERVATION)",
+		file:    "core/transaction/transactionchecker.go", fn: "ContextCheck",
+		callee:   "blockchain.GetTxFeeStrict",
+		mustArgs: []string{"core.ELAAssetID"},
+		why: "this is the ONLY per-asset conservation check reached by a transaction whose " +
+			"SpecialContextCheck returns end=true, which short-circuits before " +
+			"CheckTransactionFee -- the F-166 bypass class",
+	},
+	{
+		finding: "XM-02 parent link (block connect)",
+		file:    "blockchain/blockvalidator.go", fn: "checkTxsContext",
+		callee:   "GetTxFeeStrict",
+		mustArgs: []string{"core.ELAAssetID", "references"},
+		why: "the block-connect enforcement of per-asset conservation and the source of the " +
+			"ELA-only fee total; severing it disarms XM-02 for every transaction at once",
+	},
+	{
+		finding: "XM-03 (ONE AUTHORITATIVE FEE)",
+		file:    "core/transaction/transactionchecker.go", fn: "CheckTransactionFee",
+		callee: "authoritativeFee",
+		why: "the minimum-fee gate and SetFee must consume the same fee result block " +
+			"validation uses; the asset-blind getTransactionFee that used to sit here is " +
+			"what fed a non-ELA leg into the claimable DPoS reward pool",
+	},
+	{
+		finding: "XM-03 (ONE AUTHORITATIVE FEE)",
+		file:    "core/transaction/transactionchecker.go", fn: "authoritativeFee",
+		callee:   "blockchain.GetTxFeeStrict",
+		mustArgs: []string{"core.ELAAssetID"},
+		why: "asking for any other asset, or dropping the strict form, restores the " +
+			"two-fee-bases split this closed",
+	},
+	{
+		finding: "XM-04 (DPOS REWARD STATE)",
+		file:    "dpos/state/arbitrators.go", fn: "getBlockDPOSReward",
+		callee:   "SumBlockTxFees",
+		mustArgs: []string{"block.Height", "a.ChainParams.RevisedDPoSRewardHeight"},
+		why: "the reward STATE is the side that mints (accumulativeReward -> " +
+			"arbitersRoundReward -> claimable, spendable ELA); it must read the single " +
+			"shared fee definition, not its own asset-blind sum",
+	},
+	{
+		finding: "XM-04 (DPOS REWARD STATE)",
+		file:    "blockchain/blockvalidator.go", fn: "GetBlockDPOSReward",
+		callee:   "state.SumBlockTxFees",
+		mustArgs: []string{"block.Height", "b.chainParams.RevisedDPoSRewardHeight"},
+		why: "the validator's pre-gate reward leg must read the SAME definition as the " +
+			"state, or the two can drift apart again exactly as F-011 left them",
+	},
 }
 
 // funcBody finds the (possibly method) declaration named fn in file.

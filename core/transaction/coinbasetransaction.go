@@ -62,6 +62,12 @@ func (t *CoinBaseTransaction) CheckTransactionOutput() error {
 			return errors.New("reward to foundation in coinbase < 30%")
 		}
 	} else {
+		// XM-01: restore the per-output AssetID guard that the post-PublicDPOSHeight
+		// branch dropped. See checkCoinbaseOutputAssets.
+		if err := checkCoinbaseOutputAssets(t.Outputs(), blockHeight,
+			chainParams.StrictMoneyRangeHeight); err != nil {
+			return err
+		}
 		// check the ratio of FoundationAddress reward with miner reward
 		totalReward = t.Outputs()[0].Value + t.Outputs()[1].Value
 		if len(t.Outputs()) == 2 && foundationReward <
@@ -70,6 +76,48 @@ func (t *CoinBaseTransaction) CheckTransactionOutput() error {
 		}
 	}
 
+	return nil
+}
+
+// checkCoinbaseOutputAssets closes XM-01: the coinbase is the ONE transaction that can
+// create outputs with no inputs backing them, and above PublicDPOSHeight it was the one
+// transaction with NO AssetID constraint at all. The pre-PublicDPOSHeight branch of
+// CheckTransactionOutput loops every output demanding core.ELAAssetID; the branch taken by
+// every block since height 402,680 simply has no such loop, and nothing downstream restores
+// it -- blockchain.CheckTransactionOutput carries the identical asymmetry, and
+// checkCoinbaseTransactionContext pins the reward VALUES and (most of) the addresses but
+// never the asset. A block producer could therefore stamp any 32-byte AssetID onto a
+// coinbase reward output. That output is then indexed as an ordinary spendable UTXO
+// (blockchain/indexers/unspentindex.go ConnectBlock appends every output index of every
+// transaction; its IsCoinBaseTx() branch only skips INPUT retirement, and only RegisterAsset
+// transactions are excluded), and UTXOCache.GetTxReference resolves it by txid+index with no
+// asset validation -- so the fabricated asset is real, spendable chain state. Combined with
+// the per-asset fee accounting (GetTxFeeMapStrict) it is the entry point for turning a
+// fabricated asset into ELA, which is why "RegisterAsset is banned, so non-ELA is
+// unreachable" is not a sound argument.
+//
+// This method is NOT dead, unlike the coinbase's SpecialContextCheck/ContextCheck (see the
+// note above SpecialContextCheck): CheckBlockSanity (blockchain/blockvalidator.go) iterates
+// block.Transactions from index 0 and calls BlockChain.CheckTransactionSanity ->
+// txn.SanityCheck -> DefaultChecker.SanityCheck -> Transaction.CheckTransactionOutput, which
+// dispatches here for the coinbase. It also carries the block height, so the guard can be
+// gated where it stands rather than relocated.
+//
+// Gate: StrictMoneyRangeHeight -- gate 1, the coordinated recovery gate that already carries
+// the other coinbase guards (F-013 frozen outputs, F-031/FV-19 locktime pin, F-089 BIP30).
+// No new gate and no new config literal. Below it the expression is left exactly as it was,
+// so retained history replays byte-identically; a full scan of all 2,260,597 retained blocks
+// found ZERO outputs carrying a non-ELA AssetID, so the guard rejects no retained block
+// either way.
+func checkCoinbaseOutputAssets(outputs []*common2.Output, blockHeight, gate uint32) error {
+	if blockHeight < gate {
+		return nil
+	}
+	for _, output := range outputs {
+		if output.AssetID != core.ELAAssetID {
+			return errors.New("asset ID in coinbase is invalid")
+		}
+	}
 	return nil
 }
 

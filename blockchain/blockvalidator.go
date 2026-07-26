@@ -1154,6 +1154,31 @@ func IsFinalizedTransaction(msgTx interfaces.Transaction, blockHeight uint32) bo
 // GetTxFeeMapStrict is the post-activation fee calculation. Unlike
 // GetTxFeeMap it rejects negative amounts, per-amount money-range breaches and
 // signed 64-bit overflow instead of wrapping.
+//
+// XM-02: it also rejects a NEGATIVE per-asset fee. SubtractFixed64 guards overflow but
+// not sign, so pre-fix an asset that appeared in the outputs with no (or insufficient)
+// input backing simply produced feeMap[asset] < 0 and no error. Because every caller asks
+// only for feeMap[core.ELAAssetID], a negative entry for some OTHER asset was silently
+// discarded -- that is the missing per-asset conservation rule: a transaction could emit
+// value in an asset it never spent. It is also the leg that turns a fabricated coinbase
+// asset (XM-01) into ELA: inputs {FAKE:X, ELA:Y} -> outputs {ELA:Y+X-fee} leaves
+// feeMap[ELA] = -(X-fee) (accepted pre-fix) and feeMap[FAKE] = X, minting X-fee ELA that
+// no ELA input backs. Rejecting the negative entry makes conservation explicit and
+// per-asset: for every asset, outputs <= inputs, with the coinbase -- the one transaction
+// allowed to create value -- structurally excluded from this path (checkTxsContext
+// iterates from index 1, and mempool/txpool.go rejects a coinbase outright).
+//
+// No documented tx type needs an exception: every non-coinbase type either has zero
+// outputs (illegal-evidence, UpdateVersion, ActivateProducer, RevertToPOW/DPOS,
+// CustomIDResult, DposV2ClaimReward, NextTurnDPOSInfo) or spends real UTXOs for its
+// outputs (transfer, CRCAppropriation, CRCProposal*Withdraw, ReturnSideChainDepositCoin,
+// ExchangeVotes/ReturnVotes), so none legitimately runs an asset negative.
+//
+// The function itself carries no block height, but it does not need one: BOTH of its
+// production call sites are already inside `>= StrictMoneyRangeHeight` branches
+// (checkTxsContext above, and DefaultChecker.ContextCheck in
+// core/transaction/transactionchecker.go), and the pre-gate paths use GetTxFeeMap /
+// GetTxFee, which are untouched. Below the gate nothing about fee acceptance changes.
 func GetTxFeeMapStrict(tx interfaces.Transaction,
 	references map[*common.Input]common.Output) (map[Uint256]Fixed64, error) {
 	feeMap := make(map[Uint256]Fixed64)
@@ -1191,6 +1216,13 @@ func GetTxFeeMapStrict(tx interfaces.Transaction,
 		fee, err := SubtractFixed64(inputs[outputAssetID], outputValue)
 		if err != nil {
 			return nil, fmt.Errorf("transaction fee amount: %w", err)
+		}
+		// XM-02: per-asset conservation. A negative fee means this transaction
+		// emitted more of outputAssetID than it spent, i.e. created value out of
+		// nothing in that asset.
+		if !MoneyRange(fee) {
+			return nil, fmt.Errorf("transaction fee amount for asset %s: %w",
+				outputAssetID.String(), ErrMoneyRange)
 		}
 		feeMap[outputAssetID] = fee
 	}
@@ -1362,11 +1394,14 @@ func RecordCRCProposalAmountStrict(usedAmount *Fixed64,
 	return nil
 }
 
+// GetBlockDPOSReward is the pre-RevisedDPoSRewardHeight arbiter reward leg. XM-04: the
+// fee total is no longer summed here -- it comes from state.SumBlockTxFees, the SINGLE
+// definition shared with the DPoS reward state (dpos/state/arbitrators.go
+// getBlockDPOSReward), so the validator and the state cannot drift apart again. Below the
+// gate SumBlockTxFees returns the legacy expression verbatim, so this is byte-identical.
 func (b *BlockChain) GetBlockDPOSReward(block *Block) Fixed64 {
-	totalTxFx := Fixed64(0)
-	for _, tx := range block.Transactions {
-		totalTxFx += tx.Fee()
-	}
+	totalTxFx := state.SumBlockTxFees(block.Transactions, block.Height,
+		b.chainParams.RevisedDPoSRewardHeight)
 	return Fixed64(math.Ceil(float64(totalTxFx+
 		b.chainParams.GetBlockReward(block.Height)) * 0.35))
 }

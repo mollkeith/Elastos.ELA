@@ -3127,11 +3127,65 @@ func (a *Arbiters) dumpInfo(height uint32) {
 	printer(crInfo+nrInfo+ccInfo+ncInfo, append(append(append(crParams, nrParams...), ccParams...), ncParams...)...)
 }
 
-func (a *Arbiters) getBlockDPOSReward(block *types.Block) common.Fixed64 {
-	totalTxFx := common.Fixed64(0)
-	for _, tx := range block.Transactions {
-		totalTxFx += tx.Fee()
+// SumBlockTxFees is THE definition of a block's transaction-fee total for the DPoS
+// arbiter reward leg. It has exactly two consumers and they must never disagree:
+// blockchain.GetBlockDPOSReward (the validator's pre-RevisedDPoSRewardHeight coinbase
+// check) and Arbiters.getBlockDPOSReward (the reward STATE, whose output becomes
+// claimable ELA). It lives here because dpos/state cannot import blockchain.
+//
+// XM-04: the F-011/F-086 fix unified the validator onto the ELA-only fee basis at
+// RevisedDPoSRewardHeight (blockchain.GetBlockDPOSRewardStrict, fed by checkTxsContext's
+// GetTxFeeStrict(ELAAssetID) total) but left the STATE summing the asset-blind tx.Fee().
+// The state is the side that mints: accumulateReward -> a.accumulativeReward and
+// clearingDPOSReward -> distributeDPOSReward -> a.arbitersRoundReward. So the half that
+// was fixed only rejected a bad coinbase, while the half that was missed kept crediting
+// arbiters on the wider basis.
+//
+// The repair has two halves that must land together. XM-03 makes tx.Fee() itself the
+// authoritative ELA-only value at and above StrictMoneyRangeHeight, so "sum tx.Fee()" and
+// "sum GetTxFeeStrict(ELAAssetID)" are the same number by construction. This function
+// makes the remaining shape identical to checkTxsContext's: start at index 1 (the coinbase
+// contributes nothing to a fee total; blockchain.CalculateTxsFee skips it too), and refuse
+// to let a non-positive fee move the total. Overflow is rejected rather than wrapped.
+//
+// Gate: RevisedDPoSRewardHeight -- gate 2, the fresh future activation the core engineers
+// asked reward-rule changes to take, and the exact height at which the validator already
+// switches bases. Below it the legacy expression is returned verbatim (every transaction,
+// wrapping addition), so retained history and the window before activation are
+// byte-identical. No new gate and no new config literal.
+func SumBlockTxFees(txs []interfaces.Transaction, height, revisedGate uint32) common.Fixed64 {
+	if height < revisedGate {
+		// Legacy, verbatim: bug-compatible with every block validated to date.
+		totalTxFx := common.Fixed64(0)
+		for _, tx := range txs {
+			totalTxFx += tx.Fee()
+		}
+
+		return totalTxFx
 	}
+
+	totalTxFx := common.Fixed64(0)
+	for i := 1; i < len(txs); i++ {
+		fee := txs[i].Fee()
+		if fee <= 0 {
+			// Unreachable once XM-02 is armed (GetTxFeeMapStrict rejects a
+			// negative per-asset fee); defence in depth, and it keeps this
+			// total identical to checkTxsContext's under every input.
+			continue
+		}
+		sum, err := common.AddFixed64(totalTxFx, fee)
+		if err != nil || !common.MoneyRange(sum) {
+			return totalTxFx
+		}
+		totalTxFx = sum
+	}
+
+	return totalTxFx
+}
+
+func (a *Arbiters) getBlockDPOSReward(block *types.Block) common.Fixed64 {
+	totalTxFx := SumBlockTxFees(block.Transactions, block.Height,
+		a.ChainParams.RevisedDPoSRewardHeight)
 
 	return common.Fixed64(math.Ceil(float64(totalTxFx+
 		a.ChainParams.GetBlockReward(block.Height)) * 0.35))
