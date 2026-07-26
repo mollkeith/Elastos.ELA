@@ -2,7 +2,7 @@
 
 All notable changes to Elastos.ELA are recorded here.
 
-This file covers `d8488bf..96d1a4e6`, the **132 commits** of the v1.0.0 recovery. This changelog commit sits on top of that range, so `d8488bf..HEAD` is one more.
+This file covers `89d707d..96d1a4e6`, the **132 commits** of the v1.0.0 recovery. This changelog commit sits on top of that range, so `89d707d..HEAD` is one more.
 The thematic sections below were written when the range held 112. Fifteen later
 commits are not described here; `docs/v1.0.0-review.html` indexes and explains all
 132, and is the authoritative catalogue.
@@ -15,7 +15,7 @@ commits are not described here; `docs/v1.0.0-review.html` indexes and explains a
 the root commit below names it — but it was never released, so v1.0.0 is the
 first shipped release since v0.9.9.6. (No `v0.9.9.7` tag is present in this
 repository.) This
-repository's root commit `d8488bf` is a squashed snapshot ("ELA v0.9.9.7 + all
+repository's root commit `89d707d` is a squashed snapshot ("ELA v0.9.9.7 + all
 our fixes + battle/exploit tests"), so the entries below are the delta against
 **that snapshot**, not against released v0.9.9.6. See
 `RELEASE-MANIFEST.md` — the v0.9.9.6 delta is an **OPEN / BLOCKED** manifest
@@ -33,8 +33,8 @@ coordinated mainnet heights. There is no third, and none may be added.
 
 | Gate | Constant | Mainnet value | Introduced |
 |---|---|---|---|
-| **Gate 1** | `StrictMoneyRangeHeight` | **2 260 451** | inherited from the `d8488bf` snapshot |
-| **Gate 2** | `RevisedDPoSRewardHeight` | **2 265 000** | **new in v1.0.0** (`e646a5d`, value set in `80378ab`) |
+| **Gate 1** | `StrictMoneyRangeHeight` | **2 260 451** | inherited from the `89d707d` snapshot |
+| **Gate 2** | `RevisedDPoSRewardHeight` | **2 265 000** | **new in v1.0.0** (`94690f3`, value set in `cb0f8e0`) |
 
 * **Gate 1 = `ForcedRollbackHeight + 1`.** The coordinated recovery rewinds the
   chain to **2 260 450** and restarts on 2 260 451, so gate 1 arms on the first
@@ -56,7 +56,7 @@ coordinated mainnet heights. There is no third, and none may be added.
   0..2 260 450 on the shipped binary, compared against the frozen store, has
   not been performed** and is an `OPEN` item in `RELEASE-MANIFEST.md`.
 * Gate 2's value **must be confirmed by the core engineers before deployment**
-  and must be identical fleet-wide (`80378ab`).
+  and must be identical fleet-wide (`cb0f8e0`).
 
 ### Contents
 
@@ -81,7 +81,7 @@ The forced rollback is how the fleet leaves the exploit chain. These commits
 make it crash-atomic, make its own claims about disk true, and stop a node that
 did **not** complete it from quietly joining the recovered network.
 
-* **`ca0288e`** — Purge discarded blocks from the raw block store on forced
+* **`0430082`** — Purge discarded blocks from the raw block store on forced
   rollback. **Was:** `ForceRollback` removed the header index, the height
   indexes and the tx-index siblings, but never the by-hash location entry in
   ffldb bucket `ffldb-blockidx` — the single chokepoint every by-hash serve path
@@ -93,24 +93,24 @@ did **not** complete it from quietly joining the recovered network.
   design. **Note for keystone comparisons:** bucket `0x00000001` now
   legitimately differs from an unpurged baseline by exactly the discarded keys.
 
-* **`733d3ee`** — Offline residue cleaner for nodes that already rolled back.
+* **`61b4360`** — Offline residue cleaner for nodes that already rolled back.
   **Was:** `ForceRollback` is idempotent, so a node that rewound on the earlier,
   non-purging code would never revisit the residue. **Operator:** new
   `ela-cli purgeresidue` (node stopped). It deletes a raw-store entry only when
   it is both off the retained main chain **and** above the rollback target, is
   idempotent, and refuses on networks where forced rollback is disabled.
 
-* **`5ab8614`** — Same purge on the **manual** `ela-cli rollback` path, which
+* **`b4fc194`** — Same purge on the **manual** `ela-cli rollback` path, which
   carried the identical residue.
 
-* **`a1fe3d9`** — Sweep above-target **orphan** blocks. **Was:** the in-line
+* **`b7c229c`** — Sweep above-target **orphan** blocks. **Was:** the in-line
   purge walked only the accepted main chain, so an above-target side/orphan
   block that was stored but never joined the best chain survived. The real
   mainnet store has exactly one (`c34b71f2…`, header height 2 260 595) and a
   purged node still served it. **Operator:** `ForceRollback` alone now reaches
   clean-forward-sync parity; measured residue above target went 1 → 0.
 
-* **`a12eb91`** — Make the forced rollback crash-atomic. **Was:** the per-block
+* **`aa04d0f`** — Make the forced rollback crash-atomic. **Was:** the per-block
   rewind ran three transactions in the order `DBRemoveBlockNode` →
   `RollbackBlock` → `DBRemoveBlockFromStore`; the first destroys the header row
   the block index is rebuilt from at startup, which drives both the arming
@@ -126,7 +126,7 @@ did **not** complete it from quietly joining the recovered network.
   lines with elapsed time replace ~2, and interrupts are handled on block
   boundaries.
 
-* **`6ee9e5d`** — Separate **ARMED** from **APPLIED** on the boot path.
+* **`815d38d`** — Separate **ARMED** from **APPLIED** on the boot path.
   **Was:** `forcedRollbackFired` only meant "this node holds the chain the
   rollback targets", and the boot path read it as "the rollback happened".
   Measured in a 48-node rehearsal: a capacity-exceeded rewind was **declined
@@ -141,7 +141,7 @@ did **not** complete it from quietly joining the recovered network.
   read-only pre-flight (`PreflightForcedRollback`) refuses, with a remedy,
   before anything destructive when the store is damaged.
 
-* **`faf868e`** — Make the rollback's durability claims true. **Was:** ffldb
+* **`eb4a3cd`** — Make the rollback's durability claims true. **Was:** ffldb
   answers reads through a 20 MiB / 300 s in-memory cache, so `ForceRollback`
   logged "persisted store verified clean" while describing the **write cache**.
   Measured: a copy of the data directory taken the instant that line was printed
@@ -156,7 +156,7 @@ did **not** complete it from quietly joining the recovered network.
   `database.DB.FlushCache()`. Limit stated in-tree: it can only refuse on
   evidence this binary wrote.
 
-* **`21098e0`** — `--datadir` default shadowed the configured `DataDir`.
+* **`e6153e0`** — `--datadir` default shadowed the configured `DataDir`.
   **Was:** `cmdcom.DataDirFlag` is declared with `Value: config.DataDir`, so
   `c.String("datadir")` is never empty and the flag default always won.
   Measured with the real `ela-cli`: the rollback ran against `./elastos/data`
@@ -167,7 +167,7 @@ did **not** complete it from quietly joining the recovered network.
   remains inert — `config.ConfigFile` is a const — so run the commands from the
   node's working directory.)
 
-* Related operator-facing fix, landed in `6ee9e5d` (**FV-18**): `ela-cli
+* Related operator-facing fix, landed in `815d38d` (**FV-18**): `ela-cli
   rollback 2260450` — the **positional** form both remedy strings printed — hit
   `if c.NumFlags() == 0 { ShowSubcommandHelp; return nil }`, printed help and
   **exited 0** without touching the store, so a runbook step checking the exit
@@ -181,7 +181,7 @@ did **not** complete it from quietly joining the recovered network.
 Per the standing rule, every inflation- or mint-class claim here was proven
 empirically or is explicitly labelled deferred.
 
-* **`13a094a`** — **F-015, live mainnet theft (gate 1).** **Was:** the
+* **`3dfd191`** — **F-015, live mainnet theft (gate 1).** **Was:** the
   real-withdraw family (`CRCProposalRealWithdraw`,
   `DposV2ClaimRewardRealWithdraw`, `VotesRealWithdraw`) is exempt from
   `RunPrograms`, so the *only* authorization is that inputs come from the
@@ -191,24 +191,24 @@ empirically or is explicitly labelled deferred.
   **Operator:** every input and the Votes/DPoSV2 change output are now bound to
   the correct per-type treasury. Honest withdrawals draw from and return to the
   treasury, so nothing legitimate is rejected. Proven on-chain against the live
-  rehearsal chain in `9d2be09`. `F-218` was **refuted** in the same commit (the
+  rehearsal chain in `8cc3743`. `F-218` was **refuted** in the same commit (the
   proposed bind would have rejected every legitimate cross-chain withdraw).
 
-* **`9777985`** — **F-011/086, coinbase over-issuance (re-gated to gate 2 in
-  `e646a5d`).** **Was:** the DPoS arbiter coinbase leg was validated against a
+* **`40b0d2b`** — **F-011/086, coinbase over-issuance (re-gated to gate 2 in
+  `94690f3`).** **Was:** the DPoS arbiter coinbase leg was validated against a
   reward computed on an **all-asset** fee basis while the CR and miner legs used
   the ELA-filtered basis. A producer spending a self-issued non-ELA UTXO worth V
   could hand-craft a coinbase that passed all three checks and minted
   `ceil(0.35·V)` of unbacked ELA, repeatable per block. **Operator:** at and
   above gate 2 the arbiter reward derives from the ELA-filtered fee, the same
   basis as the other legs. For any all-ELA block the two bases are identical, so
-  no honest block changes. **Classified DORMANT by measurement** (`df066d4`): a
+  no honest block changes. **Classified DORMANT by measurement** (`eb566e7`): a
   full scan of all 2 260 597 retained blocks found **zero** outputs with a
   non-ELA asset id, ever, and `F-056` bans `RegisterAsset` at and above gate 1,
   so the precondition is structurally unreachable. Kept as defence in depth.
-  Empirical wedge proof in `b4cea44`.
+  Empirical wedge proof in `a5d4336`.
 
-* **`e646a5d`** — **F-212, empty DPoS arbiter slot reward paid twice (gate
+* **`94690f3`** — **F-212, empty DPoS arbiter slot reward paid twice (gate
   2).** **Was:** the empty-slot loop added `individualBlockConfirmReward` to the
   burned total but not to `realDPOSReward`, so the caller's
   `change = reward - realDPOSReward` was over-stated and the same reward was
@@ -219,12 +219,12 @@ empirically or is explicitly labelled deferred.
   engineers' answers (F-056, F-057, ELA-only-by-design, rollback-is-masking,
   trigger byte-order).
 
-* **`80378ab`** — Gate 2 given its value: `MainNetRevisedDPoSRewardHeight =
+* **`cb0f8e0`** — Gate 2 given its value: `MainNetRevisedDPoSRewardHeight =
   2265000`. **Was:** `math.MaxUint32`, which shipped F-212, F-032 and F-011/086
   as dead code. **Operator:** this single value must be identical fleet-wide and
   is pending core-engineer confirmation.
 
-* **`bc3fc36`** — **B4: same-block double-pay (gate 1).** **Was:** the mempool
+* **`cfdd5bb`** — **B4: same-block double-pay (gate 1).** **Was:** the mempool
   conflict manager rejects two conflicting stake/reward/withdraw/tracking
   transactions, but block validation never mirrored those slots — so an on-duty
   producer could bypass its own mempool and pack both into **one block**, giving
@@ -235,7 +235,7 @@ empirically or is explicitly labelled deferred.
   two *different* identities of the same type in one block stay legal. `F-088`
   (a claimed StakePool drain) was **refuted** empirically.
 
-* **`6c2a3ac`** — Four more mirrored slots (gate 1): `F-047` duplicate
+* **`7e6b65e`** — Four more mirrored slots (gate 1): `F-047` duplicate
   `CRCProposalWithdraw` on one proposal hash (double CRExpenses payout),
   `F-068` two `ReturnDepositCoin` with disjoint UTXOs both refunding against the
   same committed balance (over-refund of a forfeited bond), `F-071` two council
@@ -243,7 +243,7 @@ empirically or is explicitly labelled deferred.
   **Replay-safety measured:** a read-only scan of all 145 mainnet blocks in
   [2 260 451, 2 260 595] found zero occurrences of any mirrored type.
 
-* **`2e6533b`** — Cross-chain same-block and V2 dedup gaps (gate 1 where
+* **`a82d62f`** — Cross-chain same-block and V2 dedup gaps (gate 1 where
   acceptance-changing): `F-016` double `ReturnSideChainDepositCoin` refunding
   one sidechain deposit; `F-017` two `WithdrawFromSideChain` crediting one burn
   (the sidechain hash rides in output payloads that `CheckDuplicateTx` never
@@ -252,13 +252,13 @@ empirically or is explicitly labelled deferred.
   reorged V2 burn. `CRAssetsRectify` was checked as an F-015 sibling and found
   **already guarded**.
 
-* **`92b4906`** — **F-104 / F-118 NFTDestroy id dedup (gate 1).** **Was:** a
+* **`74593dc`** — **F-104 / F-118 NFTDestroy id dedup (gate 1).** **Was:** a
   repeated NFT id inside one payload, and two same-block NFTDestroy transactions
   sharing an id, both double-applied the destroy (rights and reward).
   **Operator:** duplicate ids rejected within a transaction and across a block.
   *Live sidechain proof of this pair remains deferred — see Known limits.*
 
-* **`dcedb58`** — **F-073 cross-key reward misallocation (gate 1).** Corrects
+* **`923c78d`** — **F-073 cross-key reward misallocation (gate 1).** Corrects
   our own earlier claim that F-104/F-118 closed F-073 — they do not; they close
   a same-id collision, while the hole is on the reward **key** with distinct
   ids. Proven empirically by driving the real state machine through
@@ -267,13 +267,13 @@ empirically or is explicitly labelled deferred.
   stake-address set derived from its own ids is rejected at and above gate 1; a
   legitimate new owner is a user stake address and is never affected.
 
-* **`b50d37e` (FV-09)** — The F-073 guard was **intra-transaction only** and
+* **`009ac5c` (FV-09)** — The F-073 guard was **intra-transaction only** and
   split across two same-block transactions. Closed at block scope (gate 1) plus
   a rollback-closure correction that measures the credit inside the forward
   closure so apply/revert are exact inverses. Accounting defect — **no mint, no
   supply inflation.**
 
-* **`298b9f8`** — **F-013, frozen-address rule unenforced on the coinbase (gate
+* **`d7d0933`** — **F-013, frozen-address rule unenforced on the coinbase (gate
   1).** **Was:** the "no sends **to** a frozen address" half of the quarantine
   ran only for block transactions `[1:]`; the coinbase has its own validator and
   its merge-miner output is producer-chosen and unconstrained, so a coinbase
@@ -282,41 +282,41 @@ empirically or is explicitly labelled deferred.
   coinbase output paying a configured frozen address is rejected at and above
   gate 1.
 
-* **`b942543` / `dbfe812` (FV-19)** — **F-031, immature coinbase spend (gate
+* **`7eb4fd1` / `c5af886` (FV-19)** — **F-031, immature coinbase spend (gate
   1).** **Was:** the 100-block coinbase maturity window is derived from the
   coinbase's **own** `LockTime`, which nothing validated, so an elected producer
   could set it to 0 (or to a future value and underflow `uint32`) and spend the
-  reward before maturity, defeating reorg safety. `dbfe812` then proved the
+  reward before maturity, defeating reorg safety. `c5af886` then proved the
   shipped pin **inert** — it lived in `CoinBaseTransaction.SpecialContextCheck`,
   which nothing on the block-connect path calls — moved it to the live validator
   and deleted the dead copy, and closed the `checkInvalidUTXO` underflow behind
   the same gate. **Measured:** across the retained chain, coinbases with
   `LockTime != height`: **zero**.
 
-* **`3187a25`** — **F-056 empirical exploit proof (test-only).** Drives the real
+* **`cea5053`** — **F-056 empirical exploit proof (test-only).** Drives the real
   unspent index against a real ffldb: a UTXO spent by a `RegisterAsset`
   transaction is never retired, so a later transfer re-spends it — a real double
   spend, reproduced 6×. The fix (banning `RegisterAsset` at and above gate 1)
   was already shipped.
 
-* **`dad1f68`** — **F-089 coinbase remint proof (test-only).** Two identical
+* **`8a66c48`** — **F-089 coinbase remint proof (test-only).** Two identical
   coinbases resurrect a spent output through the real unspent index. The
   upstream `checkCoinbaseBIP30` guard rejects the duplicate-coinbase block
   before connect; this proves the mechanism it prevents.
 
-* **`b4cea44`**, **`df066d4`** — Empirical proof and DORMANT classification of
-  the non-ELA fee wedge (test-only; see `9777985`).
+* **`a5d4336`**, **`eb566e7`** — Empirical proof and DORMANT classification of
+  the non-ELA fee wedge (test-only; see `40b0d2b`).
 
-* **`3d3ab1c`** — Closes two evidence gaps: proves the **BIP30 duplicate-txid
+* **`c6a098e`** — Closes two evidence gaps: proves the **BIP30 duplicate-txid
   oracle itself** against a real ffldb-backed store, and drives the real
   Arbiters capture → cold restart → recover path for F-096.
 
-* **`5ee6adb`** — **F-100 / F-083 (gate 1).** Two same-block registrations
+* **`76d0737`** — **F-100 / F-083 (gate 1).** Two same-block registrations
   sharing a public key — producer↔producer or producer↔CR — bound one key to two
   identities; and a second same-member council claim-node touched one member
   twice, which the History contract forbids.
 
-* **`dbfe812` (NX-10/FV-08)** — Completes that parity (gate 1): the mempool
+* **`c5af886` (NX-10/FV-08)** — Completes that parity (gate 1): the mempool
   holds **five** transaction types in one node-key slot and **two** in the
   nickname slot; the block mirror had two of five and **no nickname handling at
   all**. Nicknames matter because the state keyframe stores them as a **set** —
@@ -327,7 +327,7 @@ empirically or is explicitly labelled deferred.
   producer transactions replanted with a synthetic same-block partner →
   2 310/2 310 rejected here, 0/2 310 on canonical.
 
-* **`8a56f10` (NX-04, gate 1)** — The CR claim-node validator never checked the
+* **`609b2ab` (NX-04, gate 1)** — The CR claim-node validator never checked the
   claimed node key against the producer **owner** keyspace, so one council
   member could shadow any producer's owner identity: registration lockout,
   deposit lockout and a permanent third-party voter stake **lock** (not a mint).
@@ -343,7 +343,7 @@ Everything in this section is reorg/rollback-only and therefore **ungated**
 unless stated: those closures never run during linear replay, so retained
 history derives byte-identically.
 
-* **`e376150`** — **F-093 / F-094 / F-106: make the emergency `ForceChange`
+* **`0423487`** — **F-093 / F-094 / F-106: make the emergency `ForceChange`
   transactional with block connect.** **Was:** `connectBlock` runs
   `PreProcessSpecialTx` *first* — before context checks, before confirm
   validation and before the block is stored — and the emergency force-change was
@@ -357,23 +357,23 @@ history derives byte-identically.
   on success and undone on every failure exit; `utils.History` gains
   `Savepoint`/`UndoTo`.
 
-* **`dcacb82` → `3d2816f`** — The first F-093 attempt (bind the force-change to
+* **`9748149` → `1ef5088`** — The first F-093 attempt (bind the force-change to
   `block.Height`) was **reverted**: block H is not yet stored when
   `PreProcessSpecialTx` runs, so the binding produced a block/height mismatch.
   Recorded because the unit tests exercised only the height helper and missed
-  it. Superseded by `e376150`.
+  it. Superseded by `0423487`.
 
-* **`131edce`** — **N-001:** four DPoS-gossip callers opened the new savepoint
+* **`a83b0cb`** — **N-001:** four DPoS-gossip callers opened the new savepoint
   and never closed it, so the next failing connect or rollback **silently
   reversed a live emergency force-change** (7→5 arbiters) — a new divergence our
   own fix introduced, remotely triggerable. **Operator:** all four now commit
   unconditionally, restoring the pre-fix permanent-gossip semantics.
 
-* **`7ba33da`** — `Arbiters.RollbackSeekTo` did not clear a pending savepoint,
+* **`9148ad6`** — `Arbiters.RollbackSeekTo` did not clear a pending savepoint,
   so an uncommitted emergency change could **outlive a seek** and a later undo
   could over-pop, leaving `forceChanged=true` with the marker gone.
 
-* **`3748b74`** — The emergency bracket was three separate lock acquisitions, so
+* **`27aeffa`** — The emergency bracket was three separate lock acquisitions, so
   two brackets on different goroutines interleaved. Measured worse than
   predicted: 8 goroutines against one real Arbiters produced **14+ data races**
   and a torn arbiter set (5→2). **Operator:** a dedicated `specialTxMtx` is held
@@ -381,13 +381,13 @@ history derives byte-identically.
   **not** self-acquire — the confirm-failure path reaches them while the lock is
   already held, and self-acquiring would deadlock.
 
-* **`82dc348`** — **N-001 R2:** four more brackets on the checkpoint side (the
+* **`39fe40a`** — **N-001 R2:** four more brackets on the checkpoint side (the
   startup replay, both `OnBlockSaved` sites, and reset/restore) mutate the same
   state and were left open. Startup is **not** single-threaded — the DPoS
   arbitrator starts before `InitCheckpoint`. Fail-on-pristine measured 36 data
   races with both locks reverted.
 
-* **`17f1c09`** — **G1: an AB-BA deadlock introduced by our own commits.** Three
+* **`228a6f7`** — **G1: an AB-BA deadlock introduced by our own commits.** Three
   sites held `specialTxMtx` across `events.Notify`, and exactly one subscriber
   dispatched inline into `LockSpecialTx`, closing the cycle. Measured: the
   package test wedged at its 30 s watchdog and `events.mtx` was then held for the
@@ -395,9 +395,9 @@ history derives byte-identically.
   (matching its two siblings), and `connectBlock` splits so the block-connected
   broadcast happens outside the bracket. The full lock-order graph is recorded
   in the commit. Also reported, **not ours and not fixed**: a pre-existing
-  `a.mtx ↔ s.mtx` back edge present byte-for-byte at `d8488bf`.
+  `a.mtx ↔ s.mtx` back edge present byte-for-byte at `89d707d`.
 
-* **`937caf4`** — **F-041 / F-090: malleable AuxPow encoding (gate 1).**
+* **`f58852b`** — **F-041 / F-090: malleable AuxPow encoding (gate 1).**
   **Was:** `ParentHash` and the high bits of `ParMerkleIndex` are never
   validated, yet the header folds the whole AuxPow into `HashWithAux()`, whose
   tail seeds DPoSV2 committee selection — while the block's consensus identity
@@ -407,7 +407,7 @@ history derives byte-identically.
   `ParMerkleIndex` ever; last non-canonical `ParentHash` at height 2 090 418,
   170 033 blocks below the gate.
 
-* **`2526a6b`** — **The production side of F-041.** `pow.SolveBlock` never
+* **`6a676af`** — **The production side of F-041.** `pow.SolveBlock` never
   stamped `ParentHash`, so **every self-mined block** left the search with
   `ParentHash = 0x00…00` and would be rejected by the new gate — i.e. a
   self-mining node could not produce the first block of the restart, and
@@ -416,8 +416,8 @@ history derives byte-identically.
   the search goes stale on the first iteration). Merge-mining via
   `submitauxblock` is unaffected.
 
-* **`f6ea5b2`** — **T0 / NX-01: the F-032 block-validity binding is WITHDRAWN.**
-  **Was:** `f2270bc` made block validity a function of
+* **`da430dd`** — **T0 / NX-01: the F-032 block-validity binding is WITHDRAWN.**
+  **Was:** `08af9af` made block validity a function of
   `lastBlock.Confirm.Proposal.Sponsor` — a value nothing commits to (it rides
   outside `Block.Hash()`), which producer and validator derived by **different**
   rules, and about which honest nodes legitimately disagree after a view change.
@@ -433,22 +433,22 @@ history derives byte-identically.
   negative heights and duplicates, and logs byte count/entry count/SHA-256 for
   fleet comparison.
 
-* **`accaa11`** — **F-168:** the inactivity rollback closure hard-coded
+* **`94bc370`** — **F-168:** the inactivity rollback closure hard-coded
   `workedInRound` back to `true`, so a reorg across a round boundary made a
   producer that had **not** sponsored a block look as if it had.
 
-* **`f26ffc7`, `02e41e0`, `c01951c`** — **F-075 / F-065 and siblings.** F-075:
+* **`e627c06`, `8f0841a`, `a749950`** — **F-075 / F-065 and siblings.** F-075:
   the expired-NFT revert closure carried an **active, unmatched** subtraction
   from `UsedDposV2Votes`, deflating a new owner's used-vote count on reorg and
   inflating castable rights. F-065: `DepositOutputs` was written directly (no
   History wrap) in four places, so a rollback left stale entries that got baked
   into the local keyframe checkpoint — a reorged node diverges from a
-  canonically synced one. `c01951c` then fixed the fix: an unconditional delete
+  canonically synced one. `a749950` then fixed the fix: an unconditional delete
   is **not** the inverse of a set when the key pre-existed (found by a failing
-  `TestCommitee_RollbackCRCBlendTx`, git-bisected to `f26ffc7`); the value and
+  `TestCommitee_RollbackCRCBlendTx`, git-bisected to `e627c06`); the value and
   its existence are now captured and restored.
 
-* **`b6faaa5`** — **Class-E batch.** `F-064` (critical): the undo guard re-read
+* **`7db8817`** — **Class-E batch.** `F-064` (critical): the undo guard re-read
   a counter the forward pass had **zeroed**, so a producer stayed **stuck
   Inactive** after a reorg across the threshold. `F-215`: the undo hard-set the
   producer to `Canceled` instead of restoring the captured state. `F-180`: the
@@ -458,30 +458,30 @@ history derives byte-identically.
   (`F-130`, a history-capacity guard, was prototyped and **reverted** — it broke
   the silent-nil `RollbackTo` contract callers rely on.)
 
-* **`b942543` (F-048)** — The `ChangeProposalOwner` revert captured the owner of
+* **`7eb4fd1` (F-048)** — The `ChangeProposalOwner` revert captured the owner of
   the **change** proposal instead of the owner of the **target** proposal it
   actually mutates, so a reorg dropping a mismatch-owner change transaction
   restored the **wrong** owner. Governance-consistency divergence after a reorg;
   the recipient reverted correctly, so not theft.
 
-* **`0b8b482`** — **F-181:** the forward delete from `DposV2EffectedProducers`
+* **`e5302f4`** — **F-181:** the forward delete from `DposV2EffectedProducers`
   was decided on a pre-block capture but the revert **re-derived** membership and
   only ever added, so a producer present before the block was silently dropped on
   reorg. `len()` of that map feeds `isDposV2Active()`.
 
-* **`e6dc1fd`, `7be226e`** — **F-131:** `History.RollbackTo` set `height` but not
+* **`c8815c3`, `0734014`** — **F-131:** `History.RollbackTo` set `height` but not
   `seekHeight`, so a later commit computed a `uint32` difference that
-  **underflowed to ~4.29e9** and corrupted the seek loop. `7be226e` replaces the
+  **underflowed to ~4.29e9** and corrupted the seek loop. `0734014` replaces the
   first test, which passed on pristine too, with one that exercises the real
   harm (`RollbackTo` → `SeekTo`).
 
-* **`ceea0d9`** — **F-144:** two CR checkpoint paths bound the history-member
+* **`fb0e080`** — **F-144:** two CR checkpoint paths bound the history-member
   lookup to a **throwaway** committee object that is discarded immediately and
   never advanced, and nothing re-registers afterwards — so the wrong binding
   persisted for the node's lifetime and post-reset lookups resolved against
   frozen state.
 
-* **`d9a6ec6`** — **t3-state (six findings).** `FV-01` (high): nothing ever
+* **`6526a13`** — **t3-state (six findings).** `FV-01` (high): nothing ever
   lowers a checkpoint height, so after a deep reset a restored checkpoint that
   was **ahead of the chain** made both the startup replay and the attach loop
   no-ops — the node ran at full block height with **empty CR/DPoS state**. New
@@ -500,23 +500,23 @@ history derives byte-identically.
   never got F-064's capture, so a reorg left a CR member stuck inactive — out of
   the CRC set that carries the multisig quorum — with its penalty never reverted.
 
-* **`b50d37e` (FV-06, gate 1)** — Illegal-confirm validation took its majority
+* **`009ac5c` (FV-06, gate 1)** — Illegal-confirm validation took its majority
   **threshold** from the *current* committee while checking **membership**
   against the evidenced-height snapshot, and let one signer set span multiple
   snapshot frames. Now one frame decides both.
 
-* **`8e574e7`** — **F-139:** `ConsensusBlockCache.Reset` appended kept hashes to
+* **`8b4e76e`** — **F-139:** `ConsensusBlockCache.Reset` appended kept hashes to
   the **old** list instead of the new one, so the rebuilt list still carried
   every dropped block and diverged from its own map.
 
-* **`8ebff84`** — Corrects a factually wrong in-tree rationale (`History.Append`
+* **`005cfb4`** — Corrects a factually wrong in-tree rationale (`History.Append`
   **defers** apply to `Commit`; it does not run it synchronously), adds a
   contract comment at `Append`, and records that F-073's soundness rests on fix
   **interaction** with F-104/F-118, not on apply timing. Also re-pins gate 2 to
   Disabled on non-mainnet default arms for symmetry.
 
 
-* **`8bce9e7` (F-064b)** - **The `F-064` fix above was incomplete.** The Class-E
+* **`12f829a` (F-064b)** - **The `F-064` fix above was incomplete.** The Class-E
   batch captured the counter, but the inactivity-threshold undo still *computed*
   three further fields rather than restoring them: it hard-set `inactiveSince` to
   `0`, re-derived `activateRequestHeight`, and cleared `selected`. A reorg across
@@ -530,7 +530,7 @@ history derives byte-identically.
   untouched and retained history keeps its verdict. Ungated, and safe ungated,
   because revert closures never run during linear replay.
 
-* **`36eba35`, `486e4fc`, `d69680a`, `96d1a4e`** - **The class is now measured,
+* **`84aacec`, `5f84417`, `0ef56e0`, `35bc98e`** - **The class is now measured,
   not asserted.** The rollback tests already in this tree compare two producers
   with a helper that examines **9 of 22 fields**, and several maps by `len()`
   alone. They were structurally incapable of seeing any field `F-064b` touches,
@@ -550,18 +550,18 @@ history derives byte-identically.
 
 ## 4. Authorization bypasses
 
-* **`679855e` + `997c5be`** — **F-022 (gate 1):** the arbiter special-transaction
+* **`7ba6e14` + `48d8f5c`** — **F-022 (gate 1):** the arbiter special-transaction
   checks validated only the multisig **code** and never verified the parameter
   signatures over the transaction, so **anyone** could forge an unsigned
   `InactiveArbitrators` / `RevertToDPOS` with all-public inputs and trigger a
-  permissionless emergency force-change or consensus downgrade. `997c5be` is the
+  permissionless emergency force-change or consensus downgrade. `48d8f5c` is the
   important follow-up: the second code path gated on the **current tip** rather
   than the block height, so a fresh-from-genesis replay (tip pinned above the
   gate) would re-verify signatures on **all** historical special transactions —
   violating the fix's own replay-safety invariant and risking a bootstrap brick.
   Now threaded on block height everywhere.
 
-* **`219de01`** — **B3: producer-transaction auth fall-throughs (gate 1).**
+* **`acbbed8`** — **B3: producer-transaction auth fall-throughs (gate 1).**
   `F-039` / `F-069` (live, permissionless): the payload-version dispatch
   authenticated only *defined* versions, so an **unknown** version fell through
   with **no owner proof** and cancelled or rewrote an arbitrary producer —
@@ -574,7 +574,7 @@ history derives byte-identically.
   band, so no legitimate transaction is rejected. `F-004` verified and
   **refuted** as a distinct finding.
 
-* **`6e97c74`** — **F-049 / F-091 (gate 1).** F-049: a Standard/Deposit-prefixed
+* **`7074589`** — **F-049 / F-091 (gate 1).** F-049: a Standard/Deposit-prefixed
   program whose code hashed to the address but was neither Schnorr, Standard nor
   MultiSig fell through `RunPrograms` with **no signature check at all** —
   anyone-can-spend of any UTXO parked at such an address. F-091: multisig
@@ -583,7 +583,7 @@ history derives byte-identically.
   above gate 1; this required threading the block height through `RunPrograms`
   (and deliberately **not** gating on the tip — the F-022 lesson).
 
-* **`8ee5a55`** — **Gate-deny batch (gate 1).** `F-026`: `RegisterProducer`
+* **`01bf9e2`** — **Gate-deny batch (gate 1).** `F-026`: `RegisterProducer`
   gates the Schnorr version but `UpdateProducer`/`CancelProducer` did not, so the
   Schnorr re-key path was bounded only by the general Schnorr height. `F-046`:
   `UpdateCR` inherited a no-op version check, so unknown/dormant payload versions
@@ -592,14 +592,14 @@ history derives byte-identically.
   recipient bindings and reached only the owner-signature check — an
   unconstrained-output withdrawal.
 
-* **`6396036`** — **F-052 (gate 1):** `NFTDestroyFromSideChain` carries a genesis
+* **`f7bbc4b`** — **F-052 (gate 1):** `NFTDestroyFromSideChain` carries a genesis
   block hash that was never checked against each NFT's recorded origin, so an
   arbiter-signed destroy could name **any** sidechain. Flagged in-code: unlike
   its sibling F-074, a mismatch is *silently* accepted, so absence from the
   re-derived band is not scan-provable — confirm absence or move to a fresh
   dormant height if any node re-derives by replay.
 
-* **`2734a9e`** — **F-185: the aggregate-Schnorr withdraw was not dormant (gate
+* **`0017ebe`** — **F-185: the aggregate-Schnorr withdraw was not dormant (gate
   1).** **Was:** `SchnorrStartHeight` was enforced in one direction only —
   nothing rejected a **V2 payload below** it — so the V2 path was dispatchable at
   **any** height even though mainnet has the feature disabled
@@ -618,19 +618,19 @@ history derives byte-identically.
 
 ## 5. RevertToPOW, confirm and illegal-evidence integrity
 
-* **`0c7d991`** — **F-098:** the `RevertToPOW` type dispatch had no default arm;
+* **`04ad550`** — **F-098:** the `RevertToPOW` type dispatch had no default arm;
   unknown types now default-reject.
 
-* **`50aa3c4` → `43552ef` → `ed54844`** — **F-057, the forged DPoS→POW stall.**
+* **`69f819d` → `a8aacb1` → `a41416c`** — **F-057, the forged DPoS→POW stall.**
   **Was:** the in-block check measures "time since the previous block" from the
   block's **own header timestamp**, which its producer writes, and sanity only
   bounds a header at adjusted-time + 7 200 s. Because
   `RevertToPOWNoBlockTimeV1` (7 200 s) **equals** `MaxTimeOffsetSeconds`
   (7 200 s), a producer could post-date one header by exactly the stall window
   and force DPoS→POW with **zero elapsed time**.
-  * `50aa3c4` first closed it by additionally requiring the validating node's
+  * `69f819d` first closed it by additionally requiring the validating node's
     own median-adjusted clock to confirm the interval.
-  * `43552ef` (**FV-22**) **withdrew** that: the node clock is local wall time
+  * `a8aacb1` (**FV-22**) **withdrew** that: the node clock is local wall time
     plus a median over up to 199 **peer** samples, so two honest nodes with
     identical chain state and different peer sets reach opposite accept/reject
     verdicts on the same block — a category error in an acceptance decision, and
@@ -639,7 +639,7 @@ history derives byte-identically.
     sits below the parent's own timestamp in 2 241 of 2 241 samples (mean
     601.5 s) and in all 30 historical RevertToPOW blocks, so it would have been
     ~600 s *more* permissive than the rule it replaced.
-  * `ed54844` is the owner's decision, **option (b)**: at and above gate 1 the
+  * `a41416c` is the owner's decision, **option (b)**: at and above gate 1 the
     in-block branch demands `noBlockTime + MaxTimeOffsetSeconds` — more than a
     producer can manufacture, so whatever it post-dates, at least `noBlockTime`
     of **real** time must have elapsed since the parent. Deterministic and
@@ -649,7 +649,7 @@ history derives byte-identically.
     transactions lie below gate 1, so **zero** retained blocks change verdict;
     but 28 of the 29 `NoBlock` rescues would have had to wait longer (min
     6 807 s, max 7 188 s). **Emergency failsafe latency goes from ~2 h to ~4 h.**
-  * `43552ef` also fixed **FV-22 change 1** (ungated): the interval was measured
+  * `a8aacb1` also fixed **FV-22 change 1** (ungated): the interval was measured
     from the validating node's **current tip**, not the block's own parent —
     wrong on a competing branch. Now threaded from the block path. Measured: over
     all 2 260 596 heights every block links to a stored parent, and all 29
@@ -657,7 +657,7 @@ history derives byte-identically.
     (margins +12 s to +42 040 s — note the 12 s minimum: this rule has almost no
     historical slack).
 
-* **`43552ef` (NX-06, gate 1)** — **A confirm nobody checked.** The block path
+* **`a8aacb1` (NX-06, gate 1)** — **A confirm nobody checked.** The block path
   skips the **only** membership and quorum check on three legs: below
   `CRCOnlyDPOSHeight`, on a block carrying a `RevertToPOW`, and when the node is
   in POW mode. On those legs a confirm arriving with the block was **stored and
@@ -674,7 +674,7 @@ history derives byte-identically.
   (343 400 + 1 299 = 344 699). *Residual: still open **below** gate 1 for a node
   syncing from genesis — runbook item.*
 
-* **`248115a`** — **Illegal-evidence batch (gate 1).** `F-029`: the signer check
+* **`ec3718e`** — **Illegal-evidence batch (gate 1).** `F-029`: the signer check
   admitted a **padded** signer list (duplicates, real signers dropped) that still
   matched the vote count and stayed a subset, so a submitter could steer the
   punished intersection and **shield a colluding double-signer**; now strict set
@@ -688,14 +688,14 @@ history derives byte-identically.
   dedup bypass. Now folded onto a logical identity. **Census:** zero
   illegal-block evidence transactions in 2 260 597 blocks.
 
-* **`2b4b662`** — **F-030 closeout (gate 1):** the cross-block fix could not see
+* **`6bd3160`** — **F-030 closeout (gate 1):** the cross-block fix could not see
   a second encoding **inside the same block** (committed-state reads do not see
   the block under validation, and full-transaction-hash dedup does not collapse
   re-encodings), so the illegal penalty could be applied twice. A same-block arm
   covering all five special-transaction types now uses the **same** key function
   as the read and write paths.
 
-* **`b50d37e` (NX-08, gate 1)** — The illegal-**proposal** and illegal-**vote**
+* **`009ac5c` (NX-08, gate 1)** — The illegal-**proposal** and illegal-**vote**
   dedup keys were still malleable: the header deserializer discards its trailing
   sentinel without asserting the buffer was consumed, so **one appended byte**
   minted a fresh key, and one genuine equivocation could mint unbounded evidence
@@ -714,7 +714,7 @@ valid. None of these changes an acceptance decision.
 
 **Unauthenticated remote node-kill and information disclosure**
 
-* **`09d5de4`** — **F-036: remote node-kill via REST `/api/v1/restart`.**
+* **`2578463`** — **F-036: remote node-kill via REST `/api/v1/restart`.**
   Proven: two concurrent unauthenticated GETs, 5/5 runs, process exit code 2.
   Auth exists only in the JSON-RPC server; REST and WebSocket have none, and the
   route ran `Stop(); Start()` in a **bare goroutine** where the tree's `Fatal`
@@ -730,7 +730,7 @@ valid. None of these changes an acceptance decision.
   is deliberately **not** shipped: it would 403 every cross-host consumer on
   upgrade.
 
-* **`b8fdecd`** — **The node-info port served pprof.** `net/http/pprof`'s `init`
+* **`21d3e2e`** — **The node-info port served pprof.** `net/http/pprof`'s `init`
   registers on the global default mux, which the info service used with a nil
   handler — so an unauthenticated `GET /debug/pprof/cmdline` returned **the full
   process argv**, and the keystore password can be passed as `--password`.
@@ -738,7 +738,7 @@ valid. None of these changes an acceptance decision.
   routes 404 there. A second pprof surface via the profiler exists but only when
   `ProfilePort != 0` (off by default).
 
-* **`ef4cccd`** — **T1: three more unauthenticated kills.** `FV-03`: a payload
+* **`7cb1ec7`** — **T1: three more unauthenticated kills.** `FV-03`: a payload
   decoder passed three wire varints straight to `make` as **capacity**,
   reachable **pre-handshake** over the tx message (the first message of a
   connection is fully decoded before it is checked to be a Version) — **40
@@ -758,7 +758,7 @@ valid. None of these changes an acceptance decision.
 
 **Parse, bounds and allocation guards**
 
-* **`bc9bacd`** — **B7 (six findings).** `F-203`: the multisig-code parser had
+* **`3df9ee5`** — **B7 (six findings).** `F-203`: the multisig-code parser had
   only an entry-length guard, so its advanced reads sliced out of bounds —
   pre-auth, before any signature check. `F-204`: a 1-byte CR code with a crafted
   matching id reached a negative-length slice. `F-172`: an AuxPow guard counted
@@ -768,33 +768,33 @@ valid. None of these changes an acceptance decision.
   before any budget check (remote OOM). `F-188`: a map **write** under a read
   lock → Go's uncatchable "concurrent map read and map write".
 
-* **`fd200aa`** — **B8.** `F-050`: a Schnorr program with a short parameter
+* **`911932a`** — **B8.** `F-050`: a Schnorr program with a short parameter
   panicked the copy — pre-auth, P2P-relayed. `F-034`: an empty bloom filter with
   a non-zero hash count divided by zero. `F-076`: a TOCTOU nil-deref between the
   loaded check and the match. `F-077`: the per-peer requested-transaction map was
   unbounded. `F-042` verified **already closed**.
 
-* **`509d9ce`** — **Halt-DoS batch:** `F-133`/`F-099` two `len<2` index panics on
+* **`68702b7`** — **Halt-DoS batch:** `F-133`/`F-099` two `len<2` index panics on
   multisig code; `F-132` a zero-input parent coinbase; `F-153` a missing `return`
   that passed a **nil peer** to association; `F-010` a nil check on the wrong
   value; `F-171` an empty snapshot key list indexed at `len-1`.
 
-* **`fd63b77`** — **Finding H:** the two structurally identical siblings of
+* **`972134a`** — **Finding H:** the two structurally identical siblings of
   F-099 in the block-validator copy were missed, and they **are** reachable
   pre-auth — the revert-to-DPoS check is literally a direct call from the DPoS
   gossip handler, with no sanity check, so a gossiped message with empty programs
   or a <2-byte code panics the receiving **CRC arbiter**.
 
-* **`0c75385`** — **F-058:** the next-arbiters comparison length-checked only one
+* **`31a99d0`** — **F-058:** the next-arbiters comparison length-checked only one
   of two lists and indexed the attacker-supplied one.
 
-* **`1b0c772`** — **F-001:** an unguarded `int64 +=` could wrap a huge
+* **`12c898e`** — **F-001:** an unguarded `int64 +=` could wrap a huge
   cross-chain transfer negative and misclassify it as *small* — confirmed
   reachable in the mempool wherever gate 1 is disabled. Mempool-routing only, no
   mint/theft/consensus effect. `F-038`, `F-063`, `F-079` verified **already
   closed**.
 
-* **`b439675`** — **Deserialize errors:** `F-053` a ~10-byte fragment declaring
+* **`c6a7490`** — **Deserialize errors:** `F-053` a ~10-byte fragment declaring
   16 MB forced a 16 MB allocation that was then discarded on error — reads are
   now chunked above a 64 KB pre-allocation cap, byte- and error-identical
   otherwise (the 16 MB ceiling is deliberately **not** lowered; that would reject
@@ -805,12 +805,12 @@ valid. None of these changes an acceptance decision.
   requiring the header sentinel would reject inputs accepted today on consensus
   paths.
 
-* **`ff8c6de`** — Nil-receiver guard on the async event-bus path into the
+* **`3038a10`** — Nil-receiver guard on the async event-bus path into the
   transaction pool.
 
-* **`a0152da`, `1a5aa44`** — **The nil class at the two checkpoint rebuild
-  sites.** `a0152da` fixed two nil dereferences and **claimed** the rebuild then
-  equalled a genesis-fresh object; `1a5aa44` shows that claim was wrong — it
+* **`478ff09`, `0cc9837`** — **The nil class at the two checkpoint rebuild
+  sites.** `478ff09` fixed two nil dereferences and **claimed** the rebuild then
+  equalled a genesis-fresh object; `0cc9837` shows that claim was wrong — it
   fixed the symptom and **unmasked a worse one**. A machine-generated reflective
   audit of every field found **nine** divergences, one genuinely reachable: an
   index-written map left nil, so gossip arriving after a reset or deep rollback
@@ -826,7 +826,7 @@ valid. None of these changes an acceptance decision.
 
 **Networking, sync and pool retention**
 
-* **`e9324d1`** — `F-136`: both DPoS hub read sites allocated from a wire uint32
+* **`08ee9a2`** — `F-136`: both DPoS hub read sites allocated from a wire uint32
   before any bound, so one unauthenticated TCP connection forced a **~4 GiB**
   allocation (measured 67 MB for a 64 MB claim, pristine); now capped at the same
   32 MB ceiling the writer already enforces. `F-148`: a disconnect with a request
@@ -837,7 +837,7 @@ valid. None of these changes an acceptance decision.
   cap**, deliberately, because decoding keys eagerly would flip currently
   accepted programs to rejected.
 
-* **`e320c5f`** — P2P server/peer batch. `F-150`/`F-116`: `QueueMessage` blocked
+* **`c55db8c`** — P2P server/peer batch. `F-150`/`F-116`: `QueueMessage` blocked
   **forever** on a full queue whose only drainer had not started yet, wedging the
   single peer-handler goroutine and taking down peer management server-wide.
   `F-152`: a failed dial left a DNS seed disabled for the **lifetime of the
@@ -849,7 +849,7 @@ valid. None of these changes an acceptance decision.
   `MaxPeers` with a floor of `MaxPeers/2`. `F-214`: ban scores for oversized
   block locators and filter loads.
 
-* **`fb52e2f`** — `F-114`: the sync slot and target height were taken from an
+* **`cab9c99`** — `F-114`: the sync slot and target height were taken from an
   **unverified attacker-supplied** header height, and a claim of `0xffffffff`
   pinned the slot to that peer **forever** while every other peer's inventory was
   dropped; now clamped. `F-035`: the stall check lived where a hijacking peer's
@@ -860,7 +860,7 @@ valid. None of these changes an acceptance decision.
   announcement caused a **full block load and deserialize** off the flat-file
   store, with no ban score anywhere on the path.
 
-* **`5394f09`** — `F-092`: the block pool accepted any sanity-valid block at
+* **`2f9e012`** — `F-092`: the block pool accepted any sanity-valid block at
   **any height** (the only work gate is a `PowLimit` of 2²⁵⁵−1) and the sweep only
   dropped entries *below* the reference, so a far-future block was retained for
   the process lifetime; a `uint32` underflow also dropped the **whole pool**
@@ -869,7 +869,7 @@ valid. None of these changes an acceptance decision.
   forever. The membership check for confirms is **deferred** (acceptance-changing
   and redundant on both real paths).
 
-* **`8a56f10`** — `FV-15`: the pool evicted by **height** while keyed by
+* **`609b2ab`** — `FV-15`: the pool evicted by **height** while keyed by
   **hash**, so unlimited distinct blocks could sit at one retained height, and
   the sweep's only driver was the block-connected path — a stalled chain never
   swept. `FV-17`: a bounded queue drained into an **unbounded** pending list held
@@ -879,7 +879,7 @@ valid. None of these changes an acceptance decision.
   forever. `NX-07`: the persistent small-cross-transfer record was cleaned only
   on the block path, plus two leaked leveldb iterators.
 
-* **`0907eb1`** — RPC/mempool hardening: `F-149` unbounded REST POST body;
+* **`c7b718e`** — RPC/mempool hardening: `F-149` unbounded REST POST body;
   `F-161` WebSocket read limit, session cap and a torn-read race; `F-162`
   server timeouts; `F-163` a zero-count mining request that took the mining flags
   and never released them; `F-019` unfinalized transactions admitted to the pool;
@@ -887,7 +887,7 @@ valid. None of these changes an acceptance decision.
   zero-input special transaction left in the pool. Also closes a real
   `Start`/`Stop` race on the server pointer.
 
-* **`66bb738`** — `F-113`: six committee methods **wrote** state while holding
+* **`3e01760`** — `F-113`: six committee methods **wrote** state while holding
   only a **read** lock. `F-137`: two DPoS block-recovery stubs returned a **nil
   error**, telling the manager recovery had succeeded while nothing was appended;
   they now return an explicit "unimplemented" error (reviving the dormant
@@ -898,20 +898,20 @@ valid. None of these changes an acceptance decision.
 
 ## 7. Durability and state growth
 
-* **`6bd18d4`, `aa2cfb4`** — **F-096:** the DPoS checkpoint serialized the
+* **`3471b0f`, `be45da5`** — **F-096:** the DPoS checkpoint serialized the
   force-changed flag but **not** the degradation state, so a cold restart lost it
   and the startup replay re-triggered a **spurious emergency force-change**.
   Persisted as a trailing back-compatible block (legacy checkpoints default
   cleanly).
 
-* **`7e342c6`, `7990622`** — **KS-ALIAS-01:** two producer maps are **alias
+* **`eca394b`, `e971b04`** — **KS-ALIAS-01:** two producer maps are **alias
   indexes** holding the same pointer as one of the five owning state maps, but
   both persistence primitives allocate fresh objects, so after any restore or
   snapshot the index entry became a **stale frozen duplicate** — the mechanism
   behind the observed restore-baseline dependence of the persisted DPoS keyframe.
   Fixed by re-pointing at the canonical producer; **no key is ever added or
   removed**, which matters because one of those `len()`s is consensus-visible.
-  `7990622` is a test-hardening follow-up after an adversarial pass **refuted the
+  `e971b04` is a test-hardening follow-up after an adversarial pass **refuted the
   test, not the code**: three broken variants passed all six committed tests
   because every fixture started aliased, so direction and probe order were
   unobservable. It also **corrects the record** of the previous commit: one index
@@ -919,14 +919,14 @@ valid. None of these changes an acceptance decision.
   is dead for every restart-era block and touches only the immutable field the
   fix keys on.
 
-* **`de69504`** — **F-142 / F-165:** a checkpoint deserializer read each entry
+* **`9606ba3`** — **F-142 / F-165:** a checkpoint deserializer read each entry
   off the wire and **never stored it**, so every round-trip or restart returned
   an **empty** map and wiped the pending real-withdraw queues → peer desync.
   Same commit: `F-074` (gate 1) a length mismatch between two independently
   counted slices was accepted and then **panicked on ProcessBlock** — a consensus
   halt; and `F-040`/`F-073` reorg-rollback fixes proven empirically.
 
-* **`eef3fe5`** — **Checkpoint durability.** `F-122`: the save opened the
+* **`50e29e2`** — **Checkpoint durability.** `F-122`: the save opened the
   **final** path with truncate *before* serializing anything and never fsynced,
   so a serialize error destroyed the good checkpoint on disk and a power cut left
   a short file that still "exists" — which is exactly the input `F-121` chokes
@@ -943,7 +943,7 @@ valid. None of these changes an acceptance decision.
   disk path was correct; the omission was test-visible only). `F-187` recorded as
   gate-required and deferred.
 
-* **`d72b378`** — **State growth.** `F-124`: the rollback persisted the
+* **`58c8d46`** — **State growth.** `F-124`: the rollback persisted the
   **discarded child's** work sum next to the parent. `F-170`: `snapshot()` copied
   the maps but left a set nil and fourteen scalars zeroed — a snapshot was not a
   copy of the frame it came from. `F-209`: a map debited to zero never removed
@@ -960,7 +960,7 @@ The single most dangerous configuration outcome is a node that resolves to
 **mainnet identity** while its incident gates are **disabled** — it would follow
 the corrupt chain and fork itself off the recovered fleet.
 
-* **`68c0219`** — **F-043 part 1.** The params switch has **no default**, so an
+* **`9f19c4c`** — **F-043 part 1.** The params switch has **no default**, so an
   unrecognized label keeps full mainnet params, while the gate helpers switch on
   the **same string with a different case set** and send anything unrecognized to
   a default that disables **every** incident control. Empirically reproduced per
@@ -972,17 +972,17 @@ the corrupt chain and fork itself off the recovered fleet.
   disabling the gates is a *tested, intentional* contract for private/forked
   nets.
 
-* **`1012981`** — Prerequisite: a malformed `FoundationAddress` was parsed with
+* **`ae7a448`** — Prerequisite: a malformed `FoundationAddress` was parsed with
   the error **discarded**, so the genesis derivation nil-dereferenced ~40 lines
   later with a panic naming neither field nor cause — and that panic fired
   *before* the refuse-to-start gate could ever run, on exactly the malformed
   configs it targets.
 
-* **`cbc8541`, `b214e6a`, `7b0b707`** — **F-043 part 2 / G3: refuse to start.**
+* **`73df3f3`, `cb74be5`, `598c24f`** — **F-043 part 2 / G3: refuse to start.**
   The guard discriminates by foundation **identity**, not by label (unknown
   labels are legitimate for private nets), and panics if any incident gate is
-  disabled on a mainnet identity. `b214e6a` moves it **after** sterilization, or a
-  private net with a custom foundation address would be falsely refused. `7b0b707`
+  disabled on a mainnet identity. `cb74be5` moves it **after** sterilization, or a
+  private net with a custom foundation address would be falsely refused. `598c24f`
   is the important hardening: `ArmIncidentGates` (below) is exactly what converts
   a caught typo into a **silent off-fleet mainnet node**, because its whole
   purpose is to stop the default arms disabling the pins — so no sentinel is left
@@ -1000,7 +1000,7 @@ the corrupt chain and fork itself off the recovered fleet.
   so a pin that a future mislabelled config bypasses is caught too. Every
   mismatch is reported in one message.
 
-* **`e4237a4`, `633e347`** — **`ArmIncidentGates`.** **Was:** non-mainnet
+* **`fd238b9`, `0f8ed43`** — **`ArmIncidentGates`.** **Was:** non-mainnet
   configurations had every incident gate hard-overwritten to disabled and
   `config.json` could not override it, so **every gate-1 fix was inert on
   testnet** and a green testnet run proved nothing about them. **Operator:** an
@@ -1010,12 +1010,12 @@ the corrupt chain and fork itself off the recovered fleet.
   weakening mainnet — locked in by a test that sets the flag together with
   hostile overrides across five mainnet label spellings.
 
-* **`61c8e9e`** — Gate 2 was left **unpinned** for mainnet while gate 1 and the
+* **`38a6114`** — Gate 2 was left **unpinned** for mainnet while gate 1 and the
   rollback values were pinned, even though it is CLI-overridable and
   consensus-affecting. A no-op while dormant, but once gate 2 has a value a
   mainnet override would silently diverge reward math from the fleet.
 
-* **`0e9cf73`** — **Schnorr activation heights were not pinned.** The F-185 gate
+* **`8676b6e`** — **Schnorr activation heights were not pinned.** The F-185 gate
   hangs off `SchnorrStartHeight`, which is mainnet-disabled but was settable from
   `config.json` and `--schnorrstartheight`. Two consequences of lowering it: the
   rogue-key aggregate withdraw path becomes dispatchable again, **and** the node
@@ -1029,7 +1029,7 @@ the corrupt chain and fork itself off the recovered fleet.
 
 ## 9. Cryptography and key material
 
-* **`1f6bc9a`** — **F-059 (critical) and F-190: secret material drawn from
+* **`5f8906f`** — **F-059 (critical) and F-190: secret material drawn from
   `math/rand`.** F-059: the keystore IV (16 B) and master key (32 B) were drawn
   back-to-back from a generator seeded with the wall clock, and the IV is written
   to `keystore.dat` **in plaintext** — a 128-bit oracle that confirms a candidate
@@ -1047,9 +1047,9 @@ the corrupt chain and fork itself off the recovered fleet.
   changed: the block-seeded generator behind arbiter selection — that is
   consensus-deterministic and replacing it would fork the chain.
 
-* **`2734a9e`** — F-185, see [§4](#4-authorization-bypasses).
+* **`0017ebe`** — F-185, see [§4](#4-authorization-bypasses).
 
-* **`47bb3d7`, `33e12f8`** — **F-205: producer payload signatures are
+* **`56d3a20`, `b26d993`** — **F-205: producer payload signatures are
   context-free bearer credentials.** Proven against the production validator: the
   signature covers the payload alone — no network magic, no genesis hash, no
   nonce, no binding to the carrying transaction — so anyone can lift a published
@@ -1063,7 +1063,7 @@ the corrupt chain and fork itself off the recovered fleet.
   signed message changes what **every wallet signs** and, gated at 2 260 451,
   activates on the first block of the recovery fork with no upgrade window. The
   headline "cross-network replay" is **refuted** for input-spending transactions.
-  `33e12f8` then corrects **two overstatements in our own commit**: keying a
+  `b26d993` then corrects **two overstatements in our own commit**: keying a
   blacklist on (message‖r) is *not* defeated by signature malleability (measured:
   zero duplicates across all four families in eight years), and the
   exploitability figure was ~10× overstated — only **14** producers are actually
@@ -1074,7 +1074,7 @@ the corrupt chain and fork itself off the recovered fleet.
 
 ## 10. Build, tooling and test infrastructure
 
-* **`e549b83`** — **Tooling hygiene.** `F-158`: CRC helper scripts echoed **raw
+* **`32bac42`** — **Tooling hygiene.** `F-158`: CRC helper scripts echoed **raw
   private keys** to stdout and dumped the unlocked account with `%+v`, so the
   operator's own signing key went to shell history and CI logs. `F-159`: six
   white-box arbiter private keys were **compiled into `ela-cli`**; they move to a
@@ -1093,13 +1093,13 @@ the corrupt chain and fork itself off the recovered fleet.
   `F-164` **refuted** on this tree; `F-211` deliberately not actioned (dependency
   bumps do not belong in a consensus batch).
 
-* **`9d2be09`** — **The on-chain harness** (`cmd/onchainharness`), self-contained
+* **`8cc3743`** — **The on-chain harness** (`cmd/onchainharness`), self-contained
   and importing the tree's own serialization so wire bytes are always faithful.
   Used to prove F-015 on a live rehearsal chain. Also records two grounded setup
   corrections found empirically, not from memory (reproducing DPoSV2 on a regnet
   needs **both** the DPoSV2 and the vote start heights lowered).
 
-* **`bcb35d9`** — **G2: prove every guard is ARMED, not merely correct.** The
+* **`380cfd6`** — **G2: prove every guard is ARMED, not merely correct.** The
   blocker: **10 of 17 wiring mutations severed a live production guard with the
   entire suite green** — a test that asserts on a helper passes even when nothing
   calls the helper. Test-only (the production diff is empty): 19 new files, each
@@ -1107,9 +1107,9 @@ the corrupt chain and fork itself off the recovered fleet.
   run, **all 45 discriminated**. Reports two gaps rather than hiding them: three
   crash-guard tests live in packages outside the 8-suite gate, and
   `CalcPastMedianTime(nil)` panics three lines after an explicit nil guard
-  (pre-existing at `d8488bf`, not fixed under a test-only mandate).
+  (pre-existing at `89d707d`, not fixed under a test-only mandate).
 
-* **`7be226e`, `3d3ab1c`, `df066d4`, `7990622`, `633e347`** — Test-only commits
+* **`0734014`, `c6a098e`, `eb566e7`, `e971b04`, `0f8ed43`** — Test-only commits
   that replace tests which passed on pristine, or which drove an internal helper
   instead of the production dispatch. Several are recorded as corrections to our
   own earlier evidence.
@@ -1118,24 +1118,24 @@ the corrupt chain and fork itself off the recovered fleet.
 
 ## 11. Documentation and corrected in-tree claims
 
-* **`ce1ccd3`** — Comment-only. Corrects a WebSocket session-cap comment that
+* **`11e734d`** — Comment-only. Corrects a WebSocket session-cap comment that
   claimed an overshoot "is bounded" without naming a bound (it is bounded by the
   attacker's connection concurrency, not by any constant of ours), and records
   that a snapshot-ring nil guard is belt-and-braces rather than the thing that
   clears the ring.
 
-* **`4667fdf`** — Comment-only. Retracts a stale claim that a "height-gated
-  F-057 fix" is active; at that commit there was none (see `ed54844`, which then
+* **`5ec4d4b`** — Comment-only. Retracts a stale claim that a "height-gated
+  F-057 fix" is active; at that commit there was none (see `a41416c`, which then
   closed it).
 
-* **`8ebff84`**, **`33e12f8`**, **`1a5aa44`**, **`dcedb58`**, **`7990622`**,
-  **`b50d37e`** each also correct a claim this campaign itself had made.
+* **`005cfb4`**, **`b26d993`**, **`0cc9837`**, **`923c78d`**, **`e971b04`**,
+  **`009ac5c`** each also correct a claim this campaign itself had made.
 
 ---
 
 ## 12. Release metadata
 
-* **`be39057`** — **Version.** The tree carried **no** version string: the
+* **`d314bad`** — **Version.** The tree carried **no** version string: the
   Makefile injected `git describe --dirty --always --tags`, so a release binary's
   identity was a property of the **builder's working copy**. Measured on the
   canonical tree with the pinned toolchain: a git checkout produced
@@ -1151,9 +1151,9 @@ the corrupt chain and fork itself off the recovered fleet.
   `<branch>-<sha>` so a development build stays self-identifying. No consensus
   code touched; no height literal added.
 
-* **`0b3a9b1`** — this file and `RELEASE-MANIFEST.md`.
+* **`4bdeb19`** — this file and `RELEASE-MANIFEST.md`.
 
-* **`29796fd`** — **Release assurance (B3).** `go.sum` is now **tracked** (587
+* **`3063533`** — **Release assurance (B3).** `go.sum` is now **tracked** (587
   entries) rather than `.gitignore`d, so a fresh clone builds offline; CI actions
   are pinned by full SHA; `revive` is verified against a committed `sha256`
   before extraction; and a `check-toolchain` target refuses a build under any
@@ -1165,7 +1165,7 @@ the corrupt chain and fork itself off the recovered fleet.
   made fail on every run, and a `GOAMD64 :=` documented as blocking a
   command-line override, which only `override` actually does.
 
-* **`78863f9`** — **Test-only.** Covers the production `submitauxblock` path
+* **`22f0e4e`** — **Test-only.** Covers the production `submitauxblock` path
   end to end at and above gate 1 — the only path that produces mainnet blocks,
   and previously the largest untested surface in this release.
 
@@ -1253,7 +1253,7 @@ its site.
 ### Open by owner decision
 
 * **Gate 2's value (2 265 000) is pending core-engineer confirmation** and must
-  be identical fleet-wide (`80378ab`).
+  be identical fleet-wide (`cb0f8e0`).
 * **F-205** (producer payload signatures are context-free bearer credentials) is
   **real and unfixed**. Every candidate fix is chain-breaking, ineffective, or a
   coordinated signing-message upgrade that cannot be gated at 2 260 451 without
@@ -1278,7 +1278,7 @@ a third gate is not permitted. The following therefore ship unfixed:
   (`ActivateProducer` same-block arming).
 * **F-030 minor residual:** evidence whose own height is below gate 1 but whose
   transaction is included above it stays raw-keyed and therefore still malleable.
-  Exposure is negligible (documented in `2b4b662`) but it is open.
+  Exposure is negligible (documented in `6bd3160`) but it is open.
 * **F-091** partially: the core/transaction copy of the cross-chain signature
   check is caller-guarded and deliberately untouched.
 
@@ -1304,7 +1304,7 @@ Per the standing rule that inflation and mint claims are never inferred:
 
 * **F-032**: a producer may still name any current or last arbiter and
   redistribute a **conserved, non-inflationary** sponsor reward. Accepted in
-  `f6ea5b2` because the only convergent alternative was a permanent consensus
+  `da430dd` because the only convergent alternative was a permanent consensus
   split.
 * **NX-06 below gate 1**: a malicious sync peer can still poison a node replaying
   the historical POW windows (all below 2 129 102) and halt its initial sync.
@@ -1321,8 +1321,8 @@ Per the standing rule that inflation and mint claims are never inferred:
   password KDF is unsalted double-SHA256, and keystore AES-CBC has no
   authentication tag.
 * A **pre-existing** `a.mtx ↔ s.mtx` AB-BA lock inversion, present byte-for-byte
-  at `d8488bf`, is reported in `17f1c09` and deliberately not touched.
-* `CalcPastMedianTime(nil)` panics, reported in `bcb35d9` under a test-only
+  at `89d707d`, is reported in `228a6f7` and deliberately not touched.
+* `CalcPastMedianTime(nil)` panics, reported in `380cfd6` under a test-only
   mandate.
 * The second pprof surface via the profiler binds all interfaces regardless of
   the configured host — but only when `ProfilePort != 0`, which is off by
