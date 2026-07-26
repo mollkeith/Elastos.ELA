@@ -299,6 +299,45 @@ func startNode(cfg *config.Configuration) {
 	}
 	pgBar.Stop()
 
+	// OPEN-1: refuse here, BEFORE arbitrator.Start() puts this node on the DPoS
+	// gossip mesh.
+	//
+	// The authoritative baseline check lives after InitCheckpoint and uses the real
+	// restored CkpManager.MaxHeight(). But arbitrator.Start() runs BEFORE that, so a
+	// node whose snapshot is not strictly pre-target would join the mesh with
+	// exploit-era derived state, gossip on it, and only then exit. Reordering
+	// arbitrator.Start() past InitCheckpoint deadlocks the boot: InitCheckpoint
+	// publishes ETDirectPeersChanged synchronously, Arbitrator.handleEvent handles
+	// that arm synchronously by documented invariant, and server.ConnectPeers blocks
+	// on an unbuffered reply channel only peerHandler writes -- the node would hang
+	// holding the process-wide event mutex. So this is an ADDITIONAL early gate, not
+	// a reordering: nothing about the event machinery changes.
+	//
+	// The height comes from each checkpoint file's own header (Height is the FIRST
+	// serialised field of every consensus checkpoint), so no restore is needed and
+	// no chain state is touched. That value is an UPPER BOUND on what MaxHeight()
+	// will report, because a file that fails to restore is skipped later but counted
+	// here. The asymmetry is deliberate and is the safe direction: refusing a node
+	// that would have been fine costs a stopped node an operator can investigate,
+	// while admitting one costs a mesh member running exploit-era state.
+	//
+	// Scoped to the forced-rollback case only: a node with no rollback configured
+	// never evaluates this.
+	if cfg.ForcedRollbackTrigger != "" &&
+		cfg.ForcedRollbackHeight != 0 &&
+		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight &&
+		chain.GetHeight() <= cfg.ForcedRollbackHeight {
+		if mh, detail := blockchain.PredictRestoredCheckpointMaxHeight(dataDir); mh >= cfg.ForcedRollbackHeight {
+			printErrorAndExit(fmt.Errorf(
+				"forced rollback: checkpoint on disk carries height %d, which is >= the rewound "+
+					"target %d, so the derived state it would restore is not strictly pre-target "+
+					"and may be exploit-era. Refusing to start BEFORE joining the DPoS network. "+
+					"Checkpoints read: %v. Remove or replace the offending checkpoint, or restore "+
+					"a pre-target backup, then start again",
+				mh, cfg.ForcedRollbackHeight, detail))
+		}
+	}
+
 	ledger.Blockchain = chain // fixme
 	blockMemPool.Chain = chain
 	arbiters.RegisterFunction(chain.GetHeight, chain.GetBestBlockHash,

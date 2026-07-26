@@ -301,6 +301,16 @@ var requiredCallSites = []callSite{
 			"not armed, tip at the target, exploit block still main-chain indexed and served",
 	},
 	{
+		finding: "OPEN-1 (refuse before joining the DPoS mesh)",
+		file:    "main.go", fn: "startNode",
+		callee: "PredictRestoredCheckpointMaxHeight",
+		why: "the authoritative baseline check runs AFTER InitCheckpoint, but " +
+			"arbitrator.Start() runs BEFORE it, so without this early gate a node whose " +
+			"snapshot is not strictly pre-target joins the DPoS gossip mesh carrying " +
+			"exploit-era derived state and only exits afterwards; reordering " +
+			"arbitrator.Start() instead deadlocks the boot, so this call site IS the fix",
+	},
+	{
 		finding: "B1 (armed is not applied)",
 		file:    "main.go", fn: "startNode",
 		callee: "VerifyForcedRollbackApplied",
