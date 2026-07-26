@@ -125,7 +125,7 @@ func TestRevsym_F064_InactivityThreshold(t *testing.T) {
 			s, _ := revsymInactivityStateFull(count, false, nil, 8500, 7000, true, 300)
 			const H = uint32(9000)
 			sponsor := []byte{0x03, 0x99, 0x99, 0x99} // NOT the producer: needReset stays false
-			s.History.Commit(H - 1) // the reorg forks at the PARENT block
+			s.History.Commit(H - 1)                   // the reorg forks at the PARENT block
 			root := &revsymRoot{S: s}
 			runRevsym(t, fmt.Sprintf("F-064 count=%d depth=%d", count, depth), root,
 				func() {
@@ -586,20 +586,19 @@ func TestRevsym_F131_SeekInvariant(t *testing.T) {
 // unused-import guard for contract (kept: f075Setup lives in a sibling file).
 var _ = contract.CreateStakeContractByCode
 
-
 // -----------------------------------------------------------------------------
 // KNOWN RESIDUE (measured, not fixed): two revert closures leave a ZERO-VALUED map
 // entry where the fork point had no key at all.
 //
-//   1. cleanExpiredDposV2Votes (state.go, the F-209 delete-at-zero forward): the
-//      forward drops UsedDposV2Votes[stake] once it reaches zero and the undo re-adds
-//      with `+=`. Exact when the pre-block balance was >= the expiring vote -- the
-//      only state a cast vote can leave -- but if the entry is ABSENT pre-block the
-//      undo lands on zero and keeps the key.
-//   2. processNFTDestroyFromSideChain (state.go, both reward-fold branches): the undo
-//      restores the NFT stake address with `+= creditedRewards`. When the credited
-//      reward is zero the forward's delete was a no-op on an absent key and the undo
-//      creates it at zero.
+//  1. cleanExpiredDposV2Votes (state.go, the F-209 delete-at-zero forward): the
+//     forward drops UsedDposV2Votes[stake] once it reaches zero and the undo re-adds
+//     with `+=`. Exact when the pre-block balance was >= the expiring vote -- the
+//     only state a cast vote can leave -- but if the entry is ABSENT pre-block the
+//     undo lands on zero and keeps the key.
+//  2. processNFTDestroyFromSideChain (state.go, both reward-fold branches): the undo
+//     restores the NFT stake address with `+= creditedRewards`. When the credited
+//     reward is zero the forward's delete was a no-op on an absent key and the undo
+//     creates it at zero.
 //
 // Classification: NOT a fork. Every consensus reader of both maps is a keyed lookup
 // that takes the zero value of a missing key; nothing ranges over them. The one
