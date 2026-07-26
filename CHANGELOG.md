@@ -2,7 +2,10 @@
 
 All notable changes to Elastos.ELA are recorded here.
 
-This file covers the 112 commits `d8488bf..HEAD` that make up **v1.0.0**.
+This file covers `d8488bf..96d1a4e6`, the **132 commits** of the v1.0.0 recovery. This changelog commit sits on top of that range, so `d8488bf..HEAD` is one more.
+The thematic sections below were written when the range held 112. Fifteen later
+commits are not described here; `docs/v1.0.0-review.html` indexes and explains all
+132, and is the authoritative catalogue.
 
 ---
 
@@ -511,6 +514,37 @@ history derives byte-identically.
   contract comment at `Append`, and records that F-073's soundness rests on fix
   **interaction** with F-104/F-118, not on apply timing. Also re-pins gate 2 to
   Disabled on non-mainnet default arms for symmetry.
+
+
+* **`8bce9e7` (F-064b)** - **The `F-064` fix above was incomplete.** The Class-E
+  batch captured the counter, but the inactivity-threshold undo still *computed*
+  three further fields rather than restoring them: it hard-set `inactiveSince` to
+  `0`, re-derived `activateRequestHeight`, and cleared `selected`. A reorg across
+  the threshold therefore destroys a pending `ActivateProducer` request, rewrites
+  the activation wait, and loses the random-candidate flag. All three feed the
+  arbiter set, so two nodes that disagree about a reorg disagree about **who may
+  produce**. This is reachable: mainnet reorganized at height 1,832,750, and two
+  blocks there each carried a full quorum confirm. The forward step now captures
+  the originals and the undo restores them, which is the pattern `F-215` already
+  uses in the same file. 43 lines added, **zero removed**, so the forward path is
+  untouched and retained history keeps its verdict. Ungated, and safe ungated,
+  because revert closures never run during linear replay.
+
+* **`36eba35`, `486e4fc`, `d69680a`, `96d1a4e`** - **The class is now measured,
+  not asserted.** The rollback tests already in this tree compare two producers
+  with a helper that examines **9 of 22 fields**, and several maps by `len()`
+  alone. They were structurally incapable of seeing any field `F-064b` touches,
+  so their passing carried no information. A complete-derived-state harness now
+  serializes every field of the producer, CR and arbiter state and compares
+  apply-then-revert against never-applied. Across the 21 revert-symmetry sites:
+  **17 measured correct, 1 broken and fixed** (above), and **3 not measurable**
+  by a single-threaded harness, recorded as such rather than counted as passes.
+  The harness was itself validated with 24 deliberate breaks, of which **23 were
+  caught**. Two residues are pinned rather than hidden: zero-valued map entries
+  survive an undo where a never-applied state has no entry at all. That is not a
+  fork risk, because every reader of those maps is a keyed lookup that treats
+  absent and zero alike, and a test now fails if such an entry ever carries a
+  non-zero value.
 
 ---
 
