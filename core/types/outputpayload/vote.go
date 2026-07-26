@@ -114,6 +114,10 @@ func (vc *VoteContent) Serialize(w io.Writer, version byte) error {
 	return nil
 }
 
+// MaxVoteCandidatesPerContent bounds the per-content candidate slice at decode
+// time (DoS ceiling, not a consensus rule; MaxVoteProducersPerTransaction is 36).
+const MaxVoteCandidatesPerContent = 1024
+
 func (vc *VoteContent) Deserialize(r io.Reader, version byte) error {
 	voteType, err := common.ReadBytes(r, 1)
 	if err != nil {
@@ -125,10 +129,20 @@ func (vc *VoteContent) Deserialize(r io.Reader, version byte) error {
 	if err != nil {
 		return err
 	}
+	// Decode-DoS guard: candidatesCount is attacker-controlled from an untrusted
+	// p2p transaction. Bound it before the append loop.
+	if candidatesCount > MaxVoteCandidatesPerContent {
+		return errors.New("vote content candidate count exceeds maximum")
+	}
 
 	for i := uint64(0); i < candidatesCount; i++ {
 		var cv CandidateVotes
-		if cv.Deserialize(r, version); err != nil {
+		// NOTE: this MUST bind and test the Deserialize error. The previous form
+		// `if cv.Deserialize(r, version); err != nil` discarded the return and
+		// re-tested the (nil) err from ReadVarUint above, so a truncated body never
+		// broke the loop -- it appended a zero value on every one of up to 2^64
+		// iterations until the node exhausted memory.
+		if err := cv.Deserialize(r, version); err != nil {
 			return err
 		}
 		vc.CandidateVotes = append(vc.CandidateVotes, cv)
@@ -236,7 +250,13 @@ func (o *VoteOutput) Validate() error {
 			}
 			candidateMap[c] = struct{}{}
 
-			if o.Version >= VoteProducerAndCRVersion && cv.Votes <= 0 {
+			// Bound votes ABSOLUTELY, not just from below. The original exploit had
+			// exactly this shape on outputs (a `< 0` check with no upper bound), and
+			// these values feed unchecked `producer.votes += ...` accumulations in
+			// dpos/state. Legitimate votes are <= the voter's stake <= supply, far
+			// under MaxELAMoney, so this never rejects a valid vote.
+			if o.Version >= VoteProducerAndCRVersion &&
+				(cv.Votes <= 0 || !common.MoneyRange(cv.Votes)) {
 				return errors.New("invalid candidate votes")
 			}
 		}

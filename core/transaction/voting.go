@@ -153,7 +153,9 @@ func (t *VotingTransaction) SpecialContextCheck() (result elaerr.ELAError, end b
 
 		for _, content := range pld.Contents {
 			for _, vi := range content.VotesInfo {
-				if vi.Votes <= 0 {
+				// Absolute bound, not just lower — these feed unchecked accumulations
+				// in dpos/state (producer.votes/dposV2Votes += ...).
+				if vi.Votes <= 0 || !common.MoneyRange(vi.Votes) {
 					return elaerr.Simple(elaerr.ErrTxPayload,
 						errors.New("invalid votes, need to be bigger than zero")), true
 				}
@@ -268,6 +270,43 @@ func (t *VotingTransaction) checkVoteProducerContent(content payload.VotesConten
 	return nil
 }
 
+// addVoteTotal accumulates one vote amount into a running total under the
+// re-bound-per-step invariant, and is the SINGLE definition of vote-total
+// accumulation so the rule cannot exist in divergent copies.
+//
+// Bounding each entry to MoneyRange is NOT sufficient on its own, and this is
+// the same lesson as the block-2260451 output-sum wrap: every crafted value fit
+// int64 individually while their sum did not. Here the per-content decode cap
+// admits up to MaxVoteCandidatesPerContent (1024) entries, so 93 entries at
+// MaxELAMoney (1e17) each already sum past MaxInt64 (9.223e18), wrapping
+// totalVotes NEGATIVE and inverting the `totalVotes > voteRights` gate that is
+// the only thing binding votes to staked rights. The DposV2, CRC and
+// CRCImpeachment branches carry no entry cap (MaxVoteProducersPerTransaction=36
+// gates only the Delegate branch) and accept duplicate candidates, so the
+// entries need not even be distinct.
+//
+// Re-bounding the running total after EVERY add keeps each intermediate below
+// 2*MaxELAMoney (2e17, ~46x under int64 max), so the entry count drops out of
+// the overflow argument entirely.
+//
+// Height-gated: below StrictMoneyRangeHeight the legacy wrapping accumulation is
+// preserved verbatim, because historical blocks were validated under it and must
+// replay bit-identically.
+func (t *VotingTransaction) addVoteTotal(total,
+	votes common.Fixed64) (common.Fixed64, error) {
+	if t.parameters.BlockHeight < t.parameters.Config.StrictMoneyRangeHeight {
+		return total + votes, nil
+	}
+	sum, err := common.AddFixed64(total, votes)
+	if err != nil {
+		return 0, fmt.Errorf("vote total: %w", err)
+	}
+	if !common.MoneyRange(sum) {
+		return 0, fmt.Errorf("vote total: %w", common.ErrMoneyRange)
+	}
+	return sum, nil
+}
+
 func (t *VotingTransaction) checkVoteCRContent(blockHeight uint32,
 	content payload.VotesContent, crs map[common.Uint168]struct{},
 	voteRights common.Fixed64) error {
@@ -291,7 +330,11 @@ func (t *VotingTransaction) checkVoteCRContent(blockHeight uint32,
 			return fmt.Errorf("invalid vote output payload "+
 				"CR candidate: %s", cidAddress)
 		}
-		totalVotes += cv.Votes
+		newTotal, err := t.addVoteTotal(totalVotes, cv.Votes)
+		if err != nil {
+			return err
+		}
+		totalVotes = newTotal
 	}
 	if totalVotes > voteRights {
 		return errors.New("CR vote rights not enough")
@@ -345,7 +388,11 @@ func (t *VotingTransaction) checkCRImpeachmentContent(
 			crState == crstate.MemberReturned {
 			return errors.New("CR member state is wrong")
 		}
-		totalVotes += cv.Votes
+		newTotal, err := t.addVoteTotal(totalVotes, cv.Votes)
+		if err != nil {
+			return err
+		}
+		totalVotes = newTotal
 	}
 
 	if totalVotes > voteRights {
@@ -372,7 +419,11 @@ func (t *VotingTransaction) checkDPoSV2Content(content payload.VotesContent,
 
 			return errors.New("invalid DPoS 2.0 votes lock time")
 		}
-		totalVotes += cv.Votes
+		newTotal, err := t.addVoteTotal(totalVotes, cv.Votes)
+		if err != nil {
+			return err
+		}
+		totalVotes = newTotal
 	}
 	if totalVotes > voteRights {
 		return errors.New("DPoSV2 vote rights not enough")

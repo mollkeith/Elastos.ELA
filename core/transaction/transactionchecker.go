@@ -58,6 +58,15 @@ func (t *DefaultChecker) SanityCheck(params interfaces.Parameters) elaerr.ELAErr
 		return elaerr.Simple(elaerr.ErrTxInvalidOutput, err)
 	}
 
+	// Strict monetary validation is height-gated: below StrictMoneyRangeHeight
+	// the historical (wrapping) rules are preserved so existing blocks replay.
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		if err := checkTransactionMoneyRange(t.parameters.Transaction); err != nil {
+			log.Warn("[CheckTransactionMoneyRange],", err)
+			return elaerr.Simple(elaerr.ErrTxInvalidOutput, err)
+		}
+	}
+
 	if err := checkAssetPrecision(t.parameters.Transaction); err != nil {
 		log.Warn("[CheckAssetPrecesion],", err)
 		return elaerr.Simple(elaerr.ErrTxAssetPrecision, err)
@@ -105,6 +114,13 @@ func (t *DefaultChecker) ContextCheck(params interfaces.Parameters) (
 		return nil, elaerr.Simple(elaerr.ErrTxUnknownReferredTx, nil)
 	}
 	t.references = references
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		if _, err := blockchain.GetTxFeeStrict(t.parameters.Transaction,
+			core.ELAAssetID, references); err != nil {
+			log.Warn("[CheckTransactionAmount],", err)
+			return nil, elaerr.Simple(elaerr.ErrTxBalance, err)
+		}
+	}
 
 	if err := checkTransactionCrossChainUTXO(
 		t.parameters.Transaction,
@@ -729,6 +745,30 @@ func checkDestructionAddress(references map[*common2.Input]common2.Output) error
 // checkFrozenAddresses freezes configured addresses after each entry's
 // DisableStartHeight: no spends from them and no sends to them. Historical
 // transactions before each start height remain syncable.
+// checkTransactionMoneyRange rejects any individual output amount, and any
+// running aggregate of output amounts, that falls outside the permitted money
+// range. The aggregate bound is what stops the signed 64-bit output-sum wrap
+// exploited in block 2260451: each crafted output fit int64 individually while
+// their sum did not.
+func checkTransactionMoneyRange(txn interfaces.Transaction) error {
+	var total common.Fixed64
+	for _, output := range txn.Outputs() {
+		if !common.MoneyRange(output.Value) {
+			return fmt.Errorf("transaction output amount: %w", common.ErrMoneyRange)
+		}
+		var err error
+		total, err = common.AddFixed64(total, output.Value)
+		if err != nil {
+			return fmt.Errorf("transaction output total: %w", err)
+		}
+		if !common.MoneyRange(total) {
+			return fmt.Errorf("transaction output total: %w", common.ErrMoneyRange)
+		}
+	}
+
+	return nil
+}
+
 func checkFrozenAddresses(txn interfaces.Transaction,
 	references map[*common2.Input]common2.Output, blockHeight uint32,
 	frozenAddresses []config.FrozenAddress) error {

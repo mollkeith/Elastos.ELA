@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -169,6 +170,48 @@ func startNode(cfg *config.Configuration) {
 	if err != nil {
 		printErrorAndExit(err)
 	}
+	// Forced rollback runs BEFORE chain.Init so that checkpoint restoration and
+	// derived-state rebuild happen against the already-rewound chain rather than
+	// against state from a height that no longer exists. blockchain.New has
+	// populated chain.Nodes by this point, which is all the rewind needs.
+	//
+	// This replaces the manual `ela-cli rollback` step: operators update the
+	// binary and restart, nothing else. The rollback is armed only when this node
+	// actually holds the targeted block, so it is idempotent and a no-op for
+	// fresh nodes.
+	forcedRollbackFired, e := chain.ForcedRollbackArmed()
+	if e != nil {
+		printErrorAndExit(e)
+	}
+	if cfg.ForcedRollbackTrigger != "" && chain.GetHeight() > cfg.ForcedRollbackHeight {
+		// Loud diagnostic: a mis-encoded (e.g. reversed/explorer byte order)
+		// trigger silently disarms the rollback and leaves the node on the
+		// corrupt chain. Print configured vs actual so operators can catch it.
+		if actual, herr := chain.GetBlockHash(cfg.ForcedRollbackHeight + 1); herr == nil {
+			log.Warnf("forced rollback trigger check: configured=%s actual(block %d)=%s armed=%v",
+				cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight+1, actual.ReversedString(), forcedRollbackFired)
+		}
+	}
+	if forcedRollbackFired {
+		log.Warnf("forced rollback armed: this node holds block %s; rewinding to %d",
+			cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight)
+		if e := chain.ForceRollback(); e != nil {
+			if errors.Is(e, blockchain.ErrForcedRollbackExceedsCapacity) {
+				// Late-upgrade cohort: tip is beyond the incremental-rewind window.
+				// Do NOT brick the node into a permanent boot loop; log the remedy and
+				// continue booting on the current chain (pre-fix liveness preserved).
+				log.Warnf("forced rollback NOT applied: %v. Continuing boot on the current "+
+					"chain; recover via wipe+resync under the strict binary, or a manual "+
+					"`ela-cli rollback %d` then restart.", e, cfg.ForcedRollbackHeight)
+			} else {
+				printErrorAndExit(e)
+			}
+		} else if h := chain.GetHeight(); h != cfg.ForcedRollbackHeight {
+			printErrorAndExit(fmt.Errorf(
+				"forced rollback: block store tip is %d, expected exactly %d", h, cfg.ForcedRollbackHeight))
+		}
+	}
+
 	if err = chain.Init(interrupt.C); err != nil {
 		printErrorAndExit(err)
 	}
@@ -287,6 +330,31 @@ func startNode(cfg *config.Configuration) {
 		printErrorAndExit(err)
 	}
 	pgBar.Stop()
+
+	// Safety net for the forced rollback. InitCheckpoint restored the checkpoint
+	// snapshots and replayed derived state forward to the rewound tip. init replay
+	// skips SetHeight, so each checkpoint's GetHeight() still equals its RESTORED
+	// file height here. The load-bearing property is that every restored snapshot is
+	// STRICTLY BELOW the rewound target -- only then is the baseline provably
+	// pre-exploit. MaxHeight() checks the highest restored height directly (SafeHeight
+	// is a min-of-(GetHeight-720) and could not detect a single tampered snapshot
+	// sitting at/above the target). If any restored snapshot is at/above the target,
+	// derived state may carry exploit-era arbiters: refuse to start.
+	//
+	// NOTE: this asserts the replay BASELINE, not the rebuilt CONTENT. A byte-level
+	// comparison of the derived arbiter/CR set at the target against a freshly-synced
+	// reference is the definitive check and is gated on the testnet reproduction.
+	if forcedRollbackFired {
+		mh := chain.CkpManager.MaxHeight()
+		if mh >= cfg.ForcedRollbackHeight {
+			printErrorAndExit(fmt.Errorf(
+				"forced rollback: a restored checkpoint height %d is >= rewound target %d; the "+
+					"snapshot is not strictly pre-target, derived state may be exploit-era -- "+
+					"refusing to start", mh, cfg.ForcedRollbackHeight))
+		}
+		log.Warnf("forced rollback: post-rebuild baseline OK (max restored checkpoint %d < target %d, tip %d)",
+			mh, cfg.ForcedRollbackHeight, chain.GetHeight())
+	}
 
 	// todo remove me
 	if chain.GetHeight() > cfg.DPoSV2StartHeight {

@@ -29,6 +29,28 @@ const (
 	// DisabledCrossChainUTXORestrictionHeight keeps the emergency policy
 	// inactive on networks that have not adopted a coordinated activation.
 	DisabledCrossChainUTXORestrictionHeight uint32 = math.MaxUint32
+	// MainNetStrictMoneyRangeHeight is the coordinated mainnet activation
+	// height for strict monetary validation (per-amount and aggregate money
+	// range plus checked Fixed64 arithmetic). Set to ForcedRollbackHeight+1:
+	// the forced rollback removes the exploit block at 2260451, and strict
+	// validation binds from the first re-mined block so the resumed chain is
+	// protected immediately. Blocks at or below 2260450 are legitimate history
+	// and continue to validate under the preserved legacy arithmetic.
+	MainNetStrictMoneyRangeHeight uint32 = 2260451
+	// DisabledStrictMoneyRangeHeight keeps strict monetary validation inactive
+	// on networks that have not adopted a coordinated activation.
+	DisabledStrictMoneyRangeHeight uint32 = math.MaxUint32
+	// MainNetForcedRollbackHeight is the height the chain is rewound TO on first
+	// start of a patched node. The block at Height+1 is the value-overflow
+	// transaction's block; rewinding to 2260450 removes it and everything after.
+	MainNetForcedRollbackHeight uint32 = 2260450
+	// MainNetForcedRollbackTrigger is the hash of the block at
+	// MainNetForcedRollbackHeight+1. The rollback fires ONLY if the local chain
+	// actually contains this block, which makes the operation idempotent, a no-op
+	// for fresh nodes, and impossible to mis-target.
+	MainNetForcedRollbackTrigger = "e1a11e04942a7513f0256dbf3605080490800fd845f8e261deffcec68c2ea9af"
+	// DisabledForcedRollbackHeight leaves forced rollback inactive.
+	DisabledForcedRollbackHeight uint32 = math.MaxUint32
 	// ExploitIntermediateFrozenAddress is the mainchain intermediate address
 	// that received funds from the CrossChain UTXO exploit.
 	ExploitIntermediateFrozenAddress = "EfduuvdDcAgif8njgXNJUfsBumQf9yYP72"
@@ -281,6 +303,9 @@ func GetDefaultParams() *Configuration {
 		SmallCrossTransferThreshold:     100000000,
 		ReturnDepositCoinFee:            100,
 		CrossChainUTXOFreezeHeight:      MainNetCrossChainUTXOFreezeHeight,
+		StrictMoneyRangeHeight:          MainNetStrictMoneyRangeHeight,
+		ForcedRollbackHeight:            MainNetForcedRollbackHeight,
+		ForcedRollbackTrigger:           MainNetForcedRollbackTrigger,
 		CrossChainUTXORestrictionHeight: MainNetCrossChainUTXORestrictionHeight,
 		FrozenAddresses:                 MainNetFrozenAddresses(),
 		NewCrossChainStartHeight:        1032840,
@@ -411,6 +436,9 @@ func (p *Configuration) TestNet() *Configuration {
 	p.SmallCrossTransferThreshold = 100000000
 	p.ReturnDepositCoinFee = 100
 	p.CrossChainUTXOFreezeHeight = DisabledCrossChainUTXORestrictionHeight
+	p.StrictMoneyRangeHeight = DisabledStrictMoneyRangeHeight
+	p.ForcedRollbackHeight = DisabledForcedRollbackHeight
+	p.ForcedRollbackTrigger = ""
 	p.CrossChainUTXORestrictionHeight = DisabledCrossChainUTXORestrictionHeight
 	p.FrozenAddresses = nil
 	p.NewCrossChainStartHeight = 807000
@@ -543,6 +571,9 @@ func (p *Configuration) RegNet() *Configuration {
 	p.SmallCrossTransferThreshold = 100000000
 	p.ReturnDepositCoinFee = 100
 	p.CrossChainUTXOFreezeHeight = DisabledCrossChainUTXORestrictionHeight
+	p.StrictMoneyRangeHeight = DisabledStrictMoneyRangeHeight
+	p.ForcedRollbackHeight = DisabledForcedRollbackHeight
+	p.ForcedRollbackTrigger = ""
 	p.CrossChainUTXORestrictionHeight = DisabledCrossChainUTXORestrictionHeight
 	p.FrozenAddresses = nil
 	p.NewCrossChainStartHeight = 730000
@@ -690,6 +721,18 @@ type Configuration struct {
 	// every CrossChain UTXO spend is rejected. Its mainnet value is enforced
 	// after config-file and command-line parsing.
 	CrossChainUTXOFreezeHeight uint32
+
+	// StrictMoneyRangeHeight defines the height from which strict monetary
+	// validation (checked arithmetic + money range) is enforced.
+	StrictMoneyRangeHeight uint32 `screw:"--strictmoneyrangeheight" usage:"defines the height from which strict monetary validation is enforced"`
+
+	// ForcedRollbackHeight is the height a patched node rewinds TO on startup,
+	// but only when ForcedRollbackTrigger matches the block above it.
+	ForcedRollbackHeight uint32 `screw:"--forcedrollbackheight" usage:"height a patched node rewinds to on startup, armed only by forcedrollbacktrigger"`
+
+	// ForcedRollbackTrigger is the hex hash of the block at
+	// ForcedRollbackHeight+1 that arms the rollback.
+	ForcedRollbackTrigger string `screw:"--forcedrollbacktrigger" usage:"hex hash of the block at forcedrollbackheight+1 that arms the forced rollback"`
 	// CrossChainUTXORestrictionHeight defines the mainnet height at which only
 	// authorized bridge transactions may spend CrossChain UTXOs. Its mainnet
 	// value is enforced after config-file and command-line parsing.

@@ -8,6 +8,7 @@ package blockchain
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"strconv"
@@ -257,7 +258,30 @@ func RecordCRCProposalAmount(usedAmount *Fixed64, txn interfaces.Transaction) {
 	}
 }
 
+// checkCoinbaseBIP30 closes F-089: the coinbase carries its own IsTxHashDuplicate
+// guard (coinbasetransaction.go) but it is DEAD on connect -- checkTxsContext
+// validates only txs[1:], so the coinbase (index 0) never runs it. A malicious
+// block producer could replay a prior identical coinbase (same txid) to resurrect
+// already-spent coinbase outputs (BIP30). At/above the gate we reject a block whose
+// coinbase txid already exists in the ledger. Below the gate: legacy (no check),
+// for replay-safety. isDuplicate is injected for testability.
+func checkCoinbaseBIP30(coinbaseHash Uint256, height, gate uint32, isDuplicate func(Uint256) bool) error {
+	if height < gate {
+		return nil
+	}
+	if isDuplicate(coinbaseHash) {
+		return errors.New("coinbase transaction hash already exists (BIP30)")
+	}
+	return nil
+}
+
 func (b *BlockChain) checkTxsContext(block *Block) error {
+	if len(block.Transactions) > 0 {
+		if err := checkCoinbaseBIP30(block.Transactions[0].Hash(), block.Height,
+			b.chainParams.StrictMoneyRangeHeight, b.db.IsTxHashDuplicate); err != nil {
+			return elaerr.SimpleWithMessage(elaerr.ErrBlockValidation, nil, err.Error())
+		}
+	}
 	var totalTxFee = Fixed64(0)
 
 	var proposalsUsedAmount Fixed64
@@ -269,13 +293,42 @@ func (b *BlockChain) checkTxsContext(block *Block) error {
 				"CheckTransactionContext failed when verify block")
 		}
 
-		// Calculate transaction fee
-		totalTxFee += GetTxFee(block.Transactions[i], core.ELAAssetID, references)
+		// Calculate transaction fee. Below StrictMoneyRangeHeight the original
+		// wrapping arithmetic is preserved verbatim so historical blocks
+		// continue to validate; at and above it, overflow is rejected.
+		if block.Height >= b.chainParams.StrictMoneyRangeHeight {
+			fee, err := GetTxFeeStrict(block.Transactions[i], core.ELAAssetID, references)
+			if err != nil {
+				return elaerr.Simple(elaerr.ErrBlockValidation, err)
+			}
+			totalTxFee, err = AddFixed64(totalTxFee, fee)
+			if err != nil {
+				return elaerr.Simple(elaerr.ErrBlockValidation, err)
+			}
+		} else {
+			totalTxFee += GetTxFee(block.Transactions[i], core.ELAAssetID, references)
+		}
 		if block.Transactions[i].IsCRCProposalTx() {
-			RecordCRCProposalAmount(&proposalsUsedAmount, block.Transactions[i])
+			if b.StrictMoneyActive(block.Height) {
+				if err := RecordCRCProposalAmountStrict(&proposalsUsedAmount,
+					block.Transactions[i]); err != nil {
+					return elaerr.Simple(elaerr.ErrBlockValidation, err)
+				}
+			} else {
+				RecordCRCProposalAmount(&proposalsUsedAmount, block.Transactions[i])
+			}
 		}
 	}
-	dposReward := b.GetBlockDPOSReward(block)
+	var dposReward Fixed64
+	if b.StrictMoneyActive(block.Height) {
+		var err error
+		dposReward, err = b.GetBlockDPOSRewardStrict(block)
+		if err != nil {
+			return elaerr.Simple(elaerr.ErrBlockValidation, err)
+		}
+	} else {
+		dposReward = b.GetBlockDPOSReward(block)
+	}
 	err := b.checkCoinbaseTransactionContext(block.Height,
 		block.Transactions[0], totalTxFee, dposReward)
 	if err != nil {
@@ -433,6 +486,77 @@ func IsFinalizedTransaction(msgTx interfaces.Transaction, blockHeight uint32) bo
 	return true
 }
 
+// GetTxFeeMapStrict is the post-activation fee calculation. Unlike
+// GetTxFeeMap it rejects negative amounts, per-amount money-range breaches and
+// signed 64-bit overflow instead of wrapping.
+func GetTxFeeMapStrict(tx interfaces.Transaction,
+	references map[*common.Input]common.Output) (map[Uint256]Fixed64, error) {
+	feeMap := make(map[Uint256]Fixed64)
+	inputs := make(map[Uint256]Fixed64)
+	outputs := make(map[Uint256]Fixed64)
+
+	for _, output := range references {
+		if !MoneyRange(output.Value) {
+			return nil, fmt.Errorf("transaction input amount: %w", ErrMoneyRange)
+		}
+		amount, err := AddFixed64(inputs[output.AssetID], output.Value)
+		if err != nil {
+			return nil, fmt.Errorf("transaction input amount: %w", err)
+		}
+		if !MoneyRange(amount) {
+			return nil, fmt.Errorf("transaction input total: %w", ErrMoneyRange)
+		}
+		inputs[output.AssetID] = amount
+	}
+	for _, v := range tx.Outputs() {
+		if !MoneyRange(v.Value) {
+			return nil, fmt.Errorf("transaction output amount: %w", ErrMoneyRange)
+		}
+		amount, err := AddFixed64(outputs[v.AssetID], v.Value)
+		if err != nil {
+			return nil, fmt.Errorf("transaction output amount: %w", err)
+		}
+		if !MoneyRange(amount) {
+			return nil, fmt.Errorf("transaction output total: %w", ErrMoneyRange)
+		}
+		outputs[v.AssetID] = amount
+	}
+
+	for outputAssetID, outputValue := range outputs {
+		fee, err := SubtractFixed64(inputs[outputAssetID], outputValue)
+		if err != nil {
+			return nil, fmt.Errorf("transaction fee amount: %w", err)
+		}
+		feeMap[outputAssetID] = fee
+	}
+	for inputAssetID, inputValue := range inputs {
+		if _, exist := feeMap[inputAssetID]; !exist {
+			feeMap[inputAssetID] = inputValue
+		}
+	}
+
+	return feeMap, nil
+}
+
+// GetTxFeeStrict returns the post-activation checked fee for one asset.
+func GetTxFeeStrict(tx interfaces.Transaction, assetID Uint256,
+	references map[*common.Input]common.Output) (Fixed64, error) {
+	feeMap, err := GetTxFeeMapStrict(tx, references)
+	if err != nil {
+		return 0, err
+	}
+
+	return feeMap[assetID], nil
+}
+
+// GetTxFee is the pre-activation fee calculation.
+//
+// DO NOT "FIX" THE ARITHMETIC BELOW. Its signed 64-bit wrapping is
+// bug-compatible with the consensus rules that validated every block before
+// StrictMoneyRangeHeight. Historical coinbase outputs were validated against
+// these wrapped totals, so reproducing them exactly is required for a node to
+// replay the chain and sync past block 2260451. Post-activation callers must
+// use GetTxFeeStrict instead.
 func GetTxFee(tx interfaces.Transaction, assetId Uint256, references map[*common.Input]common.Output) Fixed64 {
 	feeMap, err := GetTxFeeMap(tx, references)
 	if err != nil {
@@ -481,6 +605,80 @@ func GetTxFeeMap(tx interfaces.Transaction, references map[*common.Input]common.
 	return feeMap, nil
 }
 
+// StrictMoneyActive reports whether strict monetary validation binds at height.
+func (b *BlockChain) StrictMoneyActive(blockHeight uint32) bool {
+	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
+}
+
+// coinbaseTotalReward computes totalTxFee + block issuance.
+//
+// This is the single shared entry point for BOTH the AuxPoW (PoW consensus) and
+// BPoS (DPoS v2) coinbase branches, so the two consensus modes enforce one
+// identical rule set. At and above StrictMoneyRangeHeight the sum is checked and
+// money-range bounded; below it the historical wrapping arithmetic is preserved
+// verbatim so existing blocks continue to validate.
+//
+// Bounding the total here is sufficient for the downstream share arithmetic:
+// every share is a fraction of a money-range-bounded value, so the subsequent
+// multiplications and subtractions cannot overflow.
+func (b *BlockChain) coinbaseTotalReward(blockHeight uint32,
+	totalTxFee Fixed64) (Fixed64, error) {
+	blockReward := b.chainParams.GetBlockReward(blockHeight)
+	if !b.StrictMoneyActive(blockHeight) {
+		return totalTxFee + blockReward, nil
+	}
+
+	totalReward, err := AddFixed64(totalTxFee, blockReward)
+	if err != nil {
+		return 0, fmt.Errorf("coinbase total reward: %w", err)
+	}
+	if !MoneyRange(totalReward) {
+		return 0, fmt.Errorf("coinbase total reward: %w", ErrMoneyRange)
+	}
+
+	return totalReward, nil
+}
+
+// GetBlockDPOSRewardStrict is the post-activation form of GetBlockDPOSReward.
+func (b *BlockChain) GetBlockDPOSRewardStrict(block *Block) (Fixed64, error) {
+	totalTxFx := Fixed64(0)
+	for _, tx := range block.Transactions {
+		var err error
+		totalTxFx, err = AddFixed64(totalTxFx, tx.Fee())
+		if err != nil {
+			return 0, fmt.Errorf("total block fee: %w", err)
+		}
+	}
+	totalReward, err := b.coinbaseTotalReward(block.Height, totalTxFx)
+	if err != nil {
+		return 0, err
+	}
+
+	return Fixed64(math.Ceil(float64(totalReward) * 0.35)), nil
+}
+
+// RecordCRCProposalAmountStrict is the post-activation form of
+// RecordCRCProposalAmount; it rejects rather than wraps.
+func RecordCRCProposalAmountStrict(usedAmount *Fixed64,
+	txn interfaces.Transaction) error {
+	proposal, ok := txn.Payload().(*payload.CRCProposal)
+	if !ok {
+		return nil
+	}
+	for _, bg := range proposal.Budgets {
+		amount, err := AddFixed64(*usedAmount, bg.Amount)
+		if err != nil {
+			return fmt.Errorf("crc proposal budget: %w", err)
+		}
+		if !MoneyRange(amount) {
+			return fmt.Errorf("crc proposal budget: %w", ErrMoneyRange)
+		}
+		*usedAmount = amount
+	}
+
+	return nil
+}
+
 func (b *BlockChain) GetBlockDPOSReward(block *Block) Fixed64 {
 	totalTxFx := Fixed64(0)
 	for _, tx := range block.Transactions {
@@ -493,7 +691,10 @@ func (b *BlockChain) GetBlockDPOSReward(block *Block) Fixed64 {
 func (b *BlockChain) checkCoinbaseTransactionContext(blockHeight uint32, coinbase interfaces.Transaction, totalTxFee, dposReward Fixed64) error {
 	activeHeight := DefaultLedger.Arbitrators.GetDPoSV2ActiveHeight()
 	if activeHeight != math.MaxUint32 && blockHeight > activeHeight+1 {
-		totalReward := totalTxFee + b.chainParams.GetBlockReward(blockHeight)
+		totalReward, err := b.coinbaseTotalReward(blockHeight, totalTxFee)
+		if err != nil {
+			return err
+		}
 		rewardCyberRepublic := Fixed64(math.Ceil(float64(totalReward) * 0.3))
 		rewardDposArbiter := Fixed64(math.Ceil(float64(totalReward) * 0.35))
 		rewardMergeMiner := Fixed64(totalReward) - rewardCyberRepublic - rewardDposArbiter
@@ -531,9 +732,36 @@ func (b *BlockChain) checkCoinbaseTransactionContext(blockHeight uint32, coinbas
 
 	// main version >= H2
 	if blockHeight >= b.chainParams.PublicDPOSHeight {
-		totalReward := totalTxFee + b.chainParams.GetBlockReward(blockHeight)
+		totalReward, err := b.coinbaseTotalReward(blockHeight, totalTxFee)
+		if err != nil {
+			return err
+		}
 		rewardDPOSArbiter := Fixed64(math.Ceil(float64(totalReward) * 0.35))
-		if totalReward-rewardDPOSArbiter+DefaultLedger.Arbitrators.
+		if b.StrictMoneyActive(blockHeight) {
+			// Checked form: GetFinalRoundChange() is otherwise unbounded and added
+			// to a bounded reward, and the coinbase reward outputs skip the tx-level
+			// money bound (checkTxsContext starts at index 1). Bound them here and
+			// reject overflow rather than wrapping.
+			expected, err := SubtractFixed64(totalReward, rewardDPOSArbiter)
+			if err != nil {
+				return fmt.Errorf("coinbase expected reward: %w", err)
+			}
+			expected, err = AddFixed64(expected, DefaultLedger.Arbitrators.GetFinalRoundChange())
+			if err != nil {
+				return fmt.Errorf("coinbase final round change: %w", err)
+			}
+			o0, o1 := coinbase.Outputs()[0].Value, coinbase.Outputs()[1].Value
+			if !MoneyRange(o0) || !MoneyRange(o1) {
+				return errors.New("coinbase reward output out of money range")
+			}
+			actual, err := AddFixed64(o0, o1)
+			if err != nil {
+				return fmt.Errorf("coinbase actual reward: %w", err)
+			}
+			if expected != actual {
+				return errors.New("reward amount in coinbase not correct")
+			}
+		} else if totalReward-rewardDPOSArbiter+DefaultLedger.Arbitrators.
 			GetFinalRoundChange() != coinbase.Outputs()[0].Value+
 			coinbase.Outputs()[1].Value {
 
@@ -544,9 +772,23 @@ func (b *BlockChain) checkCoinbaseTransactionContext(blockHeight uint32, coinbas
 			return err
 		}
 	} else { // old version [0, H2)
+		// Branch reachable only below PublicDPOSHeight, which is far below any
+		// StrictMoneyRangeHeight, so the checked path here is defensive: it keeps
+		// one rule set if activation is ever configured lower on a test network.
 		var rewardInCoinbase = Fixed64(0)
 		for _, output := range coinbase.Outputs() {
-			rewardInCoinbase += output.Value
+			if !b.StrictMoneyActive(blockHeight) {
+				rewardInCoinbase += output.Value
+				continue
+			}
+			var err error
+			rewardInCoinbase, err = AddFixed64(rewardInCoinbase, output.Value)
+			if err != nil {
+				return fmt.Errorf("coinbase output reward: %w", err)
+			}
+			if !MoneyRange(rewardInCoinbase) {
+				return fmt.Errorf("coinbase output reward: %w", ErrMoneyRange)
+			}
 		}
 
 		// Reward in coinbase must match inflation 4% per year

@@ -98,6 +98,7 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 		screw.Bind(conf.Configuration, version, about)
 	}
 	enforceCrossChainUTXORestrictionHeights(conf.Configuration)
+	enforceStrictMoneyAndRollbackHeights(conf.Configuration)
 	enforceFrozenAddresses(conf.Configuration)
 	conf.Configuration = conf.Sterilize()
 	config.Parameters = conf.Configuration
@@ -118,6 +119,30 @@ func enforceCrossChainUTXORestrictionHeights(configuration *config.Configuration
 			config.DisabledCrossChainUTXORestrictionHeight
 		configuration.CrossChainUTXORestrictionHeight =
 			config.DisabledCrossChainUTXORestrictionHeight
+	}
+}
+
+// enforceStrictMoneyAndRollbackHeights prevents local configuration from changing
+// the coordinated mainnet strict-money activation, forced-rollback height and
+// forced-rollback trigger. On a coordinated one-shot restart a single mismatched
+// local value would fork that node, so these are pinned for mainnet exactly like
+// the CrossChain heights.
+func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
+	switch strings.ToLower(configuration.ActiveNet) {
+	case "", "mainnet", "main":
+		configuration.StrictMoneyRangeHeight = config.MainNetStrictMoneyRangeHeight
+		configuration.ForcedRollbackHeight = config.MainNetForcedRollbackHeight
+		configuration.ForcedRollbackTrigger = config.MainNetForcedRollbackTrigger
+		// Pin the DPoS v2 vote lock-time bounds: payload.VoteRights clamps duration
+		// to [DposV2MinVoteLockDuration, DposV2MaxVoteLockDuration] (7200/720000), so
+		// an operator override of these validation params would let validation admit
+		// a vote VoteRights then weights differently -- a consensus divergence.
+		configuration.DPoSConfiguration.DPoSV2MinVotesLockTime = 7200
+		configuration.DPoSConfiguration.DPoSV2MaxVotesLockTime = 720000
+	default:
+		configuration.StrictMoneyRangeHeight = config.DisabledStrictMoneyRangeHeight
+		configuration.ForcedRollbackHeight = config.DisabledForcedRollbackHeight
+		configuration.ForcedRollbackTrigger = ""
 	}
 }
 

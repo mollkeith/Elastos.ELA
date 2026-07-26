@@ -7,6 +7,7 @@ package payload
 
 import (
 	"bytes"
+	"errors"
 	"io"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -82,6 +83,10 @@ func (i *InactiveArbitrators) DeserializeUnsigned(r io.Reader,
 	return err
 }
 
+// MaxInactiveArbitrators bounds the arbitrator slice at decode time (DoS ceiling,
+// not a consensus rule; real values are the arbiter count).
+const MaxInactiveArbitrators = 1024
+
 func (i *InactiveArbitrators) Deserialize(r io.Reader,
 	version byte) (err error) {
 	if err = i.DeserializeUnsigned(r, version); err != nil {
@@ -91,6 +96,11 @@ func (i *InactiveArbitrators) Deserialize(r io.Reader,
 	var count uint64
 	if count, err = common.ReadVarUint(r, 0); err != nil {
 		return err
+	}
+	// Decode-DoS guard: count is attacker-controlled from an untrusted p2p message
+	// and drives an upfront allocation; cap far above any real arbiter set.
+	if count > MaxInactiveArbitrators {
+		return errors.New("inactive arbitrators count exceeds maximum")
 	}
 	i.Arbitrators = make([][]byte, count)
 	for u := uint64(0); u < count; u++ {

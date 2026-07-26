@@ -236,27 +236,29 @@ func (p *Producer) GetExpiredNFTVotes() map[common.Uint168]payload.DetailedVoteI
 }
 
 func (p *Producer) GetTotalDPoSV2VoteRights() float64 {
-	var result float64
+	// Integer accumulation: each VoteRights() is an integer Fixed64, so summing in
+	// Fixed64 is exact and ORDER-INDEPENDENT. The previous float64 accumulation over
+	// a Go map (randomised iteration order) could diverge between nodes once a total
+	// crossed 2^53; this feeds the arbiter-ranking sort, so that divergence would
+	// split the validator set. Below 2^53 (all realistic totals; max observed ~1.8e15)
+	// integer- and float-sum are bit-identical, so this is behaviour-identical.
+	var result common.Fixed64
 	for _, sVoteDetail := range p.detailedDPoSV2Votes {
-		var totalN float64
+		var totalN common.Fixed64
 		for _, votes := range sVoteDetail {
-			weightF := math.Log10(float64(votes.Info[0].LockTime-votes.BlockHeight) / 7200 * 10)
-			N := common.Fixed64(float64(votes.Info[0].Votes) * weightF)
-			totalN += float64(N)
+			totalN += votes.VoteRights()
 		}
 		result += totalN
 	}
 
-	return result
+	return float64(result)
 }
 
 func (p *Producer) GetNFTVotesRight(targetReferKey common.Uint256) float64 {
 	for _, sVoteDetail := range p.detailedDPoSV2Votes {
 		for referKey, votes := range sVoteDetail {
 			if referKey.IsEqual(targetReferKey) {
-				weightF := math.Log10(float64(votes.Info[0].LockTime-votes.BlockHeight) / 7200 * 10)
-				N := common.Fixed64(float64(votes.Info[0].Votes) * weightF)
-				return float64(N)
+				return float64(votes.VoteRights())
 			}
 		}
 	}

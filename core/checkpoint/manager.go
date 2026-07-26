@@ -289,6 +289,27 @@ func (m *Manager) SafeHeight() uint32 {
 	return height
 }
 
+// MaxHeight returns the highest embedded checkpoint height across the consensus
+// checkpoints (skipping cp_txPool). After InitCheckpoint's init replay this equals
+// the highest RESTORED snapshot-file height, because init replay advances state but
+// skips SetHeight. A forced rollback uses this to verify no restored snapshot sits
+// at or above the rewound target -- the case a min-based SafeHeight cannot detect.
+func (m *Manager) MaxHeight() uint32 {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	var height uint32
+	for _, v := range m.checkpoints {
+		if v.Key() == "cp_txPool" {
+			continue
+		}
+		if v.GetHeight() > height {
+			height = v.GetHeight()
+		}
+	}
+	return height
+}
+
 // Close will clean all related resources.
 func (m *Manager) Close() {
 	m.mtx.Lock()

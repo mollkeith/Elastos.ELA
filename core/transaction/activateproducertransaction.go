@@ -96,7 +96,28 @@ func (t *ActivateProducerTransaction) CheckTransactionFee(references map[*common
 	return nil
 }
 
+// checkActivateValueCreation closes F-166: ActivateProducer is a no-cost tx
+// (CheckTransactionFee requires fee==0), but the CR-member path returns end=true
+// which makes ContextCheck SKIP CheckTransactionFee -- the only outputs<=inputs
+// guard. Combined with CheckTransactionOutput allowing outputs above NFTStartHeight,
+// a CR member could mint value outputs from 0 inputs. Above StrictMoneyRangeHeight we
+// re-apply the fee==0 invariant here so no ActivateProducer path can create (or
+// destroy) value. Below the gate: legacy behavior preserved for replay-safety.
+func (t *ActivateProducerTransaction) checkActivateValueCreation() elaerr.ELAError {
+	if t.parameters.BlockHeight < t.parameters.Config.StrictMoneyRangeHeight {
+		return nil
+	}
+	if fee := getTransactionFee(t, t.references); fee != 0 {
+		return elaerr.Simple(elaerr.ErrTxBalance, errors.New(
+			"ActivateProducer must not create or destroy value at or above StrictMoneyRangeHeight"))
+	}
+	return nil
+}
+
 func (t *ActivateProducerTransaction) SpecialContextCheck() (elaerr.ELAError, bool) {
+	if e := t.checkActivateValueCreation(); e != nil {
+		return e, true
+	}
 
 	activateProducer, ok := t.Payload().(*payload.ActivateProducer)
 	if !ok {

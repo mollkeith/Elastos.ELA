@@ -118,7 +118,8 @@ func (p *Voting) Validate() error {
 			}
 			candidateMap[c] = struct{}{}
 
-			if cv.Votes <= 0 {
+			// Absolute bound, not just lower — see outputpayload/vote.go rationale.
+			if cv.Votes <= 0 || !common.MoneyRange(cv.Votes) {
 				return errors.New("invalid candidate votes")
 			}
 		}
@@ -216,6 +217,10 @@ func (vc *VotesContent) Serialize(w io.Writer, version byte) error {
 	return nil
 }
 
+// MaxVoteCandidatesPerContent bounds the per-content candidate slice at decode
+// time (DoS ceiling, not a consensus rule; the Delegate limit is 36).
+const MaxVoteCandidatesPerContent = 1024
+
 func (vc *VotesContent) Deserialize(r io.Reader, version byte) error {
 	voteType, err := common.ReadBytes(r, 1)
 	if err != nil {
@@ -227,10 +232,20 @@ func (vc *VotesContent) Deserialize(r io.Reader, version byte) error {
 	if err != nil {
 		return err
 	}
+	// Decode-DoS guard: candidatesCount is attacker-controlled from an untrusted
+	// p2p transaction. Bound it before the append loop.
+	if candidatesCount > MaxVoteCandidatesPerContent {
+		return errors.New("votes content candidate count exceeds maximum")
+	}
 
 	for i := uint64(0); i < candidatesCount; i++ {
 		var cv VotesWithLockTime
-		if cv.Deserialize(r, version); err != nil {
+		// NOTE: this MUST bind and test the Deserialize error. The previous form
+		// `if cv.Deserialize(r, version); err != nil` discarded the return and
+		// re-tested the (nil) err from ReadVarUint above, so a truncated body never
+		// broke the loop -- it appended a zero value on every one of up to 2^64
+		// iterations until the node exhausted memory.
+		if err := cv.Deserialize(r, version); err != nil {
 			return err
 		}
 		vc.VotesInfo = append(vc.VotesInfo, cv)
@@ -311,9 +326,52 @@ func (v *DetailedVoteInfo) bytes() []byte {
 	return buf.Bytes()
 }
 
+// DposV2MinVoteLockDuration and DposV2MaxVoteLockDuration mirror the consensus
+// DPoSV2MinVotesLockTime (7200) / DPoSV2MaxVotesLockTime (720000). They MUST match
+// the validation floor/ceiling so VoteRights is bit-identical to the legacy
+// formula for every vote that passed validation (duration in [7200, 720000]).
+const (
+	DposV2MinVoteLockDuration uint32 = 7200
+	DposV2MaxVoteLockDuration uint32 = 720000
+)
+
+// VoteRights returns the lock-time-weighted vote weight. It is the SINGLE
+// definition of vote weight; state accumulation, arbiter-ranking and reward
+// distribution all call this so the formula cannot exist in divergent copies (a
+// divergence would itself split consensus).
+//
+// It self-guards against malformed inputs instead of trusting upstream validation:
+//   - lockUntil <= castHeight would underflow the uint32 duration -> 0
+//   - duration below the min lock -> 0 (never a negative or -Inf multiplier)
+//   - duration clamped to the max lock as EXACT INTEGER input, not an output cap
+//   - votes bounded to the money range so the float->Fixed64 product cannot reach
+//     the architecture-divergent out-of-range conversion
+// For every vote that passed validation (duration in [min,max], votes<=supply)
+// these guards are inert and the result equals the legacy formula exactly, so this
+// is behaviour-identical robustness hardening, not a consensus change.
 func (v *DetailedVoteInfo) VoteRights() common.Fixed64 {
-	weightF := math.Log10(float64(v.Info[0].LockTime-v.BlockHeight) / 7200 * 10)
-	return common.Fixed64(float64(v.Info[0].Votes) * weightF)
+	votes := v.Info[0].Votes
+	if votes <= 0 || !common.MoneyRange(votes) {
+		return 0
+	}
+	lockUntil := v.Info[0].LockTime
+	if lockUntil <= v.BlockHeight {
+		return 0
+	}
+	duration := lockUntil - v.BlockHeight
+	if duration < DposV2MinVoteLockDuration {
+		return 0
+	}
+	if duration > DposV2MaxVoteLockDuration {
+		duration = DposV2MaxVoteLockDuration
+	}
+	// Keep the /7200*10 form (== /720) verbatim so float rounding is bit-identical
+	// to the legacy expression.
+	weightF := math.Log10(float64(duration) / 7200 * 10)
+	if !(weightF > 0) {
+		return 0
+	}
+	return common.Fixed64(float64(votes) * weightF)
 }
 
 func (v *DetailedVoteInfo) ReferKey() common.Uint256 {

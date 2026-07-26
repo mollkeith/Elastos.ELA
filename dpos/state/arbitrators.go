@@ -769,9 +769,7 @@ func (a *Arbiters) getDPoSV2RewardsV2(dposReward common.Fixed64, sponsor []byte,
 			}
 			var totalN float64
 			for _, votes := range sVoteDetail {
-				weightF := math.Log10(float64(votes.Info[0].LockTime-votes.BlockHeight) / 7200 * 10)
-				N := common.Fixed64(float64(votes.Info[0].Votes) * weightF)
-				totalN += float64(N)
+				totalN += float64(votes.VoteRights())
 			}
 			if totalN == 0 {
 				continue

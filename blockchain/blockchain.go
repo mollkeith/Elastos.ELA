@@ -638,13 +638,37 @@ func CalculateTxsFee(block *Block) {
 			log.Error("get transaction Reference failed")
 			return
 		}
+		// Height-gated to stay bit-identical to unpatched nodes (and to the
+		// acceptance-path getTransactionFee) BELOW StrictMoneyRangeHeight: this value
+		// feeds tx.Fee() -> DPoS reward derivation, so it must match the network
+		// exactly on historical/reindexed blocks. At/above the gate use checked
+		// accumulation (an overflowing tx cannot be accepted there anyway).
 		var outputValue Fixed64
 		var inputValue Fixed64
-		for _, output := range tx.Outputs() {
-			outputValue += output.Value
-		}
-		for _, output := range references {
-			inputValue += output.Value
+		if block.Height >= DefaultLedger.Blockchain.chainParams.StrictMoneyRangeHeight {
+			var feeAccErr error
+			for _, output := range tx.Outputs() {
+				if outputValue, feeAccErr = AddFixed64(outputValue, output.Value); feeAccErr != nil {
+					break
+				}
+			}
+			for _, output := range references {
+				if feeAccErr != nil {
+					break
+				}
+				inputValue, feeAccErr = AddFixed64(inputValue, output.Value)
+			}
+			if feeAccErr != nil {
+				log.Errorf("CalculateTxsFee: value overflow computing fee for tx %s (post-validation, unexpected); skipping fee annotation", tx.Hash())
+				continue
+			}
+		} else {
+			for _, output := range tx.Outputs() {
+				outputValue += output.Value
+			}
+			for _, output := range references {
+				inputValue += output.Value
+			}
 		}
 		// set Fee and FeePerKB if check has passed
 		tx.SetFee(inputValue - outputValue)

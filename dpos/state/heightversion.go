@@ -129,7 +129,12 @@ func (a *Arbiters) distributeWithNormalArbitratorsV0(
 		roundReward[*a.ChainParams.CRConfiguration.CRCProgramHash] = reward
 		return roundReward, reward, nil
 	}
-	rewardPerVote := totalTopProducersReward / float64(totalVotesInRound)
+	// Guard div-by-zero: a round with zero total votes would yield +Inf/NaN and then
+	// Fixed64(NaN) garbage in every per-producer reward. No votes -> no per-vote reward.
+	var rewardPerVote float64
+	if totalVotesInRound > 0 {
+		rewardPerVote = totalTopProducersReward / float64(totalVotesInRound)
+	}
 
 	roundReward[*a.ChainParams.CRConfiguration.CRCProgramHash] = 0
 	realDPOSReward := common.Fixed64(0)
