@@ -131,10 +131,35 @@ func RenderText(r *blockchain.PreflightReport) string {
 	} else {
 		fmt.Fprintf(&b, "  residue above the target    not censused on this boot (no full store scan runs)\n")
 	}
+	fmt.Fprintf(&b, "  restored checkpoint height  %d (upper bound; header read, file not loaded)\n",
+		r.Store.RestoredCheckpointMaxHeight)
+	for _, c := range r.Store.RestoredCheckpoints {
+		counted := ""
+		if !c.CountedInMaxHeight {
+			counted = "  [not counted]"
+		}
+		if c.Err != "" {
+			fmt.Fprintf(&b, "    %-24s restores no height%s\n", c.Key, counted)
+			continue
+		}
+		fmt.Fprintf(&b, "    %-24s %d  (%s)%s\n", c.Key, c.Height, c.File, counted)
+	}
+	fmt.Fprintf(&b, "  post-restore height check   %s\n",
+		checkpointGateWords(r.Store.CheckpointGateEvaluated))
 	fmt.Fprintf(&b, "  truth-table cell            %s\n", r.Cell)
 
 	fmt.Fprintf(&b, "\n%s\nThis command read the store and wrote nothing to it.\n%s\n", line, line)
 	return b.String()
+}
+
+// checkpointGateWords says plainly whether main.go's post-restore height refusal
+// applies to this start, so the height above is never read as a bare number the
+// operator has to interpret.
+func checkpointGateWords(evaluated bool) string {
+	if evaluated {
+		return "RUNS on this start (refuses if the height above >= the rollback target)"
+	}
+	return "does not apply to this start"
 }
 
 // height renders the disabled sentinel as words rather than 4294967295.

@@ -240,8 +240,14 @@ func (p *Producer) GetTotalDPoSV2VoteRights() float64 {
 	// Fixed64 is exact and ORDER-INDEPENDENT. The previous float64 accumulation over
 	// a Go map (randomised iteration order) could diverge between nodes once a total
 	// crossed 2^53; this feeds the arbiter-ranking sort, so that divergence would
-	// split the validator set. Below 2^53 (all realistic totals; max observed ~1.8e15)
-	// integer- and float-sum are bit-identical, so this is behaviour-identical.
+	// split the validator set. Below 2^53 (9007199254740992) integer- and float-sum of
+	// non-negative integers are bit-identical, so this is behaviour-identical.
+	//
+	// MEASURED bound, not an estimate: a full-chain scan of the retained mainnet copy
+	// summed EVERY weight ever created for the busiest candidate -- an over-count of any
+	// instantaneous live total, since it also counts votes later superseded by renewals
+	// or expired -- and got 451,388,603,675,534, ~20x below 2^53. Pinned in
+	// core/types/payload/voterights_measured_test.go.
 	var result common.Fixed64
 	for _, sVoteDetail := range p.detailedDPoSV2Votes {
 		var totalN common.Fixed64

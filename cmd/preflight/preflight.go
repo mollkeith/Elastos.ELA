@@ -67,6 +67,13 @@ func NewCommand() *cli.Command {
 			"'chain' store is not opened at all. Run it with the node STOPPED -- " +
 			"if the node is running the store is locked and this command says so " +
 			"and exits " + fmt.Sprint(ExitNodeRunning) + " rather than forcing anything.\n\n" +
+			"   It also predicts the start-up check that refuses on a restored " +
+			"checkpoint at or above the rollback target. That prediction reads the " +
+			"height header of the default checkpoint snapshots WITHOUT loading them " +
+			"and without running the node's checkpoint restore, so it is an upper " +
+			"bound: a snapshot with an intact header and a corrupt body would fail " +
+			"to load and the node's real restored height would be lower. The report " +
+			"repeats this where it prints the number.\n\n" +
 			"   EXIT CODES: " + fmt.Sprint(ExitReady) + " ready (will rewind, or " +
 			"nothing to do); " + fmt.Sprint(ExitUsage) + " usage/configuration " +
 			"error; " + fmt.Sprint(ExitStoreUnreadable) + " no readable chain " +

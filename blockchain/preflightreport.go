@@ -68,6 +68,15 @@ type PreflightStoreState struct {
 	StoredAbove     int    `json:"stored_above_target,omitempty"`
 	HeaderRowsAbove int    `json:"header_rows_above_target,omitempty"`
 	BestStateHeight uint32 `json:"best_state_height,omitempty"`
+	// RestoredCheckpointMaxHeight predicts checkpoint.Manager.MaxHeight() after a
+	// boot's InitCheckpoint, and RestoredCheckpoints breaks it down per key. It is
+	// read from the default snapshots' height headers, never restored -- see
+	// PredictRestoredCheckpointMaxHeight for the bound this puts on it.
+	RestoredCheckpointMaxHeight uint32               `json:"restored_checkpoint_max_height"`
+	RestoredCheckpoints         []RestoredCheckpoint `json:"restored_checkpoints,omitempty"`
+	// CheckpointGateEvaluated says whether main.go:436-449 will compare that height
+	// against the rollback target on this start.
+	CheckpointGateEvaluated bool `json:"checkpoint_gate_evaluated"`
 	// SizeBytes is the on-disk size of the block database.
 	SizeBytes int64 `json:"size_bytes"`
 	// NewestWrite is the newest mtime among the store's files. It is EVIDENCE,
@@ -183,6 +192,9 @@ func BuildPreflightReport(chain *BlockChain, opts PreflightOptions) (
 	if err := r.predict(chain, opts); err != nil {
 		return nil, err
 	}
+	// main.go's LAST refusal, at main.go:436-449, runs after InitCheckpoint and so
+	// after everything predict() walks. It is predicted separately for that reason.
+	r.applyCheckpointGate(params)
 	r.addStaleDataFinding(chain, opts)
 	return r, nil
 }
