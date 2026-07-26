@@ -62,43 +62,40 @@ func PurgeForcedRollbackResidue(fflDB IFFLDBChainStore, target uint32) (int, err
 			target, len(scan.LiveAbove), refsString(scan.LiveAbove))
 	}
 
-	// Stale main-chain index entries. These can only exist above the target when a
-	// rollback was interrupted before its transaction committed; the derived state
-	// for those blocks was never reverted, so a caller that has not already
-	// diagnosed that (CheckForcedRollbackResidue) must not reach here. The removal
-	// is still performed so the offline cleaner can finish the job on a node whose
-	// state is being rebuilt from scratch anyway.
+	// Stale main-chain index entries above the target are NOT residue, and this
+	// function must not remove them. They can only exist there when a rollback was
+	// interrupted before its transaction committed -- the transaction that also
+	// reverts the UTXO and derived-state processors -- so they are the DIAGNOSIS of a
+	// node no cleanup can repair, and they are the diagnosis the boot path refuses
+	// on (DiagnoseForcedRollbackResidue -> ResidueInterrupted).
+	//
+	// The shipped version deleted them. MEASURED on the ffldb harness (four
+	// above-target blocks in the interrupted shape): `ela-cli purgeresidue` reported
+	// "purged 4 residual block(s)" and exit 0, and the next boot's refusal --
+	// which still fired, because the persisted best-chain state is a second witness
+	// this function never touches -- had degraded to "the block database still
+	// records 0 block(s) above the forced-rollback target 2 as part of the MAIN
+	// CHAIN ... Residue: ", i.e. a self-contradictory sentence with the hash list
+	// gone. The operator is told the store was cleaned when the un-reverted UTXO
+	// state that makes the node unusable is exactly what remains.
+	//
+	// Refusing costs nothing: the two in-process callers (ForceRollback's closing
+	// sweep, and CheckForcedRollbackResidue's ResidueRetentionOnly branch) only
+	// reach this function with MainChainAbove EMPTY -- the sweep runs after every
+	// above-target block on the main chain has been rolled back, and the boot-time
+	// branch is selected by `len(scan.MainChainAbove) == 0`.
 	if len(scan.MainChainAbove) > 0 {
-		log.Warnf("[PurgeForcedRollbackResidue] %d stale main-chain index entr(ies) "+
-			"above target %d -- the signature of an interrupted rollback: %s",
-			len(scan.MainChainAbove), target, refsString(scan.MainChainAbove))
-		if err := fflDB.Update(func(dbTx database.Tx) error {
-			meta := dbTx.Metadata()
-			hashIdx := meta.Bucket(hashIndexBucketName)
-			heightIdx := meta.Bucket(heightIndexBucketName)
-			if hashIdx == nil || heightIdx == nil {
-				return fmt.Errorf("purge residue: main-chain index bucket missing")
-			}
-			for _, ref := range scan.MainChainAbove {
-				hash := ref.Hash
-				if derr := hashIdx.Delete(hash[:]); derr != nil {
-					return derr
-				}
-				// Only drop the height->hash row when it actually names this block,
-				// so a retained entry can never be collaterally removed.
-				var serializedHeight [4]byte
-				byteOrder.PutUint32(serializedHeight[:], ref.Height)
-				if cur := heightIdx.Get(serializedHeight[:]); cur != nil &&
-					len(cur) == HashSize && hash.IsEqual(refHash(cur)) {
-					if derr := heightIdx.Delete(serializedHeight[:]); derr != nil {
-						return derr
-					}
-				}
-			}
-			return nil
-		}); err != nil {
-			return 0, err
-		}
+		return 0, fmt.Errorf("%w: refusing to purge -- the block database still "+
+			"records %d block(s) above the rollback target %d as part of the MAIN "+
+			"CHAIN (best-state height %d). That is the signature of an INTERRUPTED "+
+			"rollback, not retention residue: those blocks' rollback transactions, "+
+			"which also revert their UTXO and derived-state processors, never ran. "+
+			"Deleting the index entries would remove the evidence and leave the "+
+			"un-reverted state in place, so this node would look clean and be "+
+			"corrupt. %s Main-chain entries: %s",
+			ErrForcedRollbackStoreInconsistent, len(scan.MainChainAbove), target,
+			scan.BestStateHeight, forcedRollbackRemedy,
+			refsString(scan.MainChainAbove))
 	}
 
 	// Orphaned block-header-index rows. A row whose block is no longer in the store

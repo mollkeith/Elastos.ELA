@@ -450,19 +450,46 @@ func (b *BlockChain) InitCheckpointAfterDeepReset() error {
 	return b.initCheckpoint(nil, nil, nil, true)
 }
 
+// ErrCheckpointInitInterrupted reports that the operator interrupted the
+// checkpoint restore-and-replay before it finished.
+//
+// It exists because the alternative was reporting SUCCESS. The shipped select
+// returned the shared `err` variable on the interrupt branch, and on that branch
+// the replay goroutine has by definition not finished, so `err` is whatever it
+// happened to hold -- nil. MEASURED on the ffldb harness: with the interrupt
+// already signalled, InitCheckpoint returned nil having replayed 0 of 9 blocks,
+// and the goroutine then replayed all 9 AFTER the caller had been told the
+// initialisation succeeded. main.go treats a nil return as "derived state is
+// rebuilt" and carries on into the forced-rollback baseline assertion -- which
+// reads CkpManager.MaxHeight() while that goroutine is still mutating it -- and
+// then starts the P2P server. The DPoS arbiter network is worse still: it is
+// started ABOVE this call (main.go, in the `if acc != nil` block, because the
+// success path below publishes ETDirectPeersChanged synchronously and that
+// subscriber needs a running dpos/p2p server), so the node is ALREADY in the
+// arbiter mesh, and a silent nil here leaves it there running on half-derived DPoS
+// and CR state. Reading `err` on that branch was also a data race on a variable
+// the replay goroutine is concurrently writing.
+var ErrCheckpointInitInterrupted = errors.New(
+	"checkpoint initialisation interrupted before the derived-state replay finished")
+
 func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
 	barStart func(total uint32), increase func(), discardStale bool) (err error) {
 	bestHeight := b.GetHeight()
 	log.Info("current block height ->", bestHeight)
 	arbiters := DefaultLedger.Arbitrators
-	done := make(chan struct{})
+	// BUFFERED, and carrying the outcome rather than sharing a variable with the
+	// caller. The shipped channel was unbuffered and the goroutine's last statement
+	// was a send on it, so on the interrupt branch -- where nobody ever receives --
+	// the replay goroutine parked on that send for the lifetime of the process,
+	// holding everything it had reached through.
+	done := make(chan error, 1)
 	go func() {
+		var err error
 		// Notify initialize process start.
 		startHeight := uint32(0)
 
-		if err = b.restoreCheckpoints(); err != nil {
-			log.Warn(err)
-			err = nil
+		if e := b.restoreCheckpoints(); e != nil {
+			log.Warn(e)
 		}
 
 		// FV-01: the restore above just wrote the on-disk default snapshots into the
@@ -472,8 +499,7 @@ func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
 		// replay below and the caller's attach loop no-ops for it.
 		if discardStale {
 			if e := b.discardStaleCheckpoints(bestHeight); e != nil {
-				err = e
-				done <- struct{}{}
+				done <- e
 				return
 			}
 		}
@@ -489,6 +515,16 @@ func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
 		}
 
 		for i := startHeight; i <= bestHeight; i++ {
+			// Stop AT A BLOCK BOUNDARY when the operator interrupts, so the replay
+			// does not keep rebuilding derived state behind a caller that has already
+			// been told the initialisation did not complete.
+			select {
+			case <-interrupt:
+				done <- ErrCheckpointInitInterrupted
+				return
+			default:
+			}
+
 			hash, e := b.GetBlockHash(i)
 			if e != nil {
 				err = e
@@ -520,10 +556,17 @@ func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
 			}
 		}
 
-		done <- struct{}{}
+		done <- err
 	}()
 	select {
-	case <-done:
+	case e := <-done:
+		if errors.Is(e, ErrCheckpointInitInterrupted) {
+			// The replay stopped itself on the interrupt. Nothing below may run: the
+			// arbiter set has not been rebuilt, so starting it and announcing its
+			// peers would put a node with half-derived DPoS state into the mesh.
+			return e
+		}
+		err = e
 		arbiters.Start()
 
 		currentArbiters := arbiters.GetCurrentNeedConnectArbiters()
@@ -537,6 +580,11 @@ func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
 				CRPeers:      crArbiters})
 
 	case <-interrupt:
+		// NOT `return err`. The replay goroutine is still running and still writing
+		// that variable; reading it here is both a data race and, because it is
+		// almost always still nil, a report of SUCCESS for an initialisation that
+		// did not happen.
+		return ErrCheckpointInitInterrupted
 	}
 	return err
 }

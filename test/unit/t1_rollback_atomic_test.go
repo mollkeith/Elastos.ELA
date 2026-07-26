@@ -396,17 +396,46 @@ func TestT1RollbackResumeIsExactlyOnce(t *testing.T) {
 	t1Close(store)
 }
 
-// TestT1PurgeGuardRemovesInterruptedRollbackResidue is the PURGE-GUARD proof.
+// TestT1PurgeGuardClassifiesInterruptedResidueAndRefusesToPurgeIt is the
+// PURGE-GUARD proof, at the level where the guard actually lives.
 //
 // The store is put in the exact shape an interrupted rollback leaves: the
 // header-index rows above the target are gone, but the main-chain hash->height
 // entries survived because RollbackBlock -- the thing that deletes them -- never
-// ran. That is the residue the cleaner exists to remove.
+// ran.
 //
-// FAILS ON PRISTINE: guard (1) tested main-chain membership FIRST and kept every
-// entry that resolved, so the sound height guard below it was never reached and
-// the cleaner purged 0 of 4 (measured).
-func TestT1PurgeGuardRemovesInterruptedRollbackResidue(t *testing.T) {
+// TWO separate properties are asserted, and they are not the same property:
+//
+//  1. CLASSIFICATION (the PURGE-GUARD fix). ScanForcedRollbackStore must report
+//     every above-target block as residue. Guard (1) used to test main-chain
+//     membership FIRST and keep every entry that resolved, so the sound height
+//     guard below it was never reached and the census reported 0 of 4 (measured).
+//     Everything downstream -- the boot-time diagnosis, the offline cleaner, the
+//     pre-flight -- reads that census, so a census that cannot see this residue is
+//     the whole defect.
+//
+//  2. ACTION. On THIS shape the cleaner must REFUSE. It used to delete the
+//     main-chain index entries as well, which is not a purge but the destruction of
+//     a diagnosis: those entries exist above the target only because the rollback
+//     transaction -- which also reverts the UTXO and derived-state processors --
+//     never committed, so the blocks' effects are still applied and no cleanup can
+//     remove them. The tree already says so where it matters: forcedRollbackRemedy
+//     deliberately does not name `ela-cli purgeresidue` because "that command
+//     removes retention residue only, and running it here would delete the last
+//     evidence of the damage while leaving the un-reverted derived state in place".
+//     The implementation did the opposite of its own contract. MEASURED before the
+//     change: the purge returned (4, nil) and the next boot's refusal -- which still
+//     fired, on the persisted best-chain state, the one witness the purge does not
+//     touch -- had degraded to "still records 0 block(s) ... Residue: ".
+//
+// The shape the cleaner IS for -- already rolled back, main-chain index clean, raw
+// by-hash entries left behind -- is covered by
+// TestResidue2OfflineCleanerPurgesAlreadyRolledBack, which the classification fix
+// above is what makes reachable.
+//
+// FAILS ON PRISTINE: (1) the census reports 0 residual blocks; (2) the cleaner
+// returns (4, nil) and empties the main-chain index above the target.
+func TestT1PurgeGuardClassifiesInterruptedResidueAndRefusesToPurgeIt(t *testing.T) {
 	log.NewDefault(test.NodeLogPath, 0, 0, 0)
 
 	const target = uint32(2)
@@ -432,22 +461,40 @@ func TestT1PurgeGuardRemovesInterruptedRollbackResidue(t *testing.T) {
 			"precondition: height %d still served by hash", h)
 	}
 
-	purged, perr := blockchain.PurgeForcedRollbackResidue(fdb, target)
-	assert.NoError(t, perr)
-	assert.Equal(t, int(tip-target), purged,
-		"PURGE-GUARD: the cleaner must remove every above-target block left by an "+
-			"interrupted rollback. Keeping them because their main-chain index entry "+
-			"survived is exactly backwards: that entry survived BECAUSE the rollback "+
-			"never ran")
+	// (1) CLASSIFICATION.
+	scan, serr := blockchain.ScanForcedRollbackStore(fdb, target)
+	assert.NoError(t, serr)
+	assert.Len(t, scan.StoredAbove, int(tip-target),
+		"PURGE-GUARD: the census must see every above-target block left by an "+
+			"interrupted rollback as residue. Skipping them because their main-chain "+
+			"index entry survived is exactly backwards: that entry survived BECAUSE "+
+			"the rollback never ran")
+	assert.Len(t, scan.MainChainAbove, int(tip-target),
+		"the surviving main-chain entries must be censused too -- they are the "+
+			"diagnosis the boot path refuses on")
+	assert.Empty(t, scan.LiveAbove,
+		"with the header rows gone this is not a live chain above the target")
 
-	for h := target + 1; h <= tip; h++ {
-		hash := hashByHeight[h]
-		assert.False(t, fdb.IsBlockInStore(&hash),
-			"height %d must not be served by hash after the purge", h)
-		exists, _, _ := fdb.BlockExists(&hash)
-		assert.False(t, exists,
-			"height %d must not remain main-chain indexed after the purge", h)
-	}
+	// (2) ACTION: refuse, and touch nothing.
+	purged, perr := blockchain.PurgeForcedRollbackResidue(fdb, target)
+	assert.Equal(t, 0, purged)
+	assert.Error(t, perr,
+		"PURGE-ERASES-EVIDENCE: on the interrupted shape the cleaner must refuse. "+
+			"Deleting the main-chain index entries removes the evidence and leaves the "+
+			"un-reverted UTXO and derived state in place behind a store that now "+
+			"looks clean")
+	assert.True(t, errors.Is(perr, blockchain.ErrForcedRollbackStoreInconsistent),
+		"the refusal must carry the store-inconsistent sentinel, got: %v", perr)
+
+	after, serr := blockchain.ScanForcedRollbackStore(fdb, target)
+	assert.NoError(t, serr)
+	assert.Equal(t, scan.MainChainAbove, after.MainChainAbove,
+		"a refused purge must leave the main-chain index untouched")
+	assert.Equal(t, scan.StoredAbove, after.StoredAbove,
+		"a refused purge must leave the raw block store untouched")
+	assert.Equal(t, scan.HeaderRowsAbove, after.HeaderRowsAbove,
+		"a refused purge must leave the header index untouched")
+
 	// OVER-DELETION GUARD: retained history untouched.
 	for h := uint32(0); h <= target; h++ {
 		hash := hashByHeight[h]
@@ -458,10 +505,12 @@ func TestT1PurgeGuardRemovesInterruptedRollbackResidue(t *testing.T) {
 		assert.True(t, exists, "retained height %d must stay main-chain indexed", h)
 		assert.Equal(t, h, hh)
 	}
-	// Idempotent.
-	purged2, perr2 := blockchain.PurgeForcedRollbackResidue(fdb, target)
-	assert.NoError(t, perr2)
-	assert.Equal(t, 0, purged2, "a second purge must be a no-op")
+
+	// And the boot path still refuses, naming what it found.
+	berr := chain.CheckForcedRollbackResidue()
+	assert.Error(t, berr, "the node must refuse to start on this store")
+	assert.Contains(t, berr.Error(), hashByHeight[tip].String(),
+		"the refusal must still be able to name the blocks involved")
 }
 
 // TestT1PurgeGuardRefusesLiveChain proves the reordering did not create an

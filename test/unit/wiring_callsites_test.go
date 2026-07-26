@@ -253,17 +253,38 @@ var requiredCallSites = []callSite{
 	{
 		finding: "ROLLBACK-ATOMICITY",
 		file:    "blockchain/forcedrollback.go", fn: "ForceRollback",
-		callee: "rollbackOneBlock",
+		callee: "RollbackOneBlock",
 		why: "the per-block rewind must go through the phase-probed, header-row-last " +
 			"sequence; inlining the three raw transactions again restores the restart ratchet",
 	},
 	{
 		finding: "ROLLBACK-ATOMICITY (exactly-once)",
-		file:    "blockchain/forcedrollback.go", fn: "rollbackOneBlock",
+		file:    "blockchain/forcedrollback.go", fn: "RollbackOneBlock",
 		callee:   "forcedRollbackPhase",
 		mustArgs: []string{"node.Hash"},
 		why: "without the persisted-store phase probe a resumed rewind re-runs the " +
 			"per-transaction rollback processors of a block whose rollback already committed",
+	},
+	{
+		finding: "FR-02 (resumed-rewind height drift)",
+		file:    "blockchain/forcedrollback.go", fn: "ForceRollback",
+		callee:   "SetHeight",
+		mustArgs: []string{"uint32(len(b.Nodes) - 1)"},
+		why: "the ChainStore height is lowered ONLY by the per-block rollback " +
+			"transaction, which a RESUMED rewind correctly skips for a block an " +
+			"earlier run already committed -- so without this the height stays at " +
+			"target+1 and handlePersistBlockTask then REJECTS the recovered chain's " +
+			"replacement block at that height (\"block height less than current block " +
+			"height\"), leaving the node parked at the target for good",
+	},
+	{
+		finding: "MANUAL-RESUME (the operator remedy must be resumable)",
+		file:    "cmd/rollback/rollback.go", fn: "rollbackAction",
+		callee: "RollbackOneBlock",
+		why: "`ela-cli rollback` must drive the SAME phase-probed per-block rewind as " +
+			"the automatic path; its own copy re-fetched the block and re-ran " +
+			"RollbackBlock over a rollback that had already committed, re-applying " +
+			"per-transaction rollback processors that are not idempotent",
 	},
 	{
 		finding: "ROLLBACK-ATOMICITY (safety net)",
@@ -492,6 +513,30 @@ var forbiddenCallSites = []forbiddenCallSite{
 			"and keep booting ON THE EXPLOIT CHAIN. A node that cannot complete the " +
 			"rollback must not join the recovered network — every ForceRollback error is " +
 			"fatal at the boot path, and the remedies live in the error text",
+	},
+	{
+		finding: "MANUAL-RESUME (no second implementation)",
+		file:    "cmd/rollback/rollback.go", fn: "rollbackAction",
+		callee: "RollbackBlock",
+		why: "re-inlining the per-block rewind here is what brings back the manual " +
+			"path's missing phase probe: an interrupted run leaves the block " +
+			"re-visitable BY DESIGN, so an unconditional RollbackBlock on the re-run " +
+			"re-applies the rollback processors of a block already rolled back",
+	},
+	{
+		finding: "MANUAL-RESUME (no second implementation)",
+		file:    "cmd/rollback/rollback.go", fn: "rollbackAction",
+		callee: "DeleteBlockFromStore",
+		why: "same: the raw-store purge belongs to RollbackOneBlock, where it is " +
+			"skipped when the store shows it already happened",
+	},
+	{
+		finding: "MANUAL-RESUME (no second implementation)",
+		file:    "cmd/rollback/rollback.go", fn: "rollbackAction",
+		callee: "DBRemoveBlockNode",
+		why: "same: the header-row removal must stay LAST and inside the shared " +
+			"per-block rewind, keyed on hash+height rather than on a re-parsed header " +
+			"the raw purge has already made unfetchable",
 	},
 	{
 		finding: "FV-18 (the remedy must not be a no-op)",

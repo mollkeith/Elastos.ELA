@@ -594,7 +594,7 @@ func DBRemoveBlockNode(dbTx database.Tx, header *common2.Header) error {
 // directly, without needing the block body.
 //
 // The forced rollback needs this because it now removes a block's header row LAST,
-// after the raw by-hash store entry is already gone (see rollbackOneBlock), so the
+// after the raw by-hash store entry is already gone (see RollbackOneBlock), so the
 // header can no longer be re-fetched at that point. It is exactly equivalent:
 // blockIndexKey is built from nothing but the hash and the height, and a BlockNode
 // carries both -- node.Hash is the header hash it was loaded with, node.Height its

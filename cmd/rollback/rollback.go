@@ -17,8 +17,6 @@ import (
 	"github.com/elastos/Elastos.ELA/common/config/settings"
 	"github.com/elastos/Elastos.ELA/common/log"
 	"github.com/elastos/Elastos.ELA/core/checkpoint"
-	"github.com/elastos/Elastos.ELA/core/types/common"
-	"github.com/elastos/Elastos.ELA/database"
 
 	"github.com/urfave/cli"
 )
@@ -140,48 +138,34 @@ func rollbackAction(c *cli.Context) error {
 	}
 
 	for i := currentHeight; i > targetHeight; i-- {
-		fmt.Println("current height is", i)
-		block, err := chainStore.GetFFLDB().GetBlock(*nodes[i].Hash)
-		if err != nil {
-			return err
-		}
-		fmt.Println("block hash before rollback:", block.Hash())
-		// ORDERING: the rollback transaction FIRST, the block-header index row LAST.
-		// removeBlockNode used to run first, and it deletes the row that b.Nodes is
-		// rebuilt from at startup -- so an interruption or an error before
-		// RollbackBlock committed left that block permanently un-rollbackable while
-		// it stayed main-chain indexed and served by hash. Same defect, and same fix,
-		// as blockchain.rollbackOneBlock: keeping the header row until every
-		// destructive step is durably committed makes the rewind resumable, because
-		// the block is still in nodes on the next run.
-		err = chainStore.RollbackBlock(block.Block, nodes[i], nil, blockchain.CalcPastMedianTime(nodes[i-1]))
-		if err != nil {
-			fmt.Println("rollback block failed, ", block.Height, err)
-			return err
+		fmt.Println("current height is", i,
+			"block hash before rollback:", nodes[i].Hash.String())
+
+		// ONE implementation, driven from both places. This loop used to carry its
+		// own copy of the three-transaction sequence. It had the header-row-last
+		// ORDERING, so an interrupted run left the block in the index and therefore
+		// re-visitable -- but it had no phase probe, so re-visiting it was the
+		// problem: with the rollback transaction already committed and the raw entry
+		// already purged, the re-run's GetBlock failed and the command could never
+		// finish; with the rollback committed but the purge not yet done, the re-run
+		// called RollbackBlock a SECOND time over the same block, re-applying
+		// per-transaction rollback processors that are not idempotent. Neither
+		// outcome is acceptable in the command that every forced-rollback refusal
+		// message names as the operator remedy.
+		//
+		// blockchain.RollbackOneBlock is the automatic path's per-block rewind: it
+		// probes the PERSISTED store first and skips exactly the steps that are
+		// already durably committed, so a resumed run is exactly-once; it evicts the
+		// RAM block cache after the raw purge; and it checks every error. It also
+		// passes the block's own stored Confirm to RollbackBlock, where this loop
+		// passed nil.
+		if err := chain.RollbackOneBlock(nodes[i], nodes[i-1]); err != nil {
+			fmt.Println("rollback block failed, ", i, err)
+			return cli.NewExitError(err.Error(), 1)
 		}
 
-		// Residue #2 parity: RollbackBlock clears the height and tx indexes but NOT
-		// the raw by-hash entry in ffldb-blockidx, so without this the manually
-		// rolled-back node keeps serving the discarded blocks by hash (same defect the
-		// forced-rollback path fixes). Purge the raw-store location entry too.
-		if err = chainStore.GetFFLDB().DeleteBlockFromStore(*nodes[i].Hash); err != nil {
-			fmt.Println("purge block store failed, ", block.Height, err)
-			return err
-		}
-
-		if err = removeBlockNode(chainStore.GetFFLDB(), &block.Header); err != nil {
-			return err
-		}
-
-		blockHashAfter := *nodes[i-1].Hash
-		fmt.Println("block hash after rollback:", blockHashAfter)
+		fmt.Println("block hash after rollback:", nodes[i-1].Hash.String())
 	}
 
 	return nil
-}
-
-func removeBlockNode(fflDB blockchain.IFFLDBChainStore, header *common.Header) error {
-	return fflDB.Update(func(dbTx database.Tx) error {
-		return blockchain.DBRemoveBlockNode(dbTx, header)
-	})
 }

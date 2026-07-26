@@ -35,7 +35,7 @@ type t1OrderedCalls struct {
 
 var t1RequiredOrder = []t1OrderedCalls{
 	{
-		file: "blockchain/forcedrollback.go", fn: "rollbackOneBlock",
+		file: "blockchain/forcedrollback.go", fn: "RollbackOneBlock",
 		first: "RollbackBlock", last: "dbRemoveBlockNodeKey",
 		why: "the rollback transaction (which also reverts the UTXO/state processors " +
 			"and deletes the main-chain index entry) must commit BEFORE the header-index " +
@@ -43,17 +43,18 @@ var t1RequiredOrder = []t1OrderedCalls{
 			"rewind resumes",
 	},
 	{
-		file: "blockchain/forcedrollback.go", fn: "rollbackOneBlock",
+		file: "blockchain/forcedrollback.go", fn: "RollbackOneBlock",
 		first: "DBRemoveBlockFromStore", last: "dbRemoveBlockNodeKey",
 		why: "the raw by-hash purge must also precede the header-row removal, for the " +
 			"same reason",
 	},
-	{
-		file: "cmd/rollback/rollback.go", fn: "rollbackAction",
-		first: "RollbackBlock", last: "removeBlockNode",
-		why: "`ela-cli rollback` is the operator remedy the forced-rollback error message " +
-			"points at, and it carried the identical header-row-first ordering",
-	},
+	// `ela-cli rollback` no longer has an ordering of its own to pin: rollbackAction
+	// delegates to blockchain.RollbackOneBlock, so the two entries above ARE its
+	// ordering. What has to be pinned instead is the delegation, and that lives in
+	// wiring_callsites_test.go -- required: rollbackAction -> RollbackOneBlock;
+	// forbidden: rollbackAction -> RollbackBlock / DeleteBlockFromStore /
+	// DBRemoveBlockNode. Re-inlining the three raw transactions there is what would
+	// bring back both the ordering defect and the missing phase probe.
 }
 
 // callOffset returns the source offset of the first call to name inside fn.

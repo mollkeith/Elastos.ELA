@@ -29,7 +29,7 @@ import (
 //     the first place once strict validation is active above the rollback height.
 //
 // It is ALSO the resume predicate. Because the per-block rewind now removes a
-// block's header-index row LAST (see rollbackOneBlock), an interrupted rewind
+// block's header-index row LAST (see RollbackOneBlock), an interrupted rewind
 // leaves every not-yet-finished block still in b.Nodes, so this predicate is still
 // true on the next boot and the rewind picks up exactly where it stopped. Under
 // the shipped ordering the header row was removed FIRST, so each interruption
@@ -188,9 +188,20 @@ func (b *BlockChain) ReadForcedRollbackMarker() (*ForcedRollbackMarker, error) {
 		if raw == nil {
 			return nil
 		}
-		if len(raw) != forcedRollbackMarkerLen || raw[0] != forcedRollbackMarkerVersion {
+		// The length is reported on its own, and BEFORE anything indexes into the
+		// slice. ffldb returns a non-nil ZERO-LENGTH value for a key stored with an
+		// empty value (measured, both from the write cache and after a flush), so the
+		// combined condition below used to short-circuit correctly and then panic
+		// with index-out-of-range while FORMATTING its own diagnosis -- the node died
+		// on the one boot where it was trying to tell the operator that the marker is
+		// unreadable, and died with a runtime panic rather than the refusal.
+		if len(raw) != forcedRollbackMarkerLen {
 			return fmt.Errorf("forced rollback: unreadable in-progress marker "+
-				"(%d bytes, version %d)", len(raw), raw[0])
+				"(%d bytes, expected %d)", len(raw), forcedRollbackMarkerLen)
+		}
+		if raw[0] != forcedRollbackMarkerVersion {
+			return fmt.Errorf("forced rollback: unreadable in-progress marker "+
+				"(version %d, expected %d)", raw[0], forcedRollbackMarkerVersion)
 		}
 		marker = &ForcedRollbackMarker{
 			Target: byteOrder.Uint32(raw[1:5]),
@@ -270,7 +281,18 @@ func (b *BlockChain) forcedRollbackPhase(hash *common.Uint256) (blockRollbackPha
 	return phase, err
 }
 
-// rollbackOneBlock durably discards exactly one block from the tip.
+// RollbackOneBlock durably discards exactly one block from the tip.
+//
+// It is EXPORTED because it has two production callers, and they must not be two
+// implementations. ForceRollback drives it on the automatic boot path, and
+// `ela-cli rollback` -- the offline remedy every forced-rollback refusal message
+// names -- drives it too. The manual command used to carry its own hand-copied
+// three-transaction sequence: it had picked up the header-row-last ORDERING, so an
+// interrupted run left the block in the index and resumable, but it had none of the
+// phase probe below, so the resumed run re-fetched the block and re-ran
+// RollbackBlock over a rollback that had already committed -- re-applying
+// per-transaction rollback processors that are not idempotent -- or, once the raw
+// entry was gone, failed on the fetch and could never finish at all.
 //
 // ORDERING IS THE FIX. The shipped sequence was three separate database
 // transactions in the order
@@ -307,7 +329,7 @@ func (b *BlockChain) forcedRollbackPhase(hash *common.Uint256) (blockRollbackPha
 // precondition; and it must happen at all, because RollbackBlock leaves the raw
 // by-hash entry behind (residue #2) and a rolled-back node would otherwise keep
 // serving the discarded blocks over P2P getdata / RPC getblock.
-func (b *BlockChain) rollbackOneBlock(node, prevNode *BlockNode) error {
+func (b *BlockChain) RollbackOneBlock(node, prevNode *BlockNode) error {
 	fflDB := b.db.GetFFLDB()
 
 	phase, err := b.forcedRollbackPhase(node.Hash)
@@ -378,7 +400,7 @@ func (b *BlockChain) rollbackOneBlock(node, prevNode *BlockNode) error {
 //
 // interrupt may be nil. When it is signalled the rewind stops at a block boundary
 // and returns ErrForcedRollbackInterrupted; because each block's rewind is
-// crash-atomic in effect (see rollbackOneBlock), restarting resumes it.
+// crash-atomic in effect (see RollbackOneBlock), restarting resumes it.
 func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 	target := b.chainParams.ForcedRollbackHeight
 	if len(b.Nodes) == 0 {
@@ -458,7 +480,7 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 		node := b.Nodes[i]
 		prevNode := b.Nodes[i-1]
 
-		if err := b.rollbackOneBlock(node, prevNode); err != nil {
+		if err := b.RollbackOneBlock(node, prevNode); err != nil {
 			return err
 		}
 
@@ -477,6 +499,24 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 				time.Since(began).Truncate(time.Second))
 		}
 	}
+
+	// The ChainStore's own height must describe the rewound tip before anything else
+	// reads it. It is lowered ONLY by the per-block rollback transaction
+	// (ChainStore.rollback: currentBlockHeight = b.Height-1), and a RESUMED rewind
+	// deliberately SKIPS that transaction for a block an earlier, interrupted run
+	// already committed. When the skipped block is the last one -- target+1, on
+	// mainnet 2,260,451 -- nothing lowers the height at all and it stays at the value
+	// initChainState derived from the surviving header row, i.e. target+1.
+	//
+	// MEASURED on the ffldb harness (crash after block target+1's rollback commits,
+	// then resume): chain.GetHeight()=target while ChainStore.GetHeight()=target+1,
+	// and ChainStore.handlePersistBlockTask then rejects the RECOVERED chain's
+	// replacement block at target+1 with "block height less than current block
+	// height". The node rolls back correctly, reports success, and can never accept
+	// the first block of the chain it was rolled back FOR. Setting it here is
+	// unconditional and idempotent: on a clean run it restates what the last
+	// rollback transaction already wrote.
+	b.db.SetHeight(uint32(len(b.Nodes) - 1))
 
 	// The per-iteration purge above walks only the accepted main chain (b.Nodes), so
 	// it reaches every discarded block that was ON the best chain -- including the
