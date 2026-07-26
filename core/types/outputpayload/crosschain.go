@@ -84,12 +84,12 @@ func (o *CrossChainOutput) Validate() error {
 	if o.TargetAmount <= 0 {
 		return errors.New("invalid target amount")
 	}
-	// Bound the cross-chain amount to the money range. A cross-chain redemption
-	// is honored by the sidechain and is NOT undone by a main-chain rollback, so
-	// an unbounded/overflowing TargetAmount is an irreversible over-mint vector.
-	if !common.MoneyRange(o.TargetAmount) {
-		return errors.New("target amount out of money range")
-	}
+	// NOTE: the money-range bound on TargetAmount deliberately does NOT live here.
+	// Validate() carries no block height, and an unconditional bound rejects
+	// retained mainnet block 2,208,265 -- a block the released v0.9.9.6 accepted
+	// and DPoS-finalised -- which would stop a node replaying the chain from
+	// genesis. The bound is applied, height-gated, by the one caller that knows
+	// the height: TransferCrossChainAssetTransaction.CheckTransactionOutput.
 
 	return nil
 }
