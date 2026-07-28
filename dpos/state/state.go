@@ -2945,19 +2945,25 @@ func (s *State) processEmergencyInactiveArbitrators(
 	//      before an ActivateProducer request is accepted). The penalty half becomes
 	//      material the moment that parameter is configured non-zero.
 	//
-	// GATE: the undo closure is UNGATED -- it executes only on live reorgs, never
-	// during linear replay, so retained history derives byte-identically. The forward
-	// skip reuses GATE 1 (StrictMoneyRangeHeight); no new height is introduced. A
-	// census of the block store found only 6 InactiveArbitrators transactions in all
-	// history (heights 408476..434811), ZERO at or above gate 1 and zero naming any
-	// producer twice within one block, so the gated forward change is a no-op on
-	// retained history.
+	// GATE: BOTH halves reuse GATE 1 (StrictMoneyRangeHeight); no new height is
+	// introduced. The undo was originally shipped UNGATED on the premise that it
+	// "executes only on live reorgs, never during linear replay". That premise is
+	// FALSE and it cost a P0: History.Append runs the rollback closure of every
+	// outstanding tempChange the moment the next non-zero-height Append arrives
+	// (utils/history.go), so the height-0 gossip preview's undo runs on the ORDINARY
+	// linear-replay path, once per block that follows a preview. Mainnet block
+	// 409,957 -- which the real chain accepted -- was rejected by the ungated undo.
+	// See the P0-FV11-A / P0-FV11-B notes on the closures below for the full chain.
+	// A census of the block store found only 6 InactiveArbitrators transactions in
+	// all history (heights 408476..434811) and ZERO at or above gate 1, so gating
+	// both halves makes every retained block derive byte-identically to the pristine
+	// pair, by construction rather than by argument.
 	//
 	// height == 0 is the height-0 GOSSIP PREVIEW (State.ProcessSpecialTxPayload), not
-	// a block height; it is deliberately left on the legacy forward path so the gate
-	// is evaluated against real block heights only. The preview is reversed by the
-	// next Append and re-applied at the real height by processTransactions, so the
-	// committed state is always decided by the gated branch.
+	// a block height. 0 is below gate 1, so the preview takes the legacy forward AND
+	// the legacy undo, which is what mainnet ran. The preview is reversed by the next
+	// Append and re-applied at the real height by processTransactions, so the
+	// committed state is always decided by the branch the real height selects.
 	addEmergencyInactiveArbitrator := func(key string, producer *Producer) {
 		var (
 			oriState                 ProducerState
@@ -2967,25 +2973,53 @@ func (s *State) processEmergencyInactiveArbitrators(
 			oriActivateRequestHeight uint32
 			wasInactive              bool
 			hadEmergencyEntry        bool
+			captured                 bool
 		)
 		s.History.Append(height, func() {
 			// Captured inside the forward: Append only CACHES the closures (see the
 			// contract on History.Append), so an enclosing-scope capture would read
 			// pre-block state and a producer named by two payloads in the same block
 			// would restore the wrong origin.
-			oriState = producer.state
-			oriPenalty = producer.penalty
-			oriInactiveSince = producer.inactiveSince
-			oriSelected = producer.selected
-			oriActivateRequestHeight = producer.activateRequestHeight
-			wasInactive = producer.state == Inactive
-			_, hadEmergencyEntry = s.EmergencyInactiveArbiters[key]
+			//
+			// P0-FV11-A: capture on the FIRST execution ONLY. History.Commit executes
+			// the tempChanges slice and does NOT clear it, so a height-0 preview
+			// closure is re-executed once more for every further preview in the same
+			// gossip burst. Mainnet block 408,476 carries FOUR InactiveArbitrators
+			// payloads, so this closure ran four times; re-capturing on executions
+			// 2..4 read the state THIS closure had already written and latched
+			// wasInactive = true, which then made the undo skip the map restore. The
+			// capture must describe the state before the FIRST application, which is
+			// the only state the undo can legitimately restore.
+			if !captured {
+				oriState = producer.state
+				oriPenalty = producer.penalty
+				oriInactiveSince = producer.inactiveSince
+				oriSelected = producer.selected
+				oriActivateRequestHeight = producer.activateRequestHeight
+				wasInactive = producer.state == Inactive
+				_, hadEmergencyEntry = s.EmergencyInactiveArbiters[key]
+				captured = true
+			}
 
 			if !wasInactive || height < s.ChainParams.StrictMoneyRangeHeight {
 				s.setInactiveProducer(producer, key, height, true)
 			}
 			s.EmergencyInactiveArbiters[key] = struct{}{}
 		}, func() {
+			// P0-FV11-B: below gate 1 the undo is the PRISTINE pair, byte-for-byte.
+			// The height-0 gossip preview (height 0 < gate 1) and every retained
+			// block therefore reverse exactly as mainnet reversed them. Skipping the
+			// map restore here stranded producer 02792af8 (Orion Supernode) in
+			// InactiveProducers across block 408,476; countArbitratorsInactivityV0
+			// then took its `if !ok { continue }` path and never reset the producer's
+			// inactiveCountingHeight from 408,443, so 1,510 blocks later the producer
+			// was wrongly marked Inactive at 409,953 and the vote output in mainnet
+			// block 409,957 was rejected.
+			if height < s.ChainParams.StrictMoneyRangeHeight {
+				s.revertSettingInactiveProducer(producer, key, height, true)
+				delete(s.EmergencyInactiveArbiters, key)
+				return
+			}
 			// Only move the producer back between the maps when this payload is what
 			// took it out of ActivityProducers. If it was already Inactive the maps
 			// were never changed, and calling the inverse would PROMOTE it.

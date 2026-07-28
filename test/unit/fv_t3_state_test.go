@@ -138,7 +138,12 @@ func fvT3ActivateTx(nodeKey []byte) interfaces.Transaction {
 // ActivityProducers, its penalty is one EmergencyInactivePenalty short and its
 // inactiveSince is 0.
 func TestFV11AlreadyInactiveRollbackDoesNotReactivate(t *testing.T) {
-	ar := fvT3Arbiters(math.MaxUint32) // below gate 1: the ROLLBACK half is ungated
+	// P0: gate 0 puts every test height AT/ABOVE gate 1. The rollback half was
+	// originally shipped ungated on the premise that the undo "executes only on live
+	// reorgs, never during linear replay"; that premise was false and it rejected
+	// mainnet block 409,957. Below gate 1 the undo is now the pristine pair, and
+	// TestP0FV11UndoIsGatedAtGate1 pins that arm.
+	ar := fvT3Arbiters(0)
 	tip := fvT3Chain(t, ar)
 	target := fvT3Keys[1]
 	key := common.BytesToHexString(target)
@@ -196,7 +201,8 @@ func TestFV11AlreadyInactiveRollbackDoesNotReactivate(t *testing.T) {
 // FAIL-ON-PRISTINE: Selected() returns false and ActivateRequestHeight() returns
 // MaxUint32.
 func TestFV11RevertRestoresSelectedAndActivateRequest(t *testing.T) {
-	ar := fvT3Arbiters(math.MaxUint32)
+	// P0: at/above gate 1, see TestFV11AlreadyInactiveRollbackDoesNotReactivate.
+	ar := fvT3Arbiters(0)
 	tip := fvT3Chain(t, ar)
 	target := fvT3Keys[1]
 
