@@ -523,10 +523,48 @@ func (pow *Service) SubmitAuxBlock(hash *common.Uint256, auxPow *auxpow.AuxPow) 
 	canonicalAuxPow.ParentHash = canonicalAuxPow.ParBlockHeader.Hash()
 
 	msgAuxBlock.Header.AuxPow = canonicalAuxPow
-	_, _, err := pow.blkMemPool.AddDposBlock(&types.DposBlock{
+	inMainChain, isOrphan, err := pow.blkMemPool.AddDposBlock(&types.DposBlock{
 		Block: msgAuxBlock,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Do not report success for a block that did not connect.
+	//
+	// inMainChain and isOrphan used to be discarded here (`_, _, err :=`), and
+	// appendBlock returns a NIL error for a block accepted WITHOUT a confirm --
+	// deliberately, because that is exactly how the first block of the recovered
+	// chain is accepted while the network is still in PoW. But the same nil is
+	// returned when the block ORPHANED or never entered the main chain, so this
+	// function returned success for both outcomes and the pool's RPC replied
+	// "true" either way.
+	//
+	// A merge-mining pool watching submit results is therefore told its block
+	// landed while the chain has not moved at all. On restart day that is the
+	// worst possible failure mode: only a pool can mine block 2,260,451, and the
+	// operator's one feedback channel would be reporting healthy while the chain
+	// stayed dead, with nothing in the node's default-level log to contradict it.
+	//
+	// This changes only what the SUBMITTER IS TOLD. Acceptance is untouched: the
+	// block is already in the pool and, if it connected, on the chain. A
+	// confirmless block that DID enter the main chain still returns success, so
+	// the restart path is unaffected.
+	if isOrphan {
+		log.Warnf("[json-rpc:SubmitAuxBlock] block %s at height %d was accepted as an "+
+			"ORPHAN: its parent is not on this node's chain, so it has not extended the "+
+			"tip. The chain has not moved.", hash, msgAuxBlock.Height)
+		return fmt.Errorf("block %s accepted as an orphan at height %d: parent not on "+
+			"this node's chain, the tip has not advanced", hash, msgAuxBlock.Height)
+	}
+	if !inMainChain {
+		log.Warnf("[json-rpc:SubmitAuxBlock] block %s at height %d did NOT enter the main "+
+			"chain (side chain or superseded). The tip has not advanced.",
+			hash, msgAuxBlock.Height)
+		return fmt.Errorf("block %s at height %d did not enter the main chain, the tip "+
+			"has not advanced", hash, msgAuxBlock.Height)
+	}
+	return nil
 }
 
 func (pow *Service) DiscreteMining(n uint32) ([]*common.Uint256, error) {

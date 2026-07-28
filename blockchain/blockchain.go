@@ -560,13 +560,24 @@ func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
 	}()
 	select {
 	case e := <-done:
-		if errors.Is(e, ErrCheckpointInitInterrupted) {
+		if e != nil {
 			// The replay stopped itself on the interrupt. Nothing below may run: the
 			// arbiter set has not been rebuilt, so starting it and announcing its
 			// peers would put a node with half-derived DPoS state into the mesh.
+			//
+			// That reasoning is not specific to the interrupt. It applies to EVERY
+			// failure of the replay, and the interrupt sentinel used to be the only
+			// error that returned here: any other failure fell through, called
+			// arbiters.Start() and published ETDirectPeersChanged, joining the mesh
+			// with exactly the half-derived state this branch exists to keep out.
+			// The error was assigned to `err` and surfaced later, by which point the
+			// arbiters were already running and the peers already announced.
+			//
+			// On restart day this is the difference between a node that refuses to
+			// start and a node that takes an on-duty arbiter seat while disagreeing
+			// with the fleet about who may produce.
 			return e
 		}
-		err = e
 		arbiters.Start()
 
 		currentArbiters := arbiters.GetCurrentNeedConnectArbiters()
