@@ -55,16 +55,55 @@ type Config struct {
 	Arbitrators    state.Arbitrators
 }
 
+// maxAuxBlockPoolSize bounds the aux-block pool.
+//
+// WHY A BOUND IS REQUIRED. The pool is emptied ONLY when the chain height changes
+// (CreateAuxBlock: `if pow.preChainHeight != pow.chain.GetHeight()`). On a STALLED
+// chain the height by definition does not change, while createAuxBlockInterval is
+// 5 seconds -- so a merge-mining pool polling createauxblock adds a new entry, with
+// a new hash, every 5 seconds, and nothing ever removes it. That is 720 entries an
+// hour, unbounded.
+//
+// A stalled chain is not a hypothetical: it is EXACTLY the restart condition. The
+// recovery requires at least four hours of stall before the in-block RevertToPOW
+// rule can fire, and the PoW window may run far longer. The node this exhausts is
+// the pool's node -- the one node that must stay healthy for the chain to restart
+// at all.
+//
+// 720 entries is one hour of regeneration at the 5-second interval, which is far
+// more history than SubmitAuxBlock needs: a submitted block is looked up by hash
+// only until the height moves, and the height moving clears the pool outright.
+const maxAuxBlockPoolSize = 720
+
 type AuxBlockPool struct {
 	mutex       sync.RWMutex
 	mapNewBlock map[common.Uint256]*types.Block
+	// order records insertion order so the oldest entry can be evicted when the
+	// bound is reached. Go map iteration is randomised, so evicting "some" entry
+	// without this would drop the block a pool is currently mining as readily as
+	// a stale one.
+	order []common.Uint256
 }
 
 func (p *AuxBlockPool) AppendBlock(block *types.Block) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	p.mapNewBlock[block.Hash()] = block
+	hash := block.Hash()
+	if _, exists := p.mapNewBlock[hash]; exists {
+		return
+	}
+
+	// Evict oldest-first until there is room. A loop rather than a single evict so
+	// the bound still holds if maxAuxBlockPoolSize is ever lowered on a live pool.
+	for len(p.order) >= maxAuxBlockPoolSize && len(p.order) > 0 {
+		oldest := p.order[0]
+		p.order = p.order[1:]
+		delete(p.mapNewBlock, oldest)
+	}
+
+	p.mapNewBlock[hash] = block
+	p.order = append(p.order, hash)
 }
 
 func (p *AuxBlockPool) ClearBlock() {
@@ -74,6 +113,9 @@ func (p *AuxBlockPool) ClearBlock() {
 	for key := range p.mapNewBlock {
 		delete(p.mapNewBlock, key)
 	}
+	// Release the backing array too: on a long stall this slice is the larger of
+	// the two allocations, and keeping its capacity would defeat the eviction.
+	p.order = nil
 }
 
 func (p *AuxBlockPool) GetBlock(hash common.Uint256) (*types.Block, bool) {
