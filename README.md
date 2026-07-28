@@ -2,7 +2,7 @@ Elastos ELA
 ===========
 |Actions CI|Go Report Card|
 |:-:|:-:|
-|[![Build Status()](https://github.com/elastos/Elastos.ELA/workflows/Go/badge.svg?branch=release_v0.4.3)](https://github.com/elastos/Elastos.ELA/actions?query=branch:release_v0.4.3) |[![Code Report()](https://goreportcard.com/badge/github.com/elastos/Elastos.ELA)](https://goreportcard.com/report/github.com/elastos/Elastos.ELA)|
+|[![Build Status()](https://github.com/elastos/Elastos.ELA/workflows/Go/badge.svg)](https://github.com/elastos/Elastos.ELA/actions) |[![Code Report()](https://goreportcard.com/badge/github.com/elastos/Elastos.ELA)](https://goreportcard.com/report/github.com/elastos/Elastos.ELA)|
 
 ## Introduction
 
@@ -52,8 +52,8 @@ $ sudo apt-get install -y git
 Install Go distribution.
 
 ```bash
-$ curl -O https://golang.org/dl/go1.13.15.linux-amd64.tar.gz
-$ tar -xvf go1.13.15.linux-amd64.tar.gz
+$ curl -O https://golang.org/dl/go1.20.14.linux-amd64.tar.gz
+$ tar -xvf go1.20.14.linux-amd64.tar.gz
 $ sudo chown -R root:root ./go
 $ sudo mv go /usr/local
 $ export GOPATH=$HOME/go

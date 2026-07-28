@@ -2,10 +2,23 @@
 
 All notable changes to Elastos.ELA are recorded here.
 
-This file covers `89d707d..96d1a4e6`, the **132 commits** of the v1.0.0 recovery. This changelog commit sits on top of that range, so `89d707d..HEAD` is one more.
-The thematic sections below were written when the range held 112. Fifteen later
-commits are not described here; `docs/v1.0.0-review.html` indexes and explains all
-132, and is the authoritative catalogue.
+This file covers the v1.0.0 recovery, based on released v0.9.9.6 (`c61c9e61`).
+
+Counts and ranges are deliberately not hardcoded here, because they differ between
+the working tree, the canonical tree and the published branch. Compute them on the
+surface you are reading this from:
+
+```
+git rev-list --count c61c9e61..HEAD
+git diff --stat c61c9e61..HEAD
+```
+
+Assert that a cited commit is on this branch with `git rev-list c61c9e61..HEAD`.
+Do not use `git cat-file -e`, which succeeds for any object present in the
+repository whether or not it is reachable from this branch.
+
+The thematic sections below were written earlier in the effort and do not describe
+every later commit. `docs/v1.0.0-review.html` is the fuller per-commit catalogue.
 
 ---
 
@@ -17,9 +30,8 @@ first shipped release since v0.9.9.6. (No `v0.9.9.7` tag is present in this
 repository.) This
 repository's root commit `89d707d` is a squashed snapshot ("ELA v0.9.9.7 + all
 our fixes + battle/exploit tests"), so the entries below are the delta against
-**that snapshot**, not against released v0.9.9.6. See
-`RELEASE-MANIFEST.md` — the v0.9.9.6 delta is an **OPEN / BLOCKED** manifest
-field.
+**that snapshot**, not against released v0.9.9.6. To see the delta against the
+released version directly, use `git diff c61c9e61..HEAD`.
 
 Per-version release notes for every earlier version live in
 `docs/release-notes/`. That series stops at `release-notes-0.9.9.5.md`: this
@@ -53,8 +65,8 @@ coordinated mainnet heights. There is no third, and none may be added.
   transport, tooling or configuration. The evidence is per fix — full-chain
   censuses, fail-on-pristine tests and mutation batteries, recorded in the
   individual commits and summarised below. **A single independent replay of
-  0..2 260 450 on the shipped binary, compared against the frozen store, has
-  not been performed** and is an `OPEN` item in `RELEASE-MANIFEST.md`.
+  0..2 260 450 on the shipped binary, compared against the frozen store, is a
+  release gate and must complete before this release is tagged.**
 * Gate 2's value **must be confirmed by the core engineers before deployment**
   and must be identical fleet-wide (`cb0f8e0`).
 
@@ -1151,7 +1163,7 @@ the corrupt chain and fork itself off the recovered fleet.
   `<branch>-<sha>` so a development build stays self-identifying. No consensus
   code touched; no height literal added.
 
-* **`4bdeb19`** — this file and `RELEASE-MANIFEST.md`.
+* **`4bdeb19`** — this file.
 
 * **`3063533`** — **Release assurance (B3).** `go.sum` is now **tracked** (587
   entries) rather than `.gitignore`d, so a fresh clone builds offline; CI actions
@@ -1340,5 +1352,5 @@ Per the standing rule that inflation and mint claims are never inferred:
   side chains. This release is **main chain only**.
 * Any recovery, burn or fund-movement action. Those are separate, later,
   owner-driven operations.
-* A verified delta against **released upstream v0.9.9.6** — see
-  `RELEASE-MANIFEST.md`, where that field is **OPEN and BLOCKED**.
+* A verified delta against **released upstream v0.9.9.6**. Compute it directly
+  with `git diff c61c9e61..HEAD`.
