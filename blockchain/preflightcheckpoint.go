@@ -14,6 +14,7 @@ import (
 
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/common/config"
+	"github.com/elastos/Elastos.ELA/common/log"
 	"github.com/elastos/Elastos.ELA/core/checkpoint"
 )
 
@@ -258,4 +259,97 @@ func (r *PreflightReport) applyCheckpointGate(params *config.Configuration) {
 		"the rollback target %d, so its derived state may be exploit-era. Move or "+
 		"delete the stale default snapshot(s) so the node rebuilds derived state by "+
 		"replay.", max, target))
+}
+
+// PurgeTxPoolCheckpointAboveTarget removes any cp_txPool checkpoint whose recorded
+// height is ABOVE the forced-rollback target, after the rewind has completed.
+//
+// WHY THIS IS NEEDED AT ALL. cp_txPool is the one registered checkpoint that
+// Manager.MaxHeight deliberately skips (core/checkpoint/manager.go), and both
+// forced-rollback baseline gates therefore skip it by name -- see
+// CountedInMaxHeight above. That exclusion is correct arithmetic for the height
+// gate, but it also means NO existing check can observe a cp_txPool file left
+// above the target. ForceRollback does not remove it either. So it survives.
+//
+// MEASURED on a real mainnet node (2026-07-28): after a successful rewind from
+// 2,260,595 to 2,260,450, cp_txPool/2260595.txpcp was still present.
+//
+// WHY IT MATTERS. cp_txPool has SavePeriod == EffectivePeriod == 1, so it is
+// rewritten every block; on a frozen node it describes the mempool from INSIDE the
+// discarded range. txPoolCheckpoint.Deserialize calls txPool.appendToTxPool -- the
+// same entry point the live pool uses -- so the file restores directly into the
+// LIVE pool, and pow.GenerateBlock assembles the first block of the recovered chain
+// from that pool. Per-transaction re-validation does run (gate 1 included), so a
+// harmful entry is unlikely to survive it; this removes the question instead of
+// arguing about it.
+//
+// SCOPE. Only files strictly ABOVE the target are removed, and only from the
+// cp_txPool directory. The `default` file is left alone: it carries no height in
+// its name, and the checkpoint manager rewrites it from live state on the next
+// save. Derived-state checkpoints (cp_dpos, cp_cr) are NEVER touched here -- the
+// rewind's own post-rebuild baseline assertion already requires those to be below
+// the target, and deleting one would destroy the snapshot the rebuild starts from.
+//
+// A missing directory is not an error: a node that never ran a mempool checkpoint
+// has nothing to purge.
+func PurgeTxPoolCheckpointAboveTarget(checkpointRoot string, target uint32) error {
+	// Derive the directory from the SAME registration table MaxHeight consults,
+	// rather than a local literal: the excluded key is by definition the one
+	// registered checkpoint that MaxHeight does not count. If that table ever
+	// gains or renames an excluded key this follows it automatically.
+	var key string
+	for _, k := range checkpoint.RegisteredCheckpointKeys() {
+		if !checkpoint.CountedInMaxHeight(k) {
+			key = k
+			break
+		}
+	}
+	if key == "" {
+		return nil
+	}
+	dir := filepath.Join(checkpointRoot, key)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("forced rollback: read %s: %w", dir, err)
+	}
+
+	removed := make([]string, 0, 2)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Height-named files only. The manager writes "<height><ext>"; the live
+		// file is "default<ext>" and carries no height, so it is skipped by the
+		// same parse that selects the others.
+		base := name
+		if i := len(base) - len(filepath.Ext(base)); i >= 0 {
+			base = base[:i]
+		}
+		var h uint64
+		if _, perr := fmt.Sscanf(base, "%d", &h); perr != nil {
+			continue
+		}
+		if uint32(h) <= target {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		if rerr := os.Remove(p); rerr != nil {
+			return fmt.Errorf("forced rollback: remove stale mempool checkpoint %s: %w", p, rerr)
+		}
+		removed = append(removed, name)
+	}
+
+	if len(removed) > 0 {
+		sort.Strings(removed)
+		log.Operatorf("FORCED ROLLBACK: purged %d mempool checkpoint(s) written above the "+
+			"rollback target %d: %v. These describe the transaction pool from inside the "+
+			"discarded range and would otherwise restore into the live pool on the next "+
+			"start, which is where the first block of the recovered chain is built from.",
+			len(removed), target, removed)
+	}
+	return nil
 }

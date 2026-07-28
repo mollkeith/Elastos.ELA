@@ -260,6 +260,32 @@ func startNode(cfg *config.Configuration) {
 			// block's destructive work is durably committed.
 			printErrorAndExit(e)
 		}
+		// Purge the mempool checkpoint written from ABOVE the rollback target.
+		//
+		// MEASURED on a real mainnet node (2026-07-28, tip 2,260,595 -> 2,260,450):
+		// cp_txPool/2260595.txpcp SURVIVES the rewind. Nothing in ForceRollback
+		// removes it, and both forced-rollback baseline gates skip cp_txPool BY NAME
+		// (blockchain/preflightcheckpoint.go, core/checkpoint/manager.go) because
+		// Manager.MaxHeight excludes it -- so no existing check can see it either.
+		//
+		// Why it matters: cp_txPool has SavePeriod == EffectivePeriod == 1, so it is
+		// rewritten every block and on a frozen node it describes the mempool from
+		// INSIDE the discarded range. txPoolCheckpoint.Deserialize calls
+		// txPool.appendToTxPool -- the same function the live pool uses -- so it
+		// restores straight into the LIVE pool, and pow.GenerateBlock then assembles
+		// the first block of the recovered chain from exactly that pool.
+		// Per-transaction re-validation does run, gate 1 included, so a harmful entry
+		// is unlikely to survive; this removes the question rather than reasoning
+		// about it.
+		//
+		// On the node measured the file was 14 bytes (an EMPTY pool), so this is a
+		// hygiene fix rather than a live hazard -- but a node halted mid-activity
+		// carries a populated one, and the runbook must not depend on operators
+		// deleting a file by hand.
+		if e := blockchain.PurgeTxPoolCheckpointAboveTarget(
+			filepath.Join(dataDir, checkpointPath), cfg.ForcedRollbackHeight); e != nil {
+			printErrorAndExit(e)
+		}
 		forcedRollbackApplied = true
 	} else if cfg.ForcedRollbackTrigger != "" && cfg.ForcedRollbackHeight != 0 &&
 		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight {
