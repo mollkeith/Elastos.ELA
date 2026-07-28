@@ -250,13 +250,22 @@ func (o *VoteOutput) Validate() error {
 			}
 			candidateMap[c] = struct{}{}
 
-			// Bound votes ABSOLUTELY, not just from below. The original exploit had
-			// exactly this shape on outputs (a `< 0` check with no upper bound), and
-			// these values feed unchecked `producer.votes += ...` accumulations in
-			// dpos/state. Legitimate votes are <= the voter's stake <= supply, far
-			// under MaxELAMoney, so this never rejects a valid vote.
-			if o.Version >= VoteProducerAndCRVersion &&
-				(cv.Votes <= 0 || !common.MoneyRange(cv.Votes)) {
+			// NOTE: the absolute money-range bound on cv.Votes deliberately does NOT
+			// live here, for exactly the reason CrossChainOutput.Validate() records:
+			// Validate() carries no block height, so an unconditional bound is applied
+			// to RETAINED history as well as to new blocks. Rule 2 requires every block
+			// at or below the forced-rollback target to keep the verdict the released
+			// v0.9.9.6 gave it, and an ungated acceptance change here can only ever
+			// move a verdict from accept to reject. That defect already shipped once in
+			// this codebase, as an ungated money bound that rejected real block
+			// 2,208,265.
+			//
+			// The bound IS applied, height-gated at StrictMoneyRangeHeight, by the
+			// callers that know the height:
+			//   - TransferAssetTransaction.CheckTransactionOutput (vote outputs)
+			//   - VotingTransaction.CheckTransactionPayload       (Voting payloads)
+			// so every block the restarted chain produces is still fully bounded.
+			if o.Version >= VoteProducerAndCRVersion && cv.Votes <= 0 {
 				return errors.New("invalid candidate votes")
 			}
 		}

@@ -85,7 +85,7 @@ Example configuration
     "ProhibitTransferToDIDHeight": 1032840,     // Prohibit Transfer To DID Height
     "CrossChainMonitorStartHeight": 2000000,    // Cross Chain Monitor Start Height
     "CrossChainMonitorInterval": 100,           // Cross Chain Monitor Interval
-    "DPoSV2StartHeight": 2000000,               // Second edition Dpos start height
+    "DPoSV2StartHeight": 1405000,               // Second edition Dpos start height (MAINNET value; this file previously said 2000000, which is wrong by 595000 blocks and forks a node that syncs across that span. Mainnet now PINS this in code and ignores any override -- see enforceMainnetHistoricActivationHeights.)
     "DPoSV2EffectiveVotes": 8000000000000,      // Minimum valid number of votes
     "StakePool": "",                            // Stake Pool Address
     "SchnorrStartHeight": 2000000,              // Schnorr consensus Start Height

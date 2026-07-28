@@ -143,6 +143,78 @@ func enforceCoordinatedMainnetParameters(configuration *config.Configuration) {
 	enforceStrictMoneyAndRollbackHeights(configuration)
 	enforceFrozenAddresses(configuration)
 	enforceMainnetSchnorrActivationHeights(configuration)
+	enforceMainnetHistoricActivationHeights(configuration)
+}
+
+// enforceMainnetHistoricActivationHeights pins the HISTORIC consensus activation
+// heights that are still settable from config.json or a CLI flag. Every one of
+// them is long past on mainnet, so no correctly configured node can differ; but
+// each is a fork if it does differ, and each is reachable by an operator typo.
+//
+// The concrete reason this exists: docs/config.json.md documented
+// DPoSV2StartHeight as 2000000 while the compiled-in mainnet value is 1405000 --
+// off by 595,000 blocks. An operator who copied the repository's OWN example
+// config got a node that disagrees with the fleet about which transaction types
+// are legal across that 595,000-block span, and nothing warned them. Since the
+// only thing a mining pool can be asked to do is update the binary and start,
+// any value they can get wrong by following our documentation has to be pinned
+// in code rather than corrected in prose. (The doc is corrected too.)
+//
+// SCOPE, and why it is not the whole restart story: every one of these is
+// compared against a block height, always monotonically, so for blocks ABOVE
+// both the right and the wrong value the two agree and the mistake is inert. It
+// therefore does NOT fork an already-synced node on restart day -- the restarted
+// chain begins at 2,260,451, above all of them. It forks a node that REPLAYS the
+// affected span: a from-zero sync, or a restore from a snapshot below the wrong
+// value. That is exactly the core developer's validation item 3, and it is the
+// path a new pool or exchange node takes.
+//
+// Values are read from the compiled-in mainnet defaults rather than restated, so
+// this introduces NO new height literal (Rule 1) and cannot drift from
+// GetDefaultParams(). NormalSchnorrStartHeight is already pinned at the same
+// 1405000 by enforceMainnetSchnorrActivationHeights, so leaving DPoSV2StartHeight
+// unpinned beside it was an inconsistency as much as a gap.
+//
+// Announced on os.Stderr for the same reason the rollback discard is: SetupConfig
+// runs before setupLog, so the package logger is still nil here.
+func enforceMainnetHistoricActivationHeights(configuration *config.Configuration) {
+	switch strings.ToLower(strings.TrimSpace(configuration.ActiveNet)) {
+	case "", "mainnet", "main":
+	default:
+		// Non-mainnet keeps whatever the net defaults or config.json supplied:
+		// testnet and regnet carry their own real activation heights, and a
+		// private/forked net may legitimately choose its own.
+		return
+	}
+
+	def := config.GetDefaultParams()
+
+	pins := []struct {
+		flag    string
+		field   *uint32
+		mainnet uint32
+	}{
+		{"--dposv2startheight", &configuration.DPoSV2StartHeight,
+			def.DPoSV2StartHeight},
+		{"--votestartheight", &configuration.VoteStartHeight,
+			def.VoteStartHeight},
+		{"--crconlydposheight", &configuration.CRCOnlyDPOSHeight,
+			def.CRCOnlyDPOSHeight},
+		{"--publicdposheight", &configuration.PublicDPOSHeight,
+			def.PublicDPOSHeight},
+	}
+
+	for _, p := range pins {
+		if *p.field != p.mainnet {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: ignoring mainnet %s %d - pinned to the coordinated "+
+					"mainnet activation height %d. A node that used the supplied "+
+					"value would disagree with the fleet about which transactions "+
+					"are valid across that span and fork while syncing.\n",
+				p.flag, *p.field, p.mainnet)
+		}
+		*p.field = p.mainnet
+	}
 }
 
 // enforceCrossChainUTXORestrictionHeights prevents local configuration from

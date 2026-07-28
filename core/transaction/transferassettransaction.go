@@ -54,6 +54,32 @@ func (t *TransferAssetTransaction) CheckTransactionOutput() error {
 			if err := checkTransferAssetOutputPayload(output); err != nil {
 				return err
 			}
+			// VoteOutput.Validate() carries no block height, so it applies only the
+			// original unconditional lower bound on each candidate's votes. The
+			// ABSOLUTE bound is new and lives here, where the height is known, gated
+			// at StrictMoneyRangeHeight -- the same split CrossChainOutput uses.
+			// These values feed unchecked `producer.votes += ...` accumulations in
+			// dpos/state, so bounding them above the gate is required; applying the
+			// bound below it would re-judge retained history and could only turn an
+			// accept into a reject (Rule 2).
+			//
+			// Deliberately covers EVERY vote output version, not just
+			// VoteProducerAndCRVersion as the in-Validate() form did: a version-0
+			// output's votes feed the same accumulators, and above the coordinated
+			// gate there is no retained history to preserve. No legitimate vote can
+			// exceed MaxELAMoney (1e9 ELA) against a ~26M ELA supply, so this
+			// rejects nothing real.
+			if blockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+				if vo, ok := output.Payload.(*outputpayload.VoteOutput); ok {
+					for _, content := range vo.Contents {
+						for _, cv := range content.CandidateVotes {
+							if !common.MoneyRange(cv.Votes) {
+								return errors.New("candidate votes out of money range")
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 

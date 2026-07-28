@@ -38,7 +38,27 @@ func (t *VotingTransaction) HeightVersionCheck() error {
 func (t *VotingTransaction) CheckTransactionPayload() error {
 	switch t.Payload().(type) {
 	case *payload.Voting:
-		return t.Payload().(*payload.Voting).Validate()
+		pld := t.Payload().(*payload.Voting)
+		if err := pld.Validate(); err != nil {
+			return err
+		}
+		// Voting.Validate() carries no block height, so it applies only the original
+		// unconditional lower bound. The ABSOLUTE bound is new and therefore lives
+		// here, where the height is known, gated at StrictMoneyRangeHeight. This is
+		// the same split the crosschain payload uses, and it is version-agnostic --
+		// it covers exactly the entries Validate() walks -- so above the gate the
+		// coverage is identical to an unconditional bound, while retained history
+		// keeps the verdict v0.9.9.6 gave it (Rule 2).
+		if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+			for _, content := range pld.Contents {
+				for _, cv := range content.VotesInfo {
+					if !common.MoneyRange(cv.Votes) {
+						return errors.New("candidate votes out of money range")
+					}
+				}
+			}
+		}
+		return nil
 
 	}
 
@@ -153,11 +173,22 @@ func (t *VotingTransaction) SpecialContextCheck() (result elaerr.ELAError, end b
 
 		for _, content := range pld.Contents {
 			for _, vi := range content.VotesInfo {
-				// Absolute bound, not just lower — these feed unchecked accumulations
-				// in dpos/state (producer.votes/dposV2Votes += ...).
-				if vi.Votes <= 0 || !common.MoneyRange(vi.Votes) {
+				// The lower bound is the ORIGINAL, unconditional check and must stay
+				// unconditional -- it is what the released v0.9.9.6 applied to every
+				// retained block.
+				if vi.Votes <= 0 {
 					return elaerr.Simple(elaerr.ErrTxPayload,
 						errors.New("invalid votes, need to be bigger than zero")), true
+				}
+				// The ABSOLUTE bound is new, so it is gated at StrictMoneyRangeHeight:
+				// these values feed unchecked accumulations in dpos/state
+				// (producer.votes/dposV2Votes += ...), but applying the bound below the
+				// gate would re-judge retained history and could only turn an accept
+				// into a reject (Rule 2). Above the gate every vote is bounded.
+				if blockHeight >= t.parameters.Config.StrictMoneyRangeHeight &&
+					!common.MoneyRange(vi.Votes) {
+					return elaerr.Simple(elaerr.ErrTxPayload,
+						errors.New("candidate votes out of money range")), true
 				}
 			}
 

@@ -118,8 +118,13 @@ func (p *Voting) Validate() error {
 			}
 			candidateMap[c] = struct{}{}
 
-			// Absolute bound, not just lower — see outputpayload/vote.go rationale.
-			if cv.Votes <= 0 || !common.MoneyRange(cv.Votes) {
+			// NOTE: the absolute money-range bound is NOT applied here -- Validate()
+			// carries no block height, so it would also re-judge retained history and
+			// can only move a verdict from accept to reject (Rule 2). See the rationale
+			// in outputpayload/vote.go and outputpayload/crosschain.go. The bound is
+			// applied, gated at StrictMoneyRangeHeight, by the height-aware caller
+			// VotingTransaction.CheckTransactionPayload.
+			if cv.Votes <= 0 {
 				return errors.New("invalid candidate votes")
 			}
 		}
