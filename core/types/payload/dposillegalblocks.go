@@ -16,8 +16,8 @@ import (
 	"github.com/elastos/Elastos.ELA/elanet/pact"
 )
 
-// MaxDPoSIllegalSigners bounds the signer slice at decode time (DoS ceiling, F-012
-// sibling of the SidechainIllegalData fix). Far above any legitimate signer set.
+// MaxDPoSIllegalSigners bounds the signer slice at decode time (DoS ceiling, the
+// same shape as MaxSidechainIllegalSigns). Far above any legitimate signer set.
 const MaxDPoSIllegalSigners = 1024
 
 type CoinType uint32
@@ -101,8 +101,8 @@ func (b *BlockEvidence) DeserializeOthers(r io.Reader) (err error) {
 	if len, err = common.ReadVarUint(r, 0); err != nil {
 		return err
 	}
-	// F-012 sibling: cap before allocating (a crafted varint -> `makeslice: cap out of
-	// range` / OOM, reachable pre-auth via IllegalBlockEvidence relay).
+	// Cap before allocating: a crafted varint gives `makeslice: cap out of range`
+	// or OOM, reachable pre-auth via IllegalBlockEvidence relay.
 	if len > MaxDPoSIllegalSigners {
 		return errors.New("dpos illegal signers length exceeds maximum")
 	}
@@ -245,20 +245,20 @@ func (d *DPOSIllegalBlocks) Type() IllegalDataType {
 
 // DedupHash returns the SpecialTxHashes dedup key for this illegal-block evidence.
 //
-// F-030: the legacy Hash() folds the RAW evidence-header bytes, but a block header's
-// consensus identity common2.Header.Hash() is SerializeNoAux -- it EXCLUDES the AuxPow
+// The legacy Hash() folds the raw evidence-header bytes, but a block header's
+// consensus identity common2.Header.Hash() is SerializeNoAux: it excludes the AuxPow
 // (and the trailing sentinel byte). The illegal-block validation path never calls
 // AuxPow.Check(), and even the canonical-AuxPow gate (AuxPow.IsCanonical) pins only two
 // of the AuxPow fields, so the remaining sub-fields (AuxMerkleBranch, ParBlockHeader,
 // ParCoinbaseTx, ParCoinBaseMerkle, AuxMerkleIndex) round-trip through
-// Serialize/Deserialize: an attacker can re-encode ONE logical illegal block into
+// Serialize/Deserialize: an attacker can re-encode one logical illegal block into
 // unboundedly many raw byte strings, each with a distinct Hash(), bypassing the
 // SpecialTxExists dedup set.
 //
 // When strictActive (evidence at/above StrictMoneyRangeHeight) this folds each evidence
-// header by its LOGICAL identity (Header.Hash()) and canonically orders the two hashes,
-// so every AuxPow encoding of one logical illegal block -- and any reordering of the
-// evidence pair -- collapses to a SINGLE key. When !strictActive it returns the legacy
+// header by its logical identity (Header.Hash()) and canonically orders the two hashes,
+// so every AuxPow encoding of one logical illegal block, and any reordering of the
+// evidence pair, collapses to a single key. When !strictActive it returns the legacy
 // raw Hash() unchanged so below-gate history serializes byte-identically. If either
 // header fails to decode it falls back to the raw Hash() (a non-decodable header is
 // rejected upstream anyway).
@@ -301,10 +301,10 @@ const (
 	dedupDomainIllegalVote     = uint32(0x02)
 )
 
-// illegalEvidenceDedupKey folds one logical equivocation -- an evidenced height plus the
-// two evidence identities in canonical (order-independent) form -- into a single dedup
-// key. Shared by DPOSIllegalProposals.DedupHash and DPOSIllegalVotes.DedupHash (NX-08) and
-// deliberately shaped like DPOSIllegalBlocks.DedupHash (F-030).
+// illegalEvidenceDedupKey folds one logical equivocation, an evidenced height plus the
+// two evidence identities in canonical (order-independent) form, into a single dedup
+// key. Shared by DPOSIllegalProposals.DedupHash and DPOSIllegalVotes.DedupHash, and
+// deliberately shaped like DPOSIllegalBlocks.DedupHash.
 func illegalEvidenceDedupKey(domain uint32, blockHeight uint32,
 	h1, h2 common.Uint256) common.Uint256 {
 	lo, hi := h1, h2
@@ -321,16 +321,16 @@ func illegalEvidenceDedupKey(domain uint32, blockHeight uint32,
 
 // SpecialTxDedupKey returns the SpecialTxHashes dedup key for any DPOSIllegalData
 // payload, given the coordinated StrictMoneyRangeHeight gate. At and above the gate,
-// illegal-BLOCK evidence gets the AuxPow-independent logical key (F-030) and
-// illegal-PROPOSAL / illegal-VOTE evidence get the BlockHeader-independent logical key
-// (NX-08). Below the gate, and for the two remaining DPOSIllegalData types
-// (SidechainIllegalData and InactiveArbitrators -- both hash SerializeUnsigned only, i.e.
-// neither covers a raw header blob nor the arbiter signature set, so neither has the
-// malleability this fold exists to remove), the legacy raw payload Hash() is kept so
-// below-gate history serializes byte-identically. The gate is read from the evidence's own BlockHeight so the read
-// (State.SpecialTxExists) and write (State.recordSpecialTx) paths, and the block-level
-// guard (blockchain.CheckSameBlockConflicts), always agree without threading an external
-// height -- F-030's commit note requires read and write to flip together.
+// illegal-block evidence gets the AuxPow-independent logical key and illegal-proposal
+// / illegal-vote evidence get the BlockHeader-independent logical key. Below the gate,
+// and for the two remaining DPOSIllegalData types (SidechainIllegalData and
+// InactiveArbitrators, which hash SerializeUnsigned only, so neither covers a raw
+// header blob nor the arbiter signature set and neither has the malleability this fold
+// exists to remove), the legacy raw payload Hash() is kept so below-gate history
+// serializes byte-identically. The gate is read from the evidence's own BlockHeight so
+// the read (State.SpecialTxExists) and write (State.recordSpecialTx) paths, and the
+// block-level guard (blockchain.CheckSameBlockConflicts), always agree without
+// threading an external height: read and write must flip together.
 func SpecialTxDedupKey(d DPOSIllegalData, gateHeight uint32) common.Uint256 {
 	switch p := d.(type) {
 	case *DPOSIllegalBlocks:

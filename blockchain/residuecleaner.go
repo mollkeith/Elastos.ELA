@@ -62,28 +62,27 @@ func PurgeForcedRollbackResidue(fflDB IFFLDBChainStore, target uint32) (int, err
 			target, len(scan.LiveAbove), refsString(scan.LiveAbove))
 	}
 
-	// Stale main-chain index entries above the target are NOT residue, and this
+	// Stale main-chain index entries above the target are not residue, and this
 	// function must not remove them. They can only exist there when a rollback was
-	// interrupted before its transaction committed -- the transaction that also
-	// reverts the UTXO and derived-state processors -- so they are the DIAGNOSIS of a
-	// node no cleanup can repair, and they are the diagnosis the boot path refuses
-	// on (DiagnoseForcedRollbackResidue -> ResidueInterrupted).
+	// interrupted before its transaction committed, the transaction that also reverts
+	// the UTXO and derived-state processors, so they are the diagnosis of a node no
+	// cleanup can repair, and they are the diagnosis the boot path refuses on
+	// (DiagnoseForcedRollbackResidue -> ResidueInterrupted).
 	//
-	// The shipped version deleted them. MEASURED on the ffldb harness (four
-	// above-target blocks in the interrupted shape): `ela-cli purgeresidue` reported
-	// "purged 4 residual block(s)" and exit 0, and the next boot's refusal --
-	// which still fired, because the persisted best-chain state is a second witness
-	// this function never touches -- had degraded to "the block database still
-	// records 0 block(s) above the forced-rollback target 2 as part of the MAIN
-	// CHAIN ... Residue: ", i.e. a self-contradictory sentence with the hash list
-	// gone. The operator is told the store was cleaned when the un-reverted UTXO
-	// state that makes the node unusable is exactly what remains.
+	// Deleting them hides that diagnosis. On the ffldb harness, with four above-target
+	// blocks in the interrupted shape, `ela-cli purgeresidue` reports "purged 4 residual
+	// block(s)" and exit 0, and the next boot's refusal, which still fires because the
+	// persisted best-chain state is a second witness this function never touches,
+	// degrades to "the block database still records 0 block(s) above the forced-rollback
+	// target 2 as part of the MAIN CHAIN ... Residue: ", a self-contradictory sentence
+	// with the hash list gone. The operator would be told the store was cleaned when the
+	// un-reverted UTXO state that makes the node unusable is exactly what remains.
 	//
-	// Refusing costs nothing: the two in-process callers (ForceRollback's closing
-	// sweep, and CheckForcedRollbackResidue's ResidueRetentionOnly branch) only
-	// reach this function with MainChainAbove EMPTY -- the sweep runs after every
-	// above-target block on the main chain has been rolled back, and the boot-time
-	// branch is selected by `len(scan.MainChainAbove) == 0`.
+	// Refusing costs nothing: the two in-process callers (ForceRollback's closing sweep,
+	// and CheckForcedRollbackResidue's ResidueRetentionOnly branch) only reach this
+	// function with MainChainAbove empty. The sweep runs after every above-target block
+	// on the main chain has been rolled back, and the boot-time branch is selected by
+	// `len(scan.MainChainAbove) == 0`.
 	if len(scan.MainChainAbove) > 0 {
 		return 0, fmt.Errorf("%w: refusing to purge -- the block database still "+
 			"records %d block(s) above the rollback target %d as part of the MAIN "+

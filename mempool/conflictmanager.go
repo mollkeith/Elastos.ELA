@@ -210,18 +210,18 @@ func newConflictManager() conflictManager {
 						Type: common2.UpdateProducer,
 						Func: strDPoSOwnerNodePublicKeys,
 					},
-					// NX-10b: CRCouncilMemberClaimNode belongs in this UNION slot, not only
-					// in slotDPoSNodePublicKey. blockchain.CheckSameBlockConflicts folds the
+					// CRCouncilMemberClaimNode belongs in this union slot, not only in
+					// slotDPoSNodePublicKey. blockchain.CheckSameBlockConflicts folds the
 					// claimed node key into the same producerCRKeys map that already holds
-					// producer OWNER keys, so "RegisterProducer.OwnerKey == claimed node key"
-					// is a BLOCK conflict. Without this pair it was not a MEMPOOL conflict:
-					// both transactions were admitted, GenerateBlock (which never runs
-					// CheckSameBlockConflicts) packed both, the block failed its own sanity
-					// check, and nothing evicted either transaction -- so every proposer
-					// repeated the failure. A durable halt, reachable by one CR seat plus one
+					// producer owner keys, so "RegisterProducer.OwnerKey == claimed node key"
+					// is a block conflict. Without this pair it is not a mempool conflict:
+					// both transactions are admitted, GenerateBlock (which never runs
+					// CheckSameBlockConflicts) packs both, the block fails its own sanity
+					// check, and nothing evicts either transaction, so every proposer repeats
+					// the failure. That is a durable halt, reachable with one CR seat plus one
 					// producer deposit.
 					//
-					// UNGATED, and it cannot affect consensus: the conflict manager is
+					// Ungated, and it cannot affect consensus: the conflict manager is
 					// admission-only. It is referenced nowhere outside mempool/, and every
 					// AppendToTxPool call site is P2P relay, RPC or the DPoS manager. No
 					// retained block changes verdict because no block validation path reads

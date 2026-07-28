@@ -98,21 +98,23 @@ func (t *NFTDestroyTransactionFromSideChain) SpecialContextCheck() (elaerr.ELAEr
 	if !ok {
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid payload")), true
 	}
-	// F-074: IDs and OwnerStakeAddresses are two independently-counted slices; the apply
+	// IDs and OwnerStakeAddresses are two independently-counted slices; the apply
 	// path (processNFTDestroyFromSideChain, state.go:2895/2961) indexes
-	// OwnerStakeAddresses[i] over the IDs loop, so a length mismatch is accepted here then
-	// panics (index out of range) on ProcessBlock -> consensus halt. Reject the mismatch.
-	// Gated at the coordinated-upgrade height for replay-safety (no mismatched NFTDestroy
-	// exists in history — one would have halted every node before tip 2260595).
+	// OwnerStakeAddresses[i] over the IDs loop, so a length mismatch is accepted here
+	// then panics (index out of range) on ProcessBlock, halting consensus. Reject the
+	// mismatch. Gated at the coordinated-upgrade height for replay-safety; no
+	// mismatched NFTDestroy exists in history, since one would have halted every node
+	// before tip 2260595.
 	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight &&
 		len(nftDestroyPayload.IDs) != len(nftDestroyPayload.OwnerStakeAddresses) {
 		return elaerr.Simple(elaerr.ErrTxPayload,
 			errors.New("NFTDestroy IDs and OwnerStakeAddresses length mismatch")), true
 	}
-	// F-104: reject duplicate NFT IDs within one destroy tx. ExistNFTID/CanNFTDestroy are
+	// Reject duplicate NFT IDs within one destroy tx. ExistNFTID/CanNFTDestroy are
 	// read-only during validation, so a repeated ID passes both and double-applies the
-	// destroy on ProcessBlock. Gated at StrictMoneyRangeHeight (like F-074/F-052) ->
-	// below-gate byte-identical (no arbiter-signed dup-ID NFTDestroy in retained history).
+	// destroy on ProcessBlock. Gated at StrictMoneyRangeHeight like the length and
+	// genesis-binding checks, so below-gate replay is byte-identical (no arbiter-signed
+	// dup-ID NFTDestroy exists in retained history).
 	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
 		seen := make(map[common.Uint256]struct{}, len(nftDestroyPayload.IDs))
 		for _, id := range nftDestroyPayload.IDs {
@@ -122,12 +124,12 @@ func (t *NFTDestroyTransactionFromSideChain) SpecialContextCheck() (elaerr.ELAEr
 			}
 			seen[id] = struct{}{}
 		}
-		// F-073 (fork round 2 / Fable finding I): reject an NFTDestroy whose
-		// OwnerStakeAddresses name any of its OWN NFTs` stake addresses. That cross-key
-		// aliasing makes the DPoSV2RewardInfo forward closures compose while both reverts
-		// subtract pre-block captures, misallocating claimable reward on a reorg
-		// (state.go processNFTDestroyFromSideChain). A legitimate new owner is a user stake
-		// address, never a derived NFT stake address, so this rejects only the attack.
+		// Reject an NFTDestroy whose OwnerStakeAddresses name any of its own NFTs'
+		// stake addresses. That cross-key aliasing makes the DPoSV2RewardInfo forward
+		// closures compose while both reverts subtract pre-block captures, misallocating
+		// claimable reward on a reorg (state.go processNFTDestroyFromSideChain). A
+		// legitimate new owner is a user stake address, never a derived NFT stake address,
+		// so this rejects only the attack.
 		nftStakeSet := make(map[common.Uint168]struct{}, len(nftDestroyPayload.IDs))
 		for _, id := range nftDestroyPayload.IDs {
 			ct, err := contract.CreateStakeContractByCode(id.Bytes())
@@ -159,9 +161,9 @@ func (t *NFTDestroyTransactionFromSideChain) SpecialContextCheck() (elaerr.ELAEr
 			errors.New(" NFT can not destroy")), true
 	}
 
-	// F-052: bind each destroyed NFT to the sidechain it was created on (see
-	// checkNFTDestroyGenesisBinding). Gated at StrictMoneyRangeHeight -> below-gate
-	// byte-identical.
+	// Bind each destroyed NFT to the sidechain it was created on (see
+	// checkNFTDestroyGenesisBinding). Gated at StrictMoneyRangeHeight, so below-gate
+	// replay is byte-identical.
 	if err := checkNFTDestroyGenesisBinding(nftDestroyPayload.IDs,
 		nftDestroyPayload.GenesisBlockHash, state.GetNFTGenesisBlockHash,
 		t.parameters.BlockHeight, t.parameters.Config.StrictMoneyRangeHeight); err != nil {
@@ -216,17 +218,19 @@ func (t *NFTDestroyTransactionFromSideChain) checkNFTDestroyTransactionFromSideC
 	return nil
 }
 
-// checkNFTDestroyGenesisBinding (F-052) verifies each destroyed NFT's recorded origin
+// checkNFTDestroyGenesisBinding verifies that each destroyed NFT's recorded origin
 // sidechain genesis (NFTInfo.GenesisBlockHash, set at CreateNFT) matches the destroy
-// payload's GenesisBlockHash, at/above the gate. NFTDestroyFromSideChain carried an
-// unvalidated GenesisBlockHash, so an arbiter-signed destroy could name ANY sidechain
-// genesis. genesisOf is injected (state.GetNFTGenesisBlockHash) for testability.
+// payload's GenesisBlockHash, at/above the gate. NFTDestroyFromSideChain otherwise
+// carries an unvalidated GenesisBlockHash, so an arbiter-signed destroy could name any
+// sidechain genesis. genesisOf is injected (state.GetNFTGenesisBlockHash) for
+// testability.
 //
-// ENGINEER Q14 (gate-height): unlike F-074 (a mismatch CRASHES, so its absence in history
-// is provable), F-052 is SILENT-accept, so absence in the re-derived [2260451,2260595]
-// band is not scan-provable. Safe under the mine-new rollback (corrupt blocks discarded,
-// not replayed); if any node re-derives by REPLAYING historical blocks, confirm absence in
-// that band or move this to a fresh dormant height > resume tip.
+// Gate height, open point: unlike the length-mismatch check, whose absence from history
+// is provable because a mismatch crashes, this rule is silent-accept, so its absence in
+// the re-derived [2260451,2260595] band cannot be shown by scanning. It is safe under
+// the mine-new rollback, where corrupt blocks are discarded rather than replayed. If any
+// node re-derives by replaying historical blocks, confirm absence in that band or move
+// this to a fresh dormant height above the resume tip.
 func checkNFTDestroyGenesisBinding(ids []common.Uint256, payloadGenesis common.Uint256,
 	genesisOf func(common.Uint256) (common.Uint256, error), height, gate uint32) error {
 	if height < gate {

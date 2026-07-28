@@ -110,8 +110,8 @@ func (c *fileChannels) messageLoop() {
 }
 
 func (c *fileChannels) saveCheckpoint(msg *fileMsg) (err error) {
-	// F-122: the reply told the caller "saved" even when Serialize or Write had
-	// failed. Report what actually happened.
+	// Report what actually happened: a reply of "saved" must not be sent when
+	// Serialize or Write failed.
 	defer func() { c.replyMsg(msg, err == nil) }()
 
 	dir := getCheckpointDirectory(c.cfg.DataPath, msg.checkpoint)
@@ -121,9 +121,9 @@ func (c *fileChannels) saveCheckpoint(msg *fileMsg) (err error) {
 		}
 	}
 
-	// F-122: serialize BEFORE touching the destination. As shipped this opened the
-	// FINAL path with O_TRUNC first, so a Serialize error destroyed the checkpoint
-	// that was already on disk and left a zero-length file behind.
+	// Serialize before touching the destination. Opening the final path with
+	// O_TRUNC first means a Serialize error destroys the checkpoint already on
+	// disk and leaves a zero-length file behind.
 	buf := new(bytes.Buffer)
 	if err = msg.checkpoint.Serialize(buf); err != nil {
 		return
@@ -143,14 +143,14 @@ func (c *fileChannels) saveCheckpoint(msg *fileMsg) (err error) {
 // writeFileAtomic writes data to a sibling temp file, flushes it to stable storage
 // and renames it over path.
 //
-// F-122: the shipped save wrote the final path in place with no fsync, so a crash
-// or power cut mid-write left a SHORT checkpoint file that still "exists" -- and
-// replaceCheckpoints only tests existence before renaming it over default.<ext>,
-// which then feeds the F-121 restore path on the next start. rename(2) inside one
-// directory is atomic, so a reader now sees either the previous checkpoint or the
-// complete new one, never a torn one. The directory entry itself is deliberately
-// not fsynced: losing the rename in a power cut leaves the previous good file in
-// place, which is a consistent outcome.
+// Writing the final path in place with no fsync leaves a short checkpoint file
+// that still "exists" after a crash or power cut mid-write, and
+// replaceCheckpoints only tests existence before renaming it over
+// default.<ext>, which then feeds the restore path on the next start.
+// rename(2) inside one directory is atomic, so a reader sees either the
+// previous checkpoint or the complete new one, never a torn one. The directory
+// entry itself is deliberately not fsynced: losing the rename in a power cut
+// leaves the previous good file in place, which is a consistent outcome.
 func writeFileAtomic(path string, data []byte) (err error) {
 	tmp := path + ".tmp"
 	var file *os.File
@@ -277,7 +277,7 @@ func (c *fileChannels) removeCheckpoints(msg *heightFileMsg) (err error) {
 }
 
 // replyMsg hands the outcome of a file operation back to the caller waiting on the
-// reply channel. F-122: this used to send true unconditionally.
+// reply channel. The outcome must reflect the operation, not be true unconditionally.
 func (c *fileChannels) replyMsg(msg *fileMsg, ok bool) {
 	if msg.reply != nil {
 		msg.reply <- ok

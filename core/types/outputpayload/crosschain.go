@@ -84,12 +84,13 @@ func (o *CrossChainOutput) Validate() error {
 	if o.TargetAmount <= 0 {
 		return errors.New("invalid target amount")
 	}
-	// NOTE: the money-range bound on TargetAmount deliberately does NOT live here.
-	// Validate() carries no block height, and an unconditional bound rejects
-	// retained mainnet block 2,208,265 -- a block the released v0.9.9.6 accepted
-	// and DPoS-finalised -- which would stop a node replaying the chain from
-	// genesis. The bound is applied, height-gated, by the one caller that knows
-	// the height: TransferCrossChainAssetTransaction.CheckTransactionOutput.
+	// The money-range bound on TargetAmount does not belong here. Validate() carries
+	// no block height, and an unconditional bound rejects retained mainnet block
+	// 2,208,265, which the released v0.9.9.6 accepted and DPoS-finalised, so a node
+	// replaying the chain from genesis would stop there. The bound is applied,
+	// height-gated, by the one caller that knows the height:
+	// TransferCrossChainAssetTransaction.CheckTransactionOutput. Moving it back here
+	// breaks replay from genesis.
 
 	return nil
 }

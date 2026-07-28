@@ -105,21 +105,21 @@ func (t *WithdrawFromSideChainTransaction) IsAllowedInPOWConsensus() bool {
 // HeightVersionCheck enforces SchnorrStartHeight as a real two-sided activation
 // gate for the WithdrawFromSideChain payload version.
 //
-// F-185: SchnorrStartHeight is documented as "the start height to support
-// schnorr withdraw transaction", but SpecialContextCheck only ever used it to
-// MANDATE V2 ABOVE the height -- nothing rejected a V2 payload BELOW it. So
+// SchnorrStartHeight is documented as "the start height to support schnorr
+// withdraw transaction", but SpecialContextCheck only ever used it to mandate V2
+// above the height; nothing rejected a V2 payload below it. So
 // checkWithdrawFromSideChainTransactionV2 was dispatched purely on
-// PayloadVersion==0x02 at ANY height, even though MainNet SchnorrStartHeight is
-// math.MaxUint32, i.e. the feature is configured OFF. That left the
+// PayloadVersion==0x02 at any height, even though MainNet SchnorrStartHeight is
+// math.MaxUint32, i.e. the feature is configured off. That left the
 // aggregate-Schnorr group key live: checkSchnorrWithdrawFromSidechain builds it
-// as a PLAIN sum of the signers' NodePublicKeys, with no MuSig H(L)
-// coefficients and no proof-of-possession on NodePublicKey (F-189). An arbiter
+// as a plain sum of the signers' NodePublicKeys, with no MuSig H(L)
+// coefficients and no proof-of-possession on NodePublicKey. An arbiter
 // who registers NodePublicKey = g^x - SUM(other signers' keys) makes the
 // aggregate equal g^x and can alone forge a full-threshold withdraw of the
 // cross-chain "X" custody UTXOs, naming honest arbiters' indexes without their
 // participation.
 //
-// Every other Schnorr feature in this tree gates on the reject side --
+// Every other Schnorr feature in this tree gates on the reject side:
 // registerproducertransaction.go (ProducerSchnorrStartHeight),
 // registercrtransaction.go (CRSchnorrStartHeight), exchangevotes.go
 // (VotesSchnorrStartHeight), transactionchecker.go CheckAttributeProgram
@@ -128,21 +128,21 @@ func (t *WithdrawFromSideChainTransaction) IsAllowedInPOWConsensus() bool {
 // unreachable wherever the feature is configured off, instead of shipping a
 // protocol-breaking MuSig/PoP rewrite for a path that is meant to be dormant.
 //
-// PROVEN, not inferred: a full read-only census of the real frozen mainnet
-// chain (2,260,597 blocks, heights 0..2,260,595) found 3,295 V0 and 7,786 V1
-// WithdrawFromSideChain transactions and ZERO V2 -- and zero Schnorr program
-// codes in ANY transaction type, chain-wide. The production Arbiter emits V1,
-// so enforcing the gate removes no behaviour the chain has ever used.
+// Measured, not inferred: a full read-only pass over the frozen mainnet chain
+// (2,260,597 blocks, heights 0..2,260,595) finds 3,295 V0 and 7,786 V1
+// WithdrawFromSideChain transactions and no V2, and no Schnorr program codes in
+// any transaction type chain-wide. The production Arbiter emits V1, so enforcing
+// the gate removes no behaviour the chain has ever used.
 //
 // The unknown-version default-deny mirrors RegisterProducer / RegisterCR /
-// UpdateProducer (F-069). On MainNet it is redundant with the
+// UpdateProducer. On MainNet it is redundant with the
 // checkTransactionCrossChainUTXO admit-list, which already refuses any
 // WithdrawFromSideChain payload version outside {0,1,2} from spending an "X"
 // output above CrossChainUTXOFreezeHeight; it is kept here so the rule does not
 // depend on that ordering.
 //
 // Gated at StrictMoneyRangeHeight (gate 1, the coordinated incident gate). No
-// third gate: replay of retained history at or below gate-1 stays bit-identical.
+// third gate: replay of retained history at or below gate 1 stays bit-identical.
 func (t *WithdrawFromSideChainTransaction) HeightVersionCheck() error {
 	blockHeight := t.parameters.BlockHeight
 	chainParams := t.parameters.Config
@@ -369,13 +369,13 @@ func (t *WithdrawFromSideChainTransaction) checkWithdrawFromSideChainTransaction
 	if err != nil {
 		return err
 	}
-	// F-051: V2 (Schnorr) withdraws never performed the committed sidechain-tx-hash
+	// V2 (Schnorr) withdraws never performed the committed sidechain-tx-hash
 	// dedup that V0/V1 do, so one sidechain burn could be withdrawn again in a
 	// later block. Gated at StrictMoneyRangeHeight for replay-safety (below-gate
 	// byte-identical; mainnet V2 is dormant via SchnorrStartHeight=MaxUint32).
-	// testnet/regnet forward protection is a config decision (their gate is
-	// disabled) — see INFERRED-ITEMS. The mempool extractor + same-block mirror
-	// cover the pool and in-block dimensions.
+	// Forward protection on testnet/regnet is a config decision, since their gate is
+	// disabled. The mempool extractor and same-block mirror cover the pool and
+	// in-block dimensions.
 	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
 		for _, output := range t.Outputs() {
 			if output.Type != common2.OTWithdrawFromSideChain {
@@ -413,14 +413,14 @@ func checkSchnorrWithdrawFromSidechain(t interfaces.Transaction,
 			signerIndexes[index] = struct{}{}
 		}
 
-		// F-185 (crash-harden, ungated): the index guard above only runs at or
-		// above CrossChainUTXORestrictionHeight (F-070). Outside that window an
+		// Crash-harden, ungated: the index guard above only runs at or
+		// above CrossChainUTXORestrictionHeight. Outside that window an
 		// out-of-range Signers index panics on arbiters[index], and a
 		// NodePublicKey that crypto.Unmarshal cannot decode yields (nil, nil),
 		// which panics inside Curve.Add (nil big.Int receiver / invalid point).
 		// A panic is never an accepted block, so failing closed here cannot
-		// change any acceptance decision on any history -- same rationale as the
-		// F-050 Schnorr parameter-length harden. Left ungated for that reason.
+		// change any acceptance decision on any history, the same rationale as
+		// the Schnorr parameter-length harden. Left ungated for that reason.
 		if int(index) >= len(arbiters) {
 			return errors.New("schnorr withdraw signer index out of range")
 		}
@@ -521,9 +521,9 @@ func (t *WithdrawFromSideChainTransaction) GetRollbackProcessor() (database.TXPr
 
 			return nil
 		}, nil
-		// F-051: mirror GetSaveProcessor (V1||V2) so a reorged V2 withdraw also
+		// Mirror GetSaveProcessor (V1||V2) so a reorged V2 withdraw also
 		// clears its Tx3Index; otherwise the sidechain hash stays marked-used
-		// forever (liveness brick — the burn can never be re-withdrawn).
+		// forever and the burn can never be re-withdrawn.
 	} else if t.PayloadVersion() == payload.WithdrawFromSideChainVersionV1 ||
 		t.PayloadVersion() == payload.WithdrawFromSideChainVersionV2 {
 		return func(dbTx database.Tx) error {

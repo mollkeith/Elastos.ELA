@@ -25,40 +25,38 @@ type ResidueRef struct {
 	Height uint32
 }
 
-// ForcedRollbackStoreScan is a census of what the PERSISTED block store still holds
+// ForcedRollbackStoreScan records what the persisted block store still holds
 // strictly above a forced-rollback target.
 //
-// "PERSISTED" is load-bearing and was, until this was fixed, untrue. ffldb answers
-// every read THROUGH its in-memory dbCache, which holds committed writes for up to
-// 20 MiB / 300 s (both hardcoded, database/ffldb/db.go openDB) before they reach
-// leveldb. A census taken without forcing that cache out therefore reports the
-// store as the WRITER sees it, not as a restarted process would find it -- measured
-// on two nodes differing only in the flush interval, the production one reported a
-// fully clean store at the same instant 320 above-target entries were still only in
-// RAM, and reproduced in test/unit/b4_rollback_durability_test.go, where the pristine
-// tree logs the store "verified clean" with the entire rewind still in the cache.
-// ScanForcedRollbackStore now flushes before it counts, which is what lets everything
-// below, and every message derived from it, say "persisted" honestly.
+// "Persisted" is load-bearing. ffldb answers every read through its in-memory
+// dbCache, which holds committed writes for up to 20 MiB / 300 s (both hardcoded,
+// database/ffldb/db.go openDB) before they reach leveldb. A scan taken without
+// forcing that cache out reports the store as the writer sees it, not as a restarted
+// process would find it: on two nodes differing only in the flush interval, the
+// production one reported a fully clean store at the same instant 320 above-target
+// entries were still only in RAM, and test/unit/b4_rollback_durability_test.go
+// reproduces it, logging the store "verified clean" with the entire rewind still in
+// the cache. ScanForcedRollbackStore flushes before it counts, which is what lets
+// everything below, and every message derived from it, say "persisted" honestly.
 //
-// It exists because the shipped safety nets asserted nothing about the database:
-// main.go's post-rollback height check compared chain.GetHeight() -- which is just
-// len(b.Nodes)-1 -- against the target, which is tautologically true given the
-// rewind loop's own exit condition, and the checkpoint assertion was guarded by
-// `if forcedRollbackFired`, false on exactly the boot where a ratcheted node
-// finally comes up. Every field below is read from the database, never from
-// b.Nodes, so the two can be compared against each other.
+// It exists because the other safety nets assert nothing about the database:
+// main.go's post-rollback height check compares chain.GetHeight(), which is just
+// len(b.Nodes)-1, against the target, which is tautologically true given the rewind
+// loop's own exit condition, and the checkpoint assertion is guarded by
+// `if forcedRollbackFired`, false on exactly the boot where a ratcheted node finally
+// comes up. Every field below is read from the database, never from b.Nodes, so the
+// two can be compared against each other.
 //
-// The four categories are deliberately distinct because they carry DIFFERENT
-// severities:
+// The four categories are distinct because they carry different severities:
 //
-//   - LiveAbove   -- the retained chain itself extends above the target. The node
+//   - LiveAbove: the retained chain itself extends above the target. The node
 //     is simply not rolled back; a purge here would destroy a live chain.
-//   - MainChainAbove / BestStateHeight -- the database still records blocks above
+//   - MainChainAbove / BestStateHeight: the database still records blocks above
 //     the target as part of the main chain while the loaded chain tip is at or
-//     below it. That is the signature of an INTERRUPTED rollback: the per-block
-//     RollbackBlock transaction (which also reverts the UTXO/state processors)
+//     below it. That is the signature of an interrupted rollback: the per-block
+//     RollbackBlock transaction (which also reverts the UTXO and state processors)
 //     never ran for those blocks, so no purge can repair the node.
-//   - StoredAbove / HeaderRowsAbove -- retention-only residue. The block is off
+//   - StoredAbove / HeaderRowsAbove: retention-only residue. The block is off
 //     the main chain but still fetchable by hash, or an orphaned header-index row
 //     survives. Both are safely removable.
 type ForcedRollbackStoreScan struct {
@@ -139,26 +137,26 @@ func refsString(refs []ResidueRef) string {
 	return b.String()
 }
 
-// ScanForcedRollbackStore censuses the persisted store above target.
+// ScanForcedRollbackStore reports the persisted store above target.
 //
-// It FLUSHES the database cache before reading. That is not incidental: ffldb reads
-// through its write cache, so without the flush this function -- and every claim
-// built on it, including "persisted store verified clean above target N" -- would
-// describe RAM. The flush publishes only writes that are already committed, so it
-// changes no logical content; it just makes the census answer the question its name
-// asks. Because it takes the database write lock, this function must not be called
-// from inside an open transaction.
+// It flushes the database cache before reading. That is not incidental: ffldb reads
+// through its write cache, so without the flush this function, and every claim built
+// on it including "persisted store verified clean above target N", would describe
+// RAM. The flush publishes only writes that are already committed, so it changes no
+// logical content; it just makes the answer match the question the name asks.
+// Because it takes the database write lock, this function must not be called from
+// inside an open transaction.
 //
-// Cost note: the raw-store pass would be prohibitive on a 25GB mainnet store if it
-// fetched a header for all ~2.26M entries, so the cheap main-chain lookup is kept
-// as a SKIP FILTER rather than a keep-decision: an entry that is main-chain-indexed
-// AT OR BELOW the target is retained history and is skipped without touching the
-// flat files. Everything else -- off-chain entries AND, critically, entries that
-// are still main-chain-indexed ABOVE the target -- falls through to the header
-// read. That reversal is the PURGE-GUARD fix: the shipped code skipped on
-// main-chain membership alone, so residue from an interrupted rollback (whose
-// hashidx entry survived precisely because RollbackBlock never ran) was classified
-// "retained" and kept, and the sound height guard was never reached.
+// Cost: the raw-store pass would be prohibitive on a 25GB mainnet store if it
+// fetched a header for all ~2.26M entries, so the cheap main-chain lookup is used as
+// a skip filter rather than as a keep-decision. An entry that is main-chain-indexed
+// at or below the target is retained history and is skipped without touching the
+// flat files. Everything else, off-chain entries and, critically, entries that are
+// still main-chain-indexed above the target, falls through to the header read. That
+// direction is load-bearing: skipping on main-chain membership alone classifies
+// residue from an interrupted rollback as "retained" and keeps it, because its
+// hashidx entry survives precisely when RollbackBlock never ran, and the sound
+// height guard is then never reached.
 func ScanForcedRollbackStore(fflDB IFFLDBChainStore, target uint32) (
 	*ForcedRollbackStoreScan, error) {
 	scan := &ForcedRollbackStoreScan{Target: target}

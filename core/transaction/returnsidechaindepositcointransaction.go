@@ -130,24 +130,24 @@ func (t *ReturnSideChainDepositCoinTransaction) SpecialContextCheck() (result el
 		if err != nil {
 			return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid deposit tx:"+py.DepositTransactionHash.String())), true
 		}
-		// NX-03: fail closed instead of panicking. py.DepositTransactionHash is an
-		// attacker-controlled output-payload field -- ReturnSideChainDeposit.Validate
+		// Fail closed instead of panicking. py.DepositTransactionHash is an
+		// attacker-controlled output-payload field: ReturnSideChainDeposit.Validate
 		// checks only the payload version and a non-empty GenesisBlockAddress, so the
-		// hash may name ANY transaction in the (unconditionally enabled) tx index,
-		// including ELA's zero-input transaction family. Decisively, the genesis
-		// RegisterAsset transaction is built with []*common.Input{} (core/manager.go:43-61)
-		// and its hash IS the compiled-in constant core.ELAAssetID, so
+		// hash may name any transaction in the (unconditionally enabled) tx index,
+		// including ELA's zero-input transaction family. The genesis RegisterAsset
+		// transaction is built with []*common.Input{} (core/manager.go:43-61) and its
+		// hash is the compiled-in constant core.ELAAssetID, so
 		// GetTransaction(core.ELAAssetID) resolves to a zero-input transaction on every
-		// node with no chain lookup at all. Indexing Inputs()[0] then panicked at step 10
-		// of ContextCheck -- BEFORE CheckTransactionFee, checkTransactionSignature and
-		// checkInvalidUTXO -- and on the P2P leg (OnTx -> handleTxMsg -> AppendToTxPool)
+		// node with no chain lookup at all. Indexing Inputs()[0] then panics at step 10
+		// of ContextCheck, before CheckTransactionFee, checkTransactionSignature and
+		// checkInvalidUTXO, and on the P2P leg (OnTx -> handleTxMsg -> AppendToTxPool)
 		// that panic runs on the bare netsync blockHandler goroutine, which has no
 		// recover(), so it terminates the process. (The JSON-RPC leg survives only
 		// because net/http recovers.)
 		//
-		// UNGATED, deliberately: a panic is not an acceptance decision, so converting it
-		// to a rejection is byte-identical for every block the chain has ever accepted --
-		// any retained transaction that reached these two lines necessarily had an input
+		// Ungated, deliberately: a panic is not an acceptance decision, so converting it
+		// to a rejection is byte-identical for every block the chain has ever accepted.
+		// Any retained transaction that reached these two lines necessarily had an input
 		// and an in-range index, or replaying it would kill the node. Gating behind
 		// StrictMoneyRangeHeight would instead leave the kill live on testnet/regnet
 		// (gate = MaxUint32 there) and on any node syncing below the gate, while the

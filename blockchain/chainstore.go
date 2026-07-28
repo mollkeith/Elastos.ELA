@@ -33,23 +33,23 @@ var SMALL_CROSS_TRANSFER_RPEFIX = []byte("SMALL_CROSS_TRANSFER")
 // maxSmallCrossTransferTxs hard-caps the persistent small-cross-transfer
 // bucket.
 //
-// NX-07: this bucket is written on mempool ADMISSION and, before this change,
-// cleaned only when the transaction appeared in a connected block. Every other
-// mempool exit -- conflict eviction, fee-ordered eviction, the post-reorg
-// re-check -- left a record no code ever pruned. Records are re-injected into
-// the mempool on every node start, and every arbiter downloads and parses the
-// WHOLE bucket once per second through getsmallcrosstransfertxs, so an attacker
-// who plants records sets the arbiters' steady-state load. Cleaning the other
-// exits (mempool/txpool.go) removes the leak; this cap is the defence in depth
-// that survives an unclean shutdown, and it is what makes the arbiters' load
+// This bucket is written on mempool admission. Cleaning it only when the
+// transaction appears in a connected block leaves a record behind on every other
+// mempool exit, conflict eviction, fee-ordered eviction and the post-reorg
+// re-check, and no code prunes those. Records are re-injected into the mempool on
+// every node start, and every arbiter downloads and parses the whole bucket once
+// per second through getsmallcrosstransfertxs, so an attacker who plants records
+// sets the arbiters' steady-state load. Cleaning the other exits
+// (mempool/txpool.go) removes the leak; this cap is the defence in depth that
+// survives an unclean shutdown, and it is what makes the arbiters' load
 // independent of an attacker.
 //
-// Sizing is measured, not guessed: across all 2,260,597 retained mainchain
-// blocks there are 954 transfers the production IsSmallTransfer classifies as
-// small, at most 2 in any single block, and at most 6 in any 30-block window
-// (broadcastCrossChainTransactionInterval). The bucket only ever holds
-// UNCONFIRMED transfers, so 1,000 is more than two orders of magnitude above
-// the busiest window real history has produced.
+// The size is derived from real traffic: across the whole retained mainchain there
+// are 954 transfers the production IsSmallTransfer classifies as small, at most 2
+// in any single block, and at most 6 in any 30-block window
+// (broadcastCrossChainTransactionInterval). The bucket only ever holds unconfirmed
+// transfers, so 1,000 is more than two orders of magnitude above the busiest window
+// real history has produced.
 const maxSmallCrossTransferTxs = 1000
 
 type ProducerInfo struct {
@@ -64,9 +64,9 @@ type ChainStore struct {
 	currentBlockHeight uint32
 	persistMutex       sync.Mutex
 
-	// smallCrossMutex guards the small-cross-transfer bucket census below.
+	// smallCrossMutex guards the small-cross-transfer bucket count below.
 	// smallCrossCounted records whether smallCrossCount has been seeded by the
-	// one-off iteration of the on-disk bucket. (NX-07)
+	// one-off iteration of the on-disk bucket.
 	smallCrossMutex   sync.Mutex
 	smallCrossCount   int
 	smallCrossCounted bool
@@ -102,9 +102,9 @@ func (c *ChainStore) CleanSmallCrossTransferTx(txHash Uint256) error {
 	c.smallCrossMutex.Lock()
 	defer c.smallCrossMutex.Unlock()
 
-	// NX-07: only decrement the census when a record was actually there.
-	// leveldb's Delete succeeds on a missing key, and this function is now
-	// called from every mempool exit path, most of which have no record.
+	// Only decrement the count when a record was actually there. leveldb's
+	// Delete succeeds on a missing key, and this function is called from
+	// every mempool exit path, most of which have no record.
 	if _, err := c.levelDB.Get(key); err != nil {
 		return nil
 	}
@@ -149,7 +149,7 @@ func (c *ChainStore) SaveSmallCrossTransferTx(tx interfaces.Transaction) error {
 }
 
 // censusSmallCrossTransferTxsLocked seeds smallCrossCount from disk exactly
-// once per process. The caller must hold smallCrossMutex. (NX-07)
+// once per process. The caller must hold smallCrossMutex.
 func (c *ChainStore) censusSmallCrossTransferTxsLocked() {
 	if c.smallCrossCounted {
 		return
@@ -169,11 +169,10 @@ func (c *ChainStore) censusSmallCrossTransferTxsLocked() {
 
 func (c *ChainStore) GetSmallCrossTransferTxs() ([]interfaces.Transaction, error) {
 	Iter := c.levelDB.NewIterator(SMALL_CROSS_TRANSFER_RPEFIX)
-	// NX-07, adjacent leak: neither reader released its iterator, and each
-	// leveldb iterator pins a snapshot. GetSmallCrossTransferTx below is served
-	// once per second to every arbiter through the getsmallcrosstransfertxs
-	// RPC, so that is one pinned snapshot per second, for the life of the
-	// process, on the same code path this finding is about.
+	// Release the iterator: each leveldb iterator pins a snapshot, and
+	// GetSmallCrossTransferTx below is served once per second to every arbiter
+	// through the getsmallcrosstransfertxs RPC, so a leaked iterator is one
+	// pinned snapshot per second for the life of the process.
 	defer Iter.Release()
 	txs := make([]interfaces.Transaction, 0)
 	for Iter.Next() {
@@ -194,7 +193,7 @@ func (c *ChainStore) GetSmallCrossTransferTxs() ([]interfaces.Transaction, error
 
 func (c *ChainStore) GetSmallCrossTransferTx() ([]string, error) {
 	Iter := c.levelDB.NewIterator(SMALL_CROSS_TRANSFER_RPEFIX)
-	// NX-07, adjacent leak: see GetSmallCrossTransferTxs above.
+	// Release the iterator: see GetSmallCrossTransferTxs above.
 	defer Iter.Release()
 	txns := make([]string, 0)
 	for Iter.Next() {

@@ -264,34 +264,31 @@ func (r *PreflightReport) applyCheckpointGate(params *config.Configuration) {
 // PurgeTxPoolCheckpointAboveTarget removes any cp_txPool checkpoint whose recorded
 // height is ABOVE the forced-rollback target, after the rewind has completed.
 //
-// WHY THIS IS NEEDED AT ALL. cp_txPool is the one registered checkpoint that
-// Manager.MaxHeight deliberately skips (core/checkpoint/manager.go), and both
-// forced-rollback baseline gates therefore skip it by name -- see
-// CountedInMaxHeight above. That exclusion is correct arithmetic for the height
-// gate, but it also means NO existing check can observe a cp_txPool file left
-// above the target. ForceRollback does not remove it either. So it survives.
+// cp_txPool is the one registered checkpoint that Manager.MaxHeight deliberately
+// skips (core/checkpoint/manager.go), and both forced-rollback baseline gates
+// therefore skip it by name; see CountedInMaxHeight above. That exclusion is correct
+// arithmetic for the height gate, but it also means no other check can observe a
+// cp_txPool file left above the target, and ForceRollback does not remove it either,
+// so it survives the rewind: on a mainnet node rewound from 2,260,595 to 2,260,450,
+// cp_txPool/2260595.txpcp was still present afterwards.
 //
-// MEASURED on a real mainnet node (2026-07-28): after a successful rewind from
-// 2,260,595 to 2,260,450, cp_txPool/2260595.txpcp was still present.
+// It matters because cp_txPool has SavePeriod == EffectivePeriod == 1, so it is
+// rewritten every block; on a frozen node it describes the mempool from inside the
+// discarded range. txPoolCheckpoint.Deserialize calls txPool.appendToTxPool, the same
+// entry point the live pool uses, so the file restores directly into the live pool,
+// and pow.GenerateBlock assembles the first block of the recovered chain from that
+// pool. Per-transaction re-validation does run, StrictMoneyRangeHeight included, so a
+// harmful entry is unlikely to survive it; removing the file removes the question.
 //
-// WHY IT MATTERS. cp_txPool has SavePeriod == EffectivePeriod == 1, so it is
-// rewritten every block; on a frozen node it describes the mempool from INSIDE the
-// discarded range. txPoolCheckpoint.Deserialize calls txPool.appendToTxPool -- the
-// same entry point the live pool uses -- so the file restores directly into the
-// LIVE pool, and pow.GenerateBlock assembles the first block of the recovered chain
-// from that pool. Per-transaction re-validation does run (gate 1 included), so a
-// harmful entry is unlikely to survive it; this removes the question instead of
-// arguing about it.
+// Scope: only files strictly above the target are removed, and only from the
+// cp_txPool directory. The `default` file is left alone, since it carries no height in
+// its name and the checkpoint manager rewrites it from live state on the next save.
+// Derived-state checkpoints (cp_dpos, cp_cr) are never touched here: the rewind's own
+// post-rebuild baseline assertion already requires those to be below the target, and
+// deleting one would destroy the snapshot the rebuild starts from.
 //
-// SCOPE. Only files strictly ABOVE the target are removed, and only from the
-// cp_txPool directory. The `default` file is left alone: it carries no height in
-// its name, and the checkpoint manager rewrites it from live state on the next
-// save. Derived-state checkpoints (cp_dpos, cp_cr) are NEVER touched here -- the
-// rewind's own post-rebuild baseline assertion already requires those to be below
-// the target, and deleting one would destroy the snapshot the rebuild starts from.
-//
-// A missing directory is not an error: a node that never ran a mempool checkpoint
-// has nothing to purge.
+// A missing directory is not an error: a node that never ran a mempool checkpoint has
+// nothing to purge.
 func PurgeTxPoolCheckpointAboveTarget(checkpointRoot string, target uint32) error {
 	// Derive the directory from the SAME registration table MaxHeight consults,
 	// rather than a local literal: the excluded key is by definition the one

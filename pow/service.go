@@ -40,7 +40,7 @@ const (
 	createAuxBlockInterval = 5 * time.Second
 
 	// maxDiscreteMiningAttempts bounds the block generation retries of a single
-	// DiscreteMining call. F-163: that retry used to be an unbounded `continue`.
+	// DiscreteMining call, which would otherwise retry with an unbounded `continue`.
 	maxDiscreteMiningAttempts = 100
 )
 
@@ -354,18 +354,20 @@ func (pow *Service) GenerateBlock(minerAddr string,
 		if err != nil {
 			return nil, err
 		}
-		// NX-01/NX-05 producer side. This raw read is now the ONLY derivation of the
-		// recorded sponsor anywhere in the system: the validator no longer derives one at
-		// all (blockchain/blockvalidator.go CheckBlockContext), so the producer/validator
-		// asymmetry that made an operator sponsors-file entry a deterministic block
-		// rejection at/above the gate cannot arise. Do NOT reintroduce an override lookup
-		// here or a binding there without making both sides read the same committed data.
-		// The Confirm nil-check is crash-hardening (ungated): HaveConfirm and Confirm are
-		// independent wire fields on types.DposBlock, so a stored or peer-supplied record
-		// can set the flag with no payload and nil-deref the miner here. A node whose own
-		// store is that corrupt then omits the RecordSponsor tx and its block is refused
-		// by the presence check in CheckBlockContext -- which is a rejected block instead
-		// of a dead miner, and a panic is not an acceptance decision, so this rides no gate.
+		// This raw read is the only derivation of the recorded sponsor anywhere in the
+		// system: the validator derives none at all (blockchain/blockvalidator.go
+		// CheckBlockContext), so the producer/validator asymmetry that would make an
+		// operator sponsors-file entry a deterministic block rejection at and above the
+		// gate cannot arise. Do not reintroduce an override lookup here, or a validity
+		// binding there, without making both sides read the same committed data.
+		//
+		// The Confirm nil-check is crash-hardening and is ungated: HaveConfirm and
+		// Confirm are independent wire fields on types.DposBlock, so a stored or
+		// peer-supplied record can set the flag with no payload and nil-deref the miner
+		// here. A node whose own store is that corrupt then omits the RecordSponsor tx
+		// and its block is refused by the presence check in CheckBlockContext, which is
+		// a rejected block instead of a dead miner. A panic is not an acceptance
+		// decision, so this rides no gate.
 		if bestBlock.HaveConfirm && bestBlock.Confirm != nil {
 			recordSponsorTx, err := pow.CreateRecordSponsorTx(bestBlock.Confirm.Proposal.Sponsor, nextBlockHeight)
 			if err != nil {
@@ -495,30 +497,31 @@ func (pow *Service) SubmitAuxBlock(hash *common.Uint256, auxPow *auxpow.AuxPow) 
 		return fmt.Errorf("block hash unknown")
 	}
 
-	// F-041 submission side: derive ParentHash rather than trusting the submitter.
+	// Submission side: derive ParentHash rather than trusting the submitter.
 	//
-	// At and above gate 1 CheckBlockSanity rejects a non-canonical AuxPow, but nothing has
-	// ever enforced canonicality on this path: AuxPow.Check() and CheckProofOfWork() never
-	// read ParentHash, so any 32 bytes verify and only pool convention made it canonical.
-	// A pool whose stratum software sends the display-order hash, or leaves the field zero,
-	// has every submission rejected from the first block of the restart. Since the restart
-	// necessarily begins in PoW (the rewound tip is stale, so arbiters drop the first block
-	// before it reaches consensus), that pool is the only thing that can move the chain.
+	// At and above StrictMoneyRangeHeight CheckBlockSanity rejects a non-canonical
+	// AuxPow, but nothing enforces canonicality on this path: AuxPow.Check() and
+	// CheckProofOfWork() never read ParentHash, so any 32 bytes verify and only pool
+	// convention makes it canonical. A pool whose stratum software sends the
+	// display-order hash, or leaves the field zero, has every submission rejected from
+	// the first block of the restart. The restart necessarily begins in PoW, because
+	// the rewound tip is stale and arbiters drop the first block before it reaches
+	// consensus, so that pool is the only thing that can move the chain.
 	//
-	// Deriving it here removes the dependency on third-party software entirely instead of
-	// betting on it. It cannot invalidate a valid proof of work, because neither verifier
-	// reads the field.
+	// Deriving it here removes the dependency on third-party software rather than
+	// relying on it. It cannot invalidate a valid proof of work, because neither
+	// verifier reads the field.
 	//
-	// ParMerkleIndex is deliberately NOT normalised: AuxPow.Check() DOES consume it, via
-	// GetMerkleRoot(ParCoinbaseTx.Hash(), ParCoinBaseMerkle, ParMerkleIndex), so forcing it
-	// to 0 could silently break a genuine merkle proof. A malleated index keeps its existing
-	// gate rejection.
+	// ParMerkleIndex is not normalised: AuxPow.Check() does consume it, through
+	// GetMerkleRoot(ParCoinbaseTx.Hash(), ParCoinBaseMerkle, ParMerkleIndex), so
+	// forcing it to 0 could silently break a genuine merkle proof. A malleated index
+	// keeps its existing gate rejection.
 	//
-	// UNGATED, and it needs no gate: this is block PRODUCTION. Retained blocks arrive from
-	// peers over P2P and never pass through SubmitAuxBlock, so no retained block's verdict
-	// can change. Same doctrine as the B2 SolveBlock stamp.
+	// Ungated, and it needs no gate: this is block production. Retained blocks arrive
+	// from peers over P2P and never pass through SubmitAuxBlock, so no retained
+	// block's verdict can change. Same reasoning as the SolveBlock stamp below.
 	//
-	// Normalised on a COPY so the caller's structure is left exactly as the pool sent it.
+	// Normalised on a copy so the caller's structure is left exactly as the pool sent it.
 	canonicalAuxPow := *auxPow
 	canonicalAuxPow.ParentHash = canonicalAuxPow.ParBlockHeader.Hash()
 
@@ -568,10 +571,9 @@ func (pow *Service) SubmitAuxBlock(hash *common.Uint256, auxPow *auxpow.AuxPow) 
 }
 
 func (pow *Service) DiscreteMining(n uint32) ([]*common.Uint256, error) {
-	// F-163: n comes straight off the RPC. Zero asks for no blocks at all, yet
-	// the loop below still mines one - the i == n test can only be reached after
-	// i has been incremented past zero - so "mine nothing" mined a block.
-	// Reject it before any state is touched.
+	// n comes straight off the RPC. Zero asks for no blocks at all, yet the loop
+	// below would still mine one, because the i == n test can only be reached after
+	// i has been incremented past zero. Reject it before any state is touched.
 	if n == 0 {
 		return nil, errors.New("count must be greater than 0")
 	}
@@ -587,11 +589,11 @@ func (pow *Service) DiscreteMining(n uint32) ([]*common.Uint256, error) {
 	pow.discreteMining = true
 	pow.mutex.Unlock()
 
-	// F-163: every ordinary exit below cleared these two flags, but the
-	// GenerateBlock failure path did not - it looped back with `continue`, so a
-	// persistent generation failure spun forever holding pow.started, which
-	// wedges mining for the life of the process and burns a core. Release on
-	// every path, and bound the retries.
+	// Every ordinary exit below clears these two flags, and the GenerateBlock
+	// failure path must too. Looping back with `continue` instead would let a
+	// persistent generation failure spin forever holding pow.started, which wedges
+	// mining for the life of the process and burns a core. Release on every path,
+	// and bound the retries.
 	defer func() {
 		pow.mutex.Lock()
 		pow.started = false
@@ -656,25 +658,24 @@ func (pow *Service) SolveBlock(msgBlock *types.Block, lastBlockHash *common.Uint
 		auxPow.ParBlockHeader.Nonce = i
 		hash := auxPow.ParBlockHeader.Hash() // solve parBlockHeader hash
 		if blockchain.HashToBig(&hash).Cmp(targetDifficulty) <= 0 {
-			// B2 (F-041 production side): stamp ParentHash for the WINNING
-			// nonce, i.e. only once the parent header is final.
-			// auxpow.GenerateAuxPow above never sets ParentHash, so every
-			// self-mined block used to carry ParentHash == 0x00..00 - exactly
-			// the encoding the canonical-AuxPow gate rejects at and above
-			// StrictMoneyRangeHeight, which is the height the chain restarts
-			// on. Stamping before the search would not help: the parent
-			// header hash moves with the nonce, so the value would go stale on
-			// the first iteration and still fail IsCanonical(). `hash` here IS
-			// ParBlockHeader.Hash() at this exact nonce, so the stamp cannot
-			// be stale for any nonce.
+			// Stamp ParentHash for the winning nonce, that is, only once the
+			// parent header is final. auxpow.GenerateAuxPow above never sets
+			// ParentHash, so without this stamp every self-mined block carries
+			// ParentHash == 0x00..00, exactly the encoding the canonical-AuxPow
+			// gate rejects at and above StrictMoneyRangeHeight, which is the
+			// height the chain restarts on. Stamping before the search would not
+			// help: the parent header hash moves with the nonce, so the value
+			// would go stale on the first iteration and still fail
+			// IsCanonical(). `hash` here is ParBlockHeader.Hash() at this exact
+			// nonce, so the stamp cannot be stale for any nonce.
 			//
-			// Block PRODUCTION only, therefore ungated: ParentHash is not a
-			// BtcHeader field, so ParBlockHeader.Hash() - and with it the
-			// proof of work and AuxPow.Check() - is unchanged, and no
-			// acceptance rule is touched. Retained history is never
-			// re-produced here, so below-gate replay stays byte-identical.
-			// ParMerkleIndex, the other field IsCanonical() pins, is already 0
-			// out of GenerateAuxPow and is never mutated in this loop.
+			// Block production only, therefore ungated: ParentHash is not a
+			// BtcHeader field, so ParBlockHeader.Hash(), and with it the proof of
+			// work and AuxPow.Check(), is unchanged, and no acceptance rule is
+			// touched. Retained history is never re-produced here, so below-gate
+			// replay stays byte-identical. ParMerkleIndex, the other field
+			// IsCanonical() pins, is already 0 out of GenerateAuxPow and is never
+			// mutated in this loop.
 			auxPow.ParentHash = hash
 			msgBlock.Header.AuxPow = *auxPow
 			return true

@@ -47,12 +47,12 @@ func (l *txFeeOrderedList) AddTx(tx interfaces.Transaction) errors.ELAError {
 
 	feeRate := float64(tx.Fee()) / float64(size)
 
-	// F-060: the old admission guard only compared the incoming fee rate with
-	// the single lowest entry, which does not answer the question being asked.
-	// Eviction may only free the entries paying strictly less, so a tx could
-	// pass that guard, be inserted, evict paying entries and then be popped
-	// itself - leaving a hash in TxPool.txnList this list no longer accounts
-	// for. CanAccept decides exactly what the eviction loop can deliver.
+	// Comparing the incoming fee rate with the single lowest entry does not answer
+	// the question being asked. Eviction may only free the entries paying strictly
+	// less, so a tx could pass that comparison, be inserted, evict paying entries
+	// and then be popped itself, leaving a hash in TxPool.txnList this list no
+	// longer accounts for. CanAccept decides exactly what the eviction loop can
+	// deliver.
 	if !l.CanAccept(uint64(size), feeRate) {
 		return addingTxExcluded
 	}

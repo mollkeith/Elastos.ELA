@@ -96,9 +96,9 @@ func (t *ActivateProducerTransaction) CheckTransactionFee(references map[*common
 	return nil
 }
 
-// checkActivateValueCreation closes F-166: ActivateProducer is a no-cost tx
-// (CheckTransactionFee requires fee==0), but the CR-member path returns end=true
-// which makes ContextCheck SKIP CheckTransactionFee -- the only outputs<=inputs
+// checkActivateValueCreation keeps ActivateProducer a no-cost transaction.
+// CheckTransactionFee requires fee==0, but the CR-member path returns end=true
+// which makes ContextCheck skip CheckTransactionFee, the only outputs<=inputs
 // guard. Combined with CheckTransactionOutput allowing outputs above NFTStartHeight,
 // a CR member could mint value outputs from 0 inputs. Above StrictMoneyRangeHeight we
 // re-apply the fee==0 invariant here so no ActivateProducer path can create (or
@@ -141,15 +141,16 @@ func (t *ActivateProducerTransaction) SpecialContextCheck() (elaerr.ELAError, bo
 			if t.parameters.BlockChain.GetCRCommittee().GetAvailableDepositAmount(crMember.Info.CID) < 0 {
 				return elaerr.Simple(elaerr.ErrTxPayload, errors.New("balance of CR is not enough ")), true
 			}
-			// F-021: the CR-member activation path returns end=true, which skips
-			// CheckTransactionFee AND checkTransactionSignature. Above NFTStartHeight a
-			// CR activate may carry Inputs(), so end=true lets it spend arbitrary UTXOs
-			// with NO input-ownership proof (theft; F-166's fee==0 guard only prevents
-			// net inflation, not equal-value theft). At/above the coordinated-upgrade
-			// gate, fall through so the fee + input-signature checks run. Below the gate
-			// keep end=true for replay-safety (the producer branch already gates end on
-			// NFTStartHeight, but re-gating the CR branch there would change acceptance
-			// for the historical 1405000..2260451 window -> gate at StrictMoneyRangeHeight).
+			// The CR-member activation path returns end=true, which skips
+			// CheckTransactionFee and checkTransactionSignature. Above NFTStartHeight a
+			// CR activate may carry Inputs(), so end=true lets it spend arbitrary UTXOs with
+			// no input-ownership proof: theft, since the fee==0 invariant in
+			// checkActivateValueCreation only prevents net inflation, not equal-value theft.
+			// At/above the coordinated-upgrade gate, fall through so the fee and
+			// input-signature checks run. Below the gate keep end=true for replay-safety (the
+			// producer branch already gates end on NFTStartHeight, but re-gating the CR branch
+			// there would change acceptance for the historical 1405000..2260451 window, so
+			// this gates at StrictMoneyRangeHeight).
 			end := true
 			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
 				end = false

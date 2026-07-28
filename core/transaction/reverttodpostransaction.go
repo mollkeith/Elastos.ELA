@@ -157,8 +157,8 @@ func checkArbitratorsSignatures(t interfaces.Transaction, blockHeight, gate uint
 		}
 	}
 
-	// F-022 (RevertToDPOS sibling): verify the actual arbiter multisig signatures
-	// over the tx's unsigned digest; the checks above only prove the CODE lists
-	// authorized arbiters. Shared with the CRC path, height-gated for replay-safety.
+	// Verify the actual arbiter multisig signatures over the tx's unsigned digest;
+	// the checks above only prove the code lists authorized arbiters. Shared with the
+	// CRC path, height-gated for replay-safety.
 	return verifyArbitratorsMultisigSignatures(t, blockHeight, gate)
 }

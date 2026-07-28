@@ -13,27 +13,27 @@ const NextTurnDPOSInfoVersion byte = 0x00
 const NextTurnDPOSInfoVersion2 byte = 0x01
 
 // MaxNextTurnDPOSInfoPublicKeys bounds each of the three public-key slices at
-// decode time (DoS ceiling, F-012 sibling -- same shape as MaxDPoSIllegalSigners
-// and MaxSidechainIllegalSigns, which F-012 capped while walking past this file).
+// decode time (DoS ceiling, the same shape as MaxDPoSIllegalSigners and
+// MaxSidechainIllegalSigns).
 //
-// FV-03: DeserializeUnsigned passed all three wire varints straight to
-// make([][]byte, 0, len) as CAPACITY, so the whole allocation happened before a
-// single declared element was read. common.ReadVarUint takes no max-length
-// argument (its second parameter is pver and is never read), so no caller could
-// bound it, and the smallest legal 0xff-form value is 2^32 -- 2^32 * 24 bytes of
-// slice header = 103 GiB. Reachable PRE-HANDSHAKE: peer.readRemoteVersionMsg
+// Without it DeserializeUnsigned passes all three wire varints straight to
+// make([][]byte, 0, len) as capacity, so the whole allocation happens before a
+// single declared element is read. common.ReadVarUint takes no max-length
+// argument (its second parameter is pver and is never read), so no caller can
+// bound it, and the smallest legal 0xff-form value is 2^32: 2^32 * 24 bytes of
+// slice header = 103 GiB. Reachable pre-handshake, because peer.readRemoteVersionMsg
 // fully decodes the first message of a connection before checking that it is a
 // Version message, and CheckAndCreateTxMessage bounds only the frame length
 // (8 MiB), so a 40-byte unauthenticated frame reaches this decoder. The 2^32
-// variant is a runtime THROW (out of memory) which recover() cannot catch --
+// variant is a runtime throw (out of memory) which recover() cannot catch,
 // hence a cap here rather than a panic boundary on the peer goroutine.
 //
-// Ceiling justification (MEASURED over ~/ela-repro/mainnet-copy, all 2,260,597
-// records / 41,922 NextTurnDPOSInfo transactions): max len(CRPublicKeys) = 12
+// Ceiling justification, measured over all 2,260,597 retained records and the
+// 41,922 NextTurnDPOSInfo transactions in them: max len(CRPublicKeys) = 12
 // (height 751431), max len(DPOSPublicKeys) = 36 (height 1413543), max
 // len(CompleteCRPublicKeys) = 0 (never populated in all history). 1024 is 28x
 // the largest value this payload has ever carried, so no retained block can
-// decode differently. UNGATED: today the decode does not reject the message, it
+// decode differently. Ungated: today the decode does not reject the message, it
 // kills the process, and a dead process has made no acceptance decision.
 const MaxNextTurnDPOSInfoPublicKeys = 1024
 
@@ -124,7 +124,7 @@ func (n *NextTurnDPOSInfo) DeserializeUnsigned(r io.Reader, version byte) error 
 	if len, err = common.ReadVarUint(r, 0); err != nil {
 		return err
 	}
-	// FV-03 (F-012 sibling): cap the count before allocating.
+	// Cap the count before allocating.
 	if len > MaxNextTurnDPOSInfoPublicKeys {
 		return errors.New("next turn dpos info cr public key count exceeds maximum")
 	}
@@ -142,7 +142,7 @@ func (n *NextTurnDPOSInfo) DeserializeUnsigned(r io.Reader, version byte) error 
 	if len, err = common.ReadVarUint(r, 0); err != nil {
 		return err
 	}
-	// FV-03 (F-012 sibling): cap the count before allocating.
+	// Cap the count before allocating.
 	if len > MaxNextTurnDPOSInfoPublicKeys {
 		return errors.New("next turn dpos info dpos public key count exceeds maximum")
 	}
@@ -161,7 +161,7 @@ func (n *NextTurnDPOSInfo) DeserializeUnsigned(r io.Reader, version byte) error 
 		if len, err = common.ReadVarUint(r, 0); err != nil {
 			return err
 		}
-		// FV-03 (F-012 sibling): cap the count before allocating.
+		// Cap the count before allocating.
 		if len > MaxNextTurnDPOSInfoPublicKeys {
 			return errors.New("next turn dpos info complete cr public key count exceeds maximum")
 		}

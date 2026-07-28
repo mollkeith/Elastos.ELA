@@ -297,12 +297,12 @@ func (m *Manager) Restore() (err error) {
 		//if v.Key() == "dpos" || v.Key() == "cr" {
 		//	continue
 		//}
-		// F-123: a failed load must not be erased by a later successful one. As
-		// shipped the failure went into the NAMED return and the next iteration's
-		// success overwrote it with nil, so a manager that restored only some of its
-		// checkpoints reported success. Keep loading the remaining checkpoints -- a
-		// missing default file is normal on a fresh node and the others must still
-		// come up -- but report every failure to the caller.
+		// A failed load must not be erased by a later successful one. Putting the
+		// failure in the named return lets the next iteration's success overwrite it
+		// with nil, so a manager that restored only some of its checkpoints reports
+		// success. Keep loading the remaining checkpoints, since a missing default
+		// file is normal on a fresh node and the others must still come up, but
+		// report every failure to the caller.
 		if e := m.loadDefaultCheckpoint(v); e != nil {
 			failures = append(failures, fmt.Sprintf("%s: %s", v.Key(), e.Error()))
 			continue
@@ -400,28 +400,28 @@ func (m *Manager) MaxHeight() uint32 {
 // bestHeight and rebuilds it from the genesis defaults, so the caller's replay can
 // derive it again from the retained chain.
 //
-// FV-01: a checkpoint's Height is never LOWERED. Manager.OnRollbackTo forwards to
-// each ICheckPoint.OnRollbackTo and never calls SetHeight; no OnReset implementation
+// A checkpoint's Height is never lowered. Manager.OnRollbackTo forwards to each
+// ICheckPoint.OnRollbackTo and never calls SetHeight; no OnReset implementation
 // zeroes it either (dpos/state and cr/state rebuild through
 // initFromArbitrators/initFromCommittee, neither of which touches Height); and
-// loadCheckpointFile writes the FILE's height straight into the live object. So after
-// reorganizeChain's deep-reset branch restores a default snapshot that was written on
-// an ABANDONED branch, the live checkpoint can carry a height ABOVE the post-detach
-// best height. onBlockSaved then skips every block with
-// `block.Height <= v.GetHeight()`, which makes BOTH the InitCheckpoint replay AND the
-// subsequent attach loop complete no-ops for that checkpoint: derived DPoS/CR state
-// FREEZES at the abandoned-branch snapshot while the UTXO/block store follows the
-// canonical chain, and stays frozen until the new chain climbs back above the
-// restored height. That is a durable local consensus divergence, recoverable only by
-// a full resync.
+// loadCheckpointFile writes the file's height straight into the live object. So
+// after reorganizeChain's deep-reset branch restores a default snapshot that was
+// written on an abandoned branch, the live checkpoint can carry a height above the
+// post-detach best height. onBlockSaved then skips every block with
+// `block.Height <= v.GetHeight()`, which makes both the InitCheckpoint replay and
+// the subsequent attach loop complete no-ops for that checkpoint: derived DPoS and
+// CR state freezes at the abandoned-branch snapshot while the UTXO and block store
+// follow the canonical chain, and stays frozen until the new chain climbs back
+// above the restored height. That is a durable local consensus divergence,
+// recoverable only by a full resync.
 //
 // Conditioning on `GetHeight() > bestHeight` is deliberate: an unconditional
-// SetHeight(0) would force a replay from StartHeight (~2M blocks on mainnet, hours,
-// under the chain lock) on EVERY deep reorg. This pays that cost only for a
+// SetHeight(0) would force a replay from StartHeight (about 2M blocks on mainnet,
+// hours, under the chain lock) on every deep reorg. This pays that cost only for a
 // checkpoint that is provably ahead of the chain it is supposed to describe.
 //
-// GATE: none. The only caller is the reorg deep-reset path; linear replay of retained
-// history never reaches it, so historical derivation is unchanged.
+// No height gate: the only caller is the reorg deep-reset path; linear replay of
+// retained history never reaches it, so historical derivation is unchanged.
 func (m *Manager) DiscardStaleCheckpoints(bestHeight uint32) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
@@ -564,16 +564,16 @@ func (m *Manager) loadSpecificHeightCheckpoint(current ICheckPoint, height int) 
 // loadCheckpointFile deserializes a checkpoint file into the LIVE checkpoint
 // object registered with the manager.
 //
-// F-121: ICheckPoint.Deserialize writes straight into that live object, so a
-// truncated or corrupt file leaves it half-populated -- and, because Height is the
-// first field every implementation reads, it leaves the live checkpoint carrying
-// the height of a state it does not actually hold. Restore() then skips OnInit(),
-// so the consensus state is never recovered, while SafeHeight() keeps reporting
-// the height read out of the bad file; InitCheckpoint's replay therefore starts
-// ABOVE the blocks that would have rebuilt the state and the node runs at full
-// block height with empty CR/DPoS state. Putting the pre-load height back on
-// failure returns the checkpoint to the full-replay path, which is the correct
-// recovery. Nothing changes on the success path.
+// ICheckPoint.Deserialize writes straight into that live object, so a truncated
+// or corrupt file leaves it half-populated, and because Height is the first field
+// every implementation reads, it leaves the live checkpoint carrying the height of
+// a state it does not actually hold. Restore() then skips OnInit(), so the
+// consensus state is never recovered, while SafeHeight() keeps reporting the
+// height read out of the bad file; InitCheckpoint's replay therefore starts above
+// the blocks that would have rebuilt the state and the node runs at full block
+// height with empty CR and DPoS state. Putting the pre-load height back on failure
+// returns the checkpoint to the full-replay path, which is the correct recovery.
+// Nothing changes on the success path.
 func (m *Manager) loadCheckpointFile(current ICheckPoint, path string) (err error) {
 	data, err := m.readFileBuffer(path)
 	if err != nil {

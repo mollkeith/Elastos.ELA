@@ -113,13 +113,20 @@ func (t *RegisterCRTransaction) SpecialContextCheck() (elaerr.ELAError, bool) {
 	if err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
 	}
-	// F-204: info.Code is a payload field NOT covered by the program MinProgramCodeSize
-	// guard; the slices below (code[len(code)-1], code[1:len(code)-1], code[2:]) panic on
-	// a short-but-nonzero code (e.g. a 1-byte [0xAC] with a crafted matching CID) during
-	// SpecialContextCheck, before signature verify -> pre-auth remote crash in any CR
-	// voting period. (len==0 is already caught above by CreateCRIDContractByCode's
-	// "code is nil".) Reject sub-minimal code. Ungated crash-harden (a legitimate CR code
-	// is a 35-byte / >=71-byte redeem script -> never below MinProgramCodeSize).
+	// info.Code is a payload field, so it is not covered by the program code size
+	// check; the slices below (code[len(code)-1], code[1:len(code)-1], code[2:]) need
+	// at least MinProgramCodeSize bytes and panic on a short-but-nonzero code, for
+	// example a 1-byte [0xAC] with a CID crafted to match it. (len==0 is already
+	// caught above by CreateCRIDContractByCode's "code is nil".)
+	//
+	// This runs inside SpecialContextCheck, before signature verification, so a short
+	// code is reachable without authentication in any CR voting period. That is why
+	// the guard is ungated: it must hold on every net and at every height.
+	//
+	// Ungating it is safe against retained history because a legitimate CR code is a
+	// 35-byte or >=71-byte redeem script, so this rejection cannot refuse a retained
+	// block. An ungated new rejection has to carry that proof: an ungated money bound
+	// without one rejected real mainnet block 2,208,265.
 	if len(code) < program.MinProgramCodeSize {
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid code length")), true
 	}

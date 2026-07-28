@@ -270,9 +270,9 @@ func (s *State) registerCR(tx interfaces.Transaction, height uint32) {
 	}
 
 	amount := common.Fixed64(0)
-	// F-065: capture the deposit outputs so the map write is History-wrapped
-	// below and reverts on rollback (previously written directly here, leaving
-	// stale DepositOutputs entries after a reorg / diverging the CR keyframe).
+	// Capture the deposit outputs so the map write is History-wrapped below and
+	// reverts on rollback. Writing directly here leaves stale DepositOutputs
+	// entries after a reorg, which diverges the CR keyframe.
 	addedDeposits := make(map[string]common.Fixed64)
 	for i, output := range tx.Outputs() {
 		if output.ProgramHash.IsEqual(candidate.DepositHash) {
@@ -286,10 +286,10 @@ func (s *State) registerCR(tx interfaces.Transaction, height uint32) {
 	if _, ok := s.DepositInfo[info.CID]; !ok {
 		firstTimeRegister = true
 	}
-	// F-065 revert-symmetry: capture prior DepositOutputs so the revert restores a
-	// pre-existing entry instead of deleting it (a re-registration reuses the same
-	// deposit outpoint; an unconditional delete on rollback dropped an entry the
-	// pre-block keyframe held, diverging the keyframe on reorg).
+	// Revert symmetry: capture prior DepositOutputs so the revert restores a
+	// pre-existing entry instead of deleting it. A re-registration reuses the same
+	// deposit outpoint, so an unconditional delete on rollback drops an entry the
+	// pre-block keyframe held and diverges the keyframe on reorg.
 	oriDeposits := make(map[string]common.Fixed64)
 	oriDepositExists := make(map[string]bool)
 	for k := range addedDeposits {
@@ -380,7 +380,7 @@ func (s *State) processDeposit(tx interfaces.Transaction, height uint32) {
 		if contract.GetPrefixType(output.ProgramHash) == contract.PrefixDeposit {
 			if s.addCRCRelatedAssert(output, height) {
 				op := common2.NewOutPoint(tx.Hash(), uint16(i))
-				// F-065: History-wrap so the entry reverts on rollback.
+				// History-wrap so the entry reverts on rollback.
 				k, v := op.ReferKey(), output.Value
 				oriV, oriExists := s.DepositOutputs[k]
 				s.History.Append(height, func() {
@@ -493,8 +493,9 @@ func (s *State) processVoteCRC(height uint32, candidate []byte, votes common.Fix
 		return
 	}
 	c := s.GetCandidate(*cid)
-	// F-010: guard the GetCandidate result (nil when the candidate was removed), not the
-	// []byte param which is always non-nil here; else the History closure nil-derefs.
+	// Guard the GetCandidate result, which is nil when the candidate was removed, not the
+	// []byte parameter, which is always non-nil here; otherwise the History closure
+	// nil-dereferences.
 	if c == nil {
 		return
 	}
@@ -512,8 +513,9 @@ func (s *State) processCancelVoteCRC(height uint32, candidate []byte, votes comm
 		return
 	}
 	c := s.GetCandidate(*cid)
-	// F-010: guard the GetCandidate result (nil when the candidate was removed), not the
-	// []byte param which is always non-nil here; else the History closure nil-derefs.
+	// Guard the GetCandidate result, which is nil when the candidate was removed, not the
+	// []byte parameter, which is always non-nil here; otherwise the History closure
+	// nil-dereferences.
 	if c == nil {
 		return
 	}

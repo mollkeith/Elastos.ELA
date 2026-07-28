@@ -77,12 +77,12 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 		s.loadConfigFile(conf.Conf, conf)
 	}
 
-	// F-043: an unrecognized ActiveNet keeps the MAINNET params (the switch above
+	// An unrecognized ActiveNet keeps the mainnet params (the switch above
 	// has no default) while enforce*Heights() below treats it as non-mainnet and
-	// DISABLES the CrossChain-UTXO freeze/restriction, strict-money-range and
-	// forced-rollback controls. That combination (mainnet chain, incident gates
-	// off) is what a typo such as "mainet"/"production" produces. Unknown labels
-	// are still supported on purpose for private/forked nets, so warn loudly
+	// disables the CrossChain-UTXO freeze/restriction, strict-money-range and
+	// forced-rollback controls. That combination, mainnet chain with the incident
+	// gates off, is what a typo such as "mainet"/"production" produces. Unknown
+	// labels are still supported on purpose for private/forked nets, so warn loudly
 	// rather than refuse to start.
 	switch strings.ToLower(strings.TrimSpace(conf.ActiveNet)) {
 	case "", "mainnet", "main", "testnet", "test", "regnet", "regtest", "reg":
@@ -167,9 +167,9 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 	}
 	enforceCoordinatedMainnetParameters(conf.Configuration)
 	conf.Configuration = conf.Sterilize()
-	// F-043 part 2: run AFTER Sterilize so FoundationProgramHash reflects any config.json
+	// Run AFTER Sterilize so FoundationProgramHash reflects any config.json
 	// FoundationAddress (Sterilize recomputes it from a non-empty address). Running before
-	// Sterilize would compare the INHERITED default hash, falsely refusing a private/forked
+	// Sterilize would compare the inherited default hash, falsely refusing a private/forked
 	// net that set a custom FoundationAddress with the incident gates off. Real mainnet has
 	// an empty FoundationAddress, so Sterilize keeps the default identity and the
 	// typo-mainnet-with-gates-off case is still caught.
@@ -291,17 +291,14 @@ func enforceCrossChainUTXORestrictionHeights(configuration *config.Configuration
 // --forcedrollbackheight (equivalently a config.json ForcedRollbackTrigger /
 // ForcedRollbackHeight) that the mainnet pin is about to throw away.
 //
-// MEASURED on the shipped binary: passing an EMPTY --forcedrollbacktrigger together
-// with the disabled sentinel as --forcedrollbackheight still resolved to the
-// coordinated mainnet target and left the node armed, and said nothing at all.
-// That is not a cosmetic gap. The node's OWN capacity-refusal text used to tell the
-// operator that unsetting the trigger would let the node start, so an operator who
-// followed our instructions got a node that was still armed and an explanation that
-// was still missing. The text is fixed in blockchain/forcedrollback.go; this is the
-// other half -- the discard itself now says so.
+// Without it, an empty --forcedrollbacktrigger passed together with the disabled
+// sentinel as --forcedrollbackheight still resolves to the coordinated mainnet
+// target and leaves the node armed, saying nothing at all. The node's own
+// capacity-refusal text in blockchain/forcedrollback.go tells the operator what
+// unsetting the trigger does; this is the discard side of the same story.
 //
-// A correctly configured mainnet node -- which is every node in the fleet, since these
-// are the compiled-in defaults -- supplies neither value and prints nothing, so this
+// A correctly configured mainnet node, which is every node in the fleet since these
+// are the compiled-in defaults, supplies neither value and prints nothing, so this
 // cannot become boilerplate operators learn to skip.
 //
 // It writes to os.Stderr rather than through common/log because SetupConfig runs
@@ -341,8 +338,8 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 		announceDiscardedRollbackOverride(configuration)
 		configuration.StrictMoneyRangeHeight = config.MainNetStrictMoneyRangeHeight
 		// Pin RevisedDPoSRewardHeight too: it is a --reviseddposrewardheight-overridable,
-		// consensus-affecting coordinated height (F-212/F-032 reward gate). Leaving it
-		// unpinned let a mainnet config.json/CLI override diverge reward math from the fleet
+		// consensus-affecting coordinated height (the revised DPoS reward gate). Unpinned, a
+		// mainnet config.json or CLI override would diverge reward math from the fleet
 		// once the owner sets its activation value. No-op today (default MaxUint32/dormant).
 		configuration.RevisedDPoSRewardHeight = config.MainNetRevisedDPoSRewardHeight
 		configuration.ForcedRollbackHeight = config.MainNetForcedRollbackHeight
@@ -376,24 +373,24 @@ func enforceStrictMoneyAndRollbackHeights(configuration *config.Configuration) {
 // is settable from config.json, and every one of them is a consensus activation height
 // that the tree's Schnorr rejections hang off:
 //
-//   - SchnorrStartHeight gates the aggregate-Schnorr WithdrawFromSideChain payload
-//     (F-185). Lowering it on mainnet does two consensus-relevant things at once: it
-//     re-opens the plain-sum group-key path an arbiter with a rogue NodePublicKey can
-//     forge a full-threshold withdraw through, AND -- because SpecialContextCheck
-//     rejects every NON-V2 withdraw once BlockHeight > SchnorrStartHeight -- it makes
-//     the node reject the V1 withdrawals the rest of the fleet accepts, forking it off.
+//   - SchnorrStartHeight gates the aggregate-Schnorr WithdrawFromSideChain payload.
+//     Lowering it on mainnet does two consensus-relevant things at once: it re-opens
+//     the plain-sum group-key path an arbiter with a rogue NodePublicKey can forge a
+//     full-threshold withdraw through, and, because SpecialContextCheck rejects every
+//     non-V2 withdraw once BlockHeight > SchnorrStartHeight, it makes the node reject
+//     the V1 withdrawals the rest of the fleet accepts, forking it off.
 //   - NormalSchnorrStartHeight (1405000, live on mainnet) gates Schnorr program codes
 //     in CheckAttributeProgram.
-//   - Producer/CR/VotesSchnorrStartHeight are the dormant gates the F-026/F-046/F-175
-//     rejections hang off.
+//   - Producer/CR/VotesSchnorrStartHeight are the dormant gates the producer, CR and
+//     vote Schnorr rejections hang off.
 //
 // Pinned for mainnet exactly like the CrossChain-UTXO, strict-money and
-// RevisedDPoSReward heights above. The pinned values ARE the compiled-in mainnet
-// defaults, so a correctly configured mainnet node sees NO change of any kind and no
+// RevisedDPoSReward heights above. The pinned values are the compiled-in mainnet
+// defaults, so a correctly configured mainnet node sees no change of any kind and no
 // acceptance decision moves; only an operator override is discarded (loudly).
 //
-// Unlike the incident gates there is deliberately NO non-mainnet branch: testnet
-// (973000) and regnet (879144) carry REAL Schnorr activation heights that
+// There is deliberately no non-mainnet branch, unlike the incident gates: testnet
+// (973000) and regnet (879144) carry real Schnorr activation heights that
 // TestNet()/RegNet() set, and a private/forked net may legitimately choose its own.
 // Clobbering those would be a behaviour change on those nets, so they are untouched.
 func enforceMainnetSchnorrActivationHeights(configuration *config.Configuration) {
@@ -500,29 +497,28 @@ func sameFrozenAddresses(got, want []config.FrozenAddress) bool {
 	return true
 }
 
-// enforceMainnetIncidentGatesArmed (F-043 part 2, hardened by G3) refuses to start a
-// node that carries the REAL mainnet foundation identity unless its coordinated
-// consensus configuration is byte-for-byte the fleet's.
+// enforceMainnetIncidentGatesArmed refuses to start a node that carries the real
+// mainnet foundation identity unless its coordinated consensus configuration is
+// byte-for-byte the fleet's.
 //
 // The ActiveNet label switch that selects params has no default, so a typo (e.g.
-// "mainet") keeps the mainnet params AND this mainnet foundation identity while every
-// enforce* helper above takes its NON-mainnet branch. Discriminating by foundation
-// IDENTITY rather than by label is what catches that; unknown labels remain
+// "mainet") keeps the mainnet params and this mainnet foundation identity while every
+// enforce* helper above takes its non-mainnet branch. Discriminating by foundation
+// identity rather than by label is what catches that; unknown labels remain
 // legitimate for private/forked nets, which have a different foundation and return
 // early here.
 //
-// G3: the previous version only tested for the Disabled SENTINELS and an empty
-// trigger, so the rehearsal opt-in ArmIncidentGates -- whose whole purpose is to make
-// those default branches KEEP the operator's heights instead of disabling them --
-// walked straight through it. A mislabelled node then started, believing it was
-// mainnet, with gate 1 effectively off, the forced rollback disarmed, the
-// CrossChain-UTXO freeze off and the F-185 aggregate-Schnorr withdraw path re-opened.
-// Two changes close it:
+// Testing only for the disabled sentinels and an empty trigger is not enough: the
+// rehearsal opt-in ArmIncidentGates, whose whole purpose is to make those default
+// branches keep the operator's heights instead of disabling them, walks straight
+// through such a test. A mislabelled node then starts believing it is mainnet, with
+// gate 1 effectively off, the forced rollback disarmed, the CrossChain-UTXO freeze
+// off and the aggregate-Schnorr withdraw path re-opened. Two rules close that:
 //
 //   - ArmIncidentGates is refused outright on the mainnet identity. It exists only to
-//     arm a NON-mainnet rehearsal chain; on mainnet the pins are unconditional, so the
+//     arm a non-mainnet rehearsal chain; on mainnet the pins are unconditional, so the
 //     flag can never be anything but a copied-in rehearsal config.
-//   - every coordinated value must EQUAL its compiled-in mainnet constant, so any
+//   - every coordinated value must equal its compiled-in mainnet constant, so any
 //     future pin that a mislabelled config bypasses is caught too.
 //
 // A correctly configured mainnet node reaches every mainnet arm above, so all of
@@ -601,11 +597,11 @@ func NewSettings() *Settings {
 }
 
 // isMainNetName reports whether an ActiveNet string selects the MAINNET chain
-// parameters. It mirrors the switch in SetupConfig exactly, including the F-043
-// case: an EMPTY or UNRECOGNISED name keeps the mainnet params (the switch there
-// has no default), so it must be treated as mainnet here too. Getting that wrong
-// in the permissive direction would leave a typo-mainnet node running unpinned
-// block limits, which is the partition this pin exists to prevent.
+// parameters. It mirrors the switch in SetupConfig exactly: an empty or
+// unrecognised name keeps the mainnet params (the switch there has no default),
+// so it must be treated as mainnet here too. Getting that wrong in the permissive
+// direction would leave a typo-mainnet node running unpinned block limits, which
+// is the partition this pin exists to prevent.
 func isMainNetName(activeNet string) bool {
 	switch strings.ToLower(strings.TrimSpace(activeNet)) {
 	case "testnet", "test", "regnet", "regtest", "reg":

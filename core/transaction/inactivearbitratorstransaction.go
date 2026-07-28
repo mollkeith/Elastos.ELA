@@ -134,7 +134,7 @@ func CheckInactiveArbitrators(t interfaces.Transaction, blockHeight, gate uint32
 func checkCRCArbitratorsSignatures(t interfaces.Transaction, blockHeight, gate uint32) error {
 
 	code := t.Programs()[0].Code
-	// F-099: guard before indexing code[0]/code[len-2] so a <2-byte code cannot panic;
+	// Guard before indexing code[0]/code[len-2] so a <2-byte code cannot panic;
 	// the semantic checks (ParseMultisigScript etc.) stay downstream with their existing
 	// error paths for all len>=2 codes. Crash-harden only.
 	if len(code) < 2 {
@@ -168,7 +168,7 @@ func checkCRCArbitratorsSignatures(t interfaces.Transaction, blockHeight, gate u
 
 // verifyArbitratorsMultisigSignatures verifies that the program Parameter
 // actually carries valid M-of-N arbiter signatures over the tx's unsigned
-// digest. F-022: the structure/pubkey checks above only prove the CODE lists
+// digest. The structure/pubkey checks above only prove the code lists
 // authorized arbiters; without this an unsigned special tx (empty or garbage
 // Parameter, all-public inputs) would be accepted permissionlessly and could
 // trigger an emergency ForceChange / RevertToDPOS. Height-gated at

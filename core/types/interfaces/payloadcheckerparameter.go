@@ -9,11 +9,11 @@ type Parameters interface {
 }
 
 // PrevBlockAware is implemented by transaction check parameters that can be told
-// which block is the PARENT of the block currently being validated.
+// which block is the parent of the block currently being validated.
 //
-// FV-22: transaction context checks that need "when was the previous block" must
-// use the parent of the block under validation, not the validating node's current
-// best tip. The two differ for every block that arrives on a competing branch, and
+// Transaction context checks that need "when was the previous block" must use the
+// parent of the block under validation, not the validating node's current best
+// tip. The two differ for every block that arrives on a competing branch, and
 // core/transaction cannot reach a *blockchain.BlockNode through the shared
 // functions.GetTransactionParameters hook, so blockchain sets it through this
 // optional interface instead of widening that hook's signature.

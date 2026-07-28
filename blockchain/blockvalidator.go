@@ -42,15 +42,15 @@ func (b *BlockChain) CheckBlockSanity(block *Block) error {
 	if !header.AuxPow.Check(&hash, AuxPowChainID) {
 		return errors.New("[PowCheckBlockSanity] block check aux pow failed")
 	}
-	// F-041/F-090: at and above the coordinated StrictMoneyRangeHeight activation,
-	// require the single canonical AuxPow encoding so Header.HashWithAux() (the
-	// DPoSV2 committee seed) cannot be malleated into a consensus split. ParentHash
-	// and the high bits of ParMerkleIndex are unvalidated by AuxPow.Check yet feed
-	// HashWithAux(), while the block identity Header.Hash() excludes the AuxPow --
-	// so two encodings of the same block can seed two different committees at zero
-	// PoW cost. Below the gate history replays byte-identically (mainnet census:
-	// every real block at/above the gate is already canonical; last non-canonical
-	// block was height 2,090,418).
+	// At and above StrictMoneyRangeHeight, require the single canonical AuxPow
+	// encoding so Header.HashWithAux() (the DPoSV2 committee seed) cannot be
+	// malleated into a consensus split. ParentHash and the high bits of
+	// ParMerkleIndex are unvalidated by AuxPow.Check yet feed HashWithAux(), while
+	// the block identity Header.Hash() excludes the AuxPow, so two encodings of the
+	// same block can seed two different committees at zero PoW cost. Below the gate
+	// the check is skipped and retained history replays byte-identically: the last
+	// non-canonical block on the retained chain is height 2,090,418, well below the
+	// gate.
 	if b.auxPowMalleationActive(header.Height) && !header.AuxPow.IsCanonical() {
 		return errors.New("[PowCheckBlockSanity] non-canonical (malleable) AuxPow encoding")
 	}
@@ -267,17 +267,16 @@ func CheckDuplicateTx(block *Block) error {
 	return nil
 }
 
-// checkSameBlockConflicts closes the same-block double-pay/race cluster
-// (F-028, F-066, F-067, F-078, F-088). The mempool conflictmanager rejects two
-// conflicting stake/reward/withdraw/tracking txs, but the block-level validation never
-// mirrored those slots — so an on-duty block producer could pack two conflicting txs
-// into ONE block (bypassing its own mempool) and cause a double ReturnVotes/ClaimReward
-// payout, a double RealWithdraw, a double unused-budget return, or cloned renewal votes.
-// This mirrors the relevant mempool conflict slots at the block level, keyed on the
-// EXACT conflict identity (stake program hash / claim program hash / pending withdraw
-// hash / proposal hash), so two DIFFERENT identities of the same tx type in one block
-// remain legitimate. Gated at StrictMoneyRangeHeight: below the coordinated-upgrade gate
-// this is a no-op, so the frozen chain re-derives byte-identically.
+// CheckSameBlockConflicts mirrors the mempool conflict slots at block level. The
+// mempool conflictmanager rejects two conflicting stake/reward/withdraw/tracking
+// transactions, but block validation does not consult the mempool, so an on-duty block
+// producer can pack two conflicting transactions into one block and cause a double
+// ReturnVotes/ClaimReward payout, a double RealWithdraw, a double unused-budget return,
+// or cloned renewal votes. Each slot is keyed on the exact conflict identity (stake
+// program hash, claim program hash, pending withdraw hash, proposal hash), so two
+// different identities of the same transaction type in one block remain legitimate.
+// Gated at StrictMoneyRangeHeight: below the gate this returns nil, so retained history
+// re-derives byte-identically.
 func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	if block.Height < gate {
 		return nil
@@ -288,22 +287,22 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 	crcRealWithdraw := make(map[Uint256]struct{})       // mempool slotCRCProposalRealWithdrawKey
 	dposClaimRealWithdraw := make(map[Uint256]struct{}) // mempool slotDposV2ClaimRewardRealWithdrawKey
 	votesRealWithdrawCount := 0                          // mempool slotVotesRealWithdraw (singleton)
-	proposalWithdraw := make(map[Uint256]struct{})      // F-047: mempool slotCRCProposalHash (queue side)
-	returnDeposit := make(map[string]struct{})          // F-068: mempool slotProgramCode (return-deposit)
-	claimNodeKeys := make(map[string]struct{})          // F-071: mempool slotCRCouncilMemberNodePublicKey
-	proposalDraft := make(map[Uint256]struct{})         // F-072: mempool slotCRCProposalDraftHash
-	sidechainWithdraw := make(map[Uint256]struct{})      // F-017/F-051: mempool slotSidechainTxHashes
-	sidechainReturnDeposit := make(map[Uint256]struct{}) // F-016: mempool slotSidechainReturnDepositTxHashes
-	nftDestroyIDs := make(map[Uint256]struct{})          // F-118: mempool slotNFTDestroyFromSideChainHash
-	producerCRKeys := make(map[string]struct{})          // F-100: mempool slotDPoSOwnerPublicKey/slotDPoSNodePublicKey (producer/CR overlap)
-	claimNodeDIDs := make(map[Uint168]struct{})          // F-083: mempool slotCRCouncilMemberDID
-	specialTxHashes := make(map[Uint256]struct{})        // F-030 closeout: mempool slotSpecialTxHash (illegal-evidence / inactive-arbitrators)
-	producerNicknames := make(map[string]struct{})       // NX-10/FV-08: mempool slotDPoSNickname
-	// FV-09: BLOCK-scope accumulators for the NFTDestroy owner/NFT stake-address alias.
-	// The per-tx F-073 guard (nftdestroytransaction.go) can only see ONE payload, and the
-	// F-118 arm below keys on the NFT ID, so a two-transaction split is invisible to both.
-	// Collected across the WHOLE block and intersected after the loop, because the naming
-	// transaction may precede the destroying transaction in block order.
+	proposalWithdraw := make(map[Uint256]struct{})      // mempool slotCRCProposalHash (queue side)
+	returnDeposit := make(map[string]struct{})          // mempool slotProgramCode (return-deposit)
+	claimNodeKeys := make(map[string]struct{})          // mempool slotCRCouncilMemberNodePublicKey
+	proposalDraft := make(map[Uint256]struct{})         // mempool slotCRCProposalDraftHash
+	sidechainWithdraw := make(map[Uint256]struct{})      // mempool slotSidechainTxHashes
+	sidechainReturnDeposit := make(map[Uint256]struct{}) // mempool slotSidechainReturnDepositTxHashes
+	nftDestroyIDs := make(map[Uint256]struct{})          // mempool slotNFTDestroyFromSideChainHash
+	producerCRKeys := make(map[string]struct{})          // mempool slotDPoSOwnerPublicKey/slotDPoSNodePublicKey (producer/CR overlap)
+	claimNodeDIDs := make(map[Uint168]struct{})          // mempool slotCRCouncilMemberDID
+	specialTxHashes := make(map[Uint256]struct{})        // mempool slotSpecialTxHash (illegal-evidence / inactive-arbitrators)
+	producerNicknames := make(map[string]struct{})       // mempool slotDPoSNickname
+	// Block-scope accumulators for the NFTDestroy owner/NFT stake-address alias. The
+	// per-transaction guard in nftdestroytransaction.go sees one payload at a time, and the
+	// NFTDestroy arm below keys on the NFT id, so a two-transaction split is invisible to
+	// both. Collected across the whole block and intersected after the loop, because the
+	// naming transaction may precede the destroying transaction in block order.
 	nftDestroyedStakeAddrs := make(map[Uint168]struct{}) // derived stake addr of every NFT destroyed anywhere in this block
 	nftNamedOwners := make([]Uint168, 0)                 // every OwnerStakeAddresses entry named anywhere in this block
 	for _, txn := range block.Transactions {
@@ -359,10 +358,10 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate votes real withdraw")
 			}
 		case common.CRCProposalWithdraw:
-			// F-047: mirror mempool slotCRCProposalHash (queue side). Two same-block
-			// V1 withdraws for the same proposal both pass ContextCheck (the first's
-			// WithdrawnBudgets update commits only post-validation) and each queue a
-			// WithdrawableTxInfo entry keyed by tx hash -> double CRExpenses payout.
+			// Mirror mempool slotCRCProposalHash (queue side). Two same-block V1 withdraws
+			// for the same proposal both pass ContextCheck (the first's WithdrawnBudgets
+			// update commits only post-validation) and each queue a WithdrawableTxInfo entry
+			// keyed by tx hash, which pays CRExpenses twice.
 			p, ok := txn.Payload().(*payload.CRCProposalWithdraw)
 			if !ok {
 				return errors.New("[PowCheckBlockSanity] invalid CRCProposalWithdraw payload")
@@ -372,12 +371,12 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 			}
 			proposalWithdraw[p.ProposalHash] = struct{}{}
 		case common.ReturnDepositCoin, common.ReturnCRDepositCoin:
-			// F-068: mirror mempool slotProgramCode. Two same-block deposit returns
-			// with the same program code (producer/CR) but disjoint deposit UTXOs both
-			// read the same committed availableAmount and each refund up to it,
-			// escaping the block dup-UTXO check -> over-refund of the forfeited bond.
-			// (The mempool already forbids this pairing, so no honest mempool-built
-			// block is affected; this catches a malicious producer.)
+			// Mirror mempool slotProgramCode. Two same-block deposit returns with the same
+			// program code (producer or CR) but disjoint deposit UTXOs both read the same
+			// committed availableAmount and each refund up to it, escaping the block
+			// dup-UTXO check, which over-refunds the forfeited bond. The mempool already
+			// forbids this pairing, so no honest mempool-built block is affected; this
+			// catches a malicious producer.
 			if len(txn.Programs()) == 0 {
 				return errors.New("[PowCheckBlockSanity] return deposit tx without program")
 			}
@@ -387,10 +386,10 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 			}
 			returnDeposit[codeKey] = struct{}{}
 		case common.CRCouncilMemberClaimNode:
-			// F-071: mirror mempool slotCRCouncilMemberNodePublicKey. Two same-block
-			// claims of the same node public key by distinct members both pass (the key
-			// is absent from pre-block ClaimedDPoSKeys) -> two CR members bound to one
-			// DPoS node key, breaking the node-key uniqueness invariant.
+			// Mirror mempool slotCRCouncilMemberNodePublicKey. Two same-block claims of the
+			// same node public key by distinct members both pass, since the key is absent
+			// from pre-block ClaimedDPoSKeys, binding two CR members to one DPoS node key
+			// and breaking the node-key uniqueness invariant.
 			p, ok := txn.Payload().(*payload.CRCouncilMemberClaimNode)
 			if !ok {
 				return errors.New("[PowCheckBlockSanity] invalid CRCouncilMemberClaimNode payload")
@@ -400,54 +399,50 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate CR claim DPOS node public key")
 			}
 			claimNodeKeys[nodeKey] = struct{}{}
-			// NX-10/FV-08: CRCouncilMemberClaimNode is the FIFTH member of the single mempool
-			// slotDPoSNodePublicKey slot, but at block level its node key only ever reached
-			// claimNodeKeys -- the F-071 claim-vs-claim map, which is never compared against the
-			// producer/CR key map. So RegisterProducer/UpdateProducer(node=X) +
-			// CRCouncilMemberClaimNode(X) in one block both passed: the producer side's
-			// ProducerOrCRNodePublicKeyExists and the claim side's ClaimedDPoSKeys /
-			// ProducerAndCurrentCRNodePublicKeyExists are all COMMITTED-state reads that cannot
-			// see the sibling transaction, and no block-level structure compared the two. Feed
-			// the shared producerCRKeys map as well. claimNodeKeys STAYS -- it is the F-071
+			// CRCouncilMemberClaimNode is the fifth member of the single mempool
+			// slotDPoSNodePublicKey slot, but at block level its node key reaches only
+			// claimNodeKeys, the claim-vs-claim map, which is never compared against the
+			// producer/CR key map. Without the entry below, RegisterProducer or
+			// UpdateProducer(node=X) together with CRCouncilMemberClaimNode(X) in one block both
+			// pass: the producer side's ProducerOrCRNodePublicKeyExists and the claim side's
+			// ClaimedDPoSKeys / ProducerAndCurrentCRNodePublicKeyExists are all committed-state
+			// reads that cannot see the sibling transaction, and no block-level structure compared
+			// the two. Feed the shared producerCRKeys map as well. claimNodeKeys stays: it is the
 			// claim-vs-claim guard and carries its own distinct error.
 			//
-			// ONE DELIBERATE DEVIATION FROM EXACT MEMPOOL PARITY, recorded so it is not
-			// mistaken for an oversight: producerCRKeys is a SINGLE map holding producer
-			// OWNER keys, producer NODE keys, RegisterCR keys and (now) claimed node keys,
-			// because that is how F-100 mirrored the mempool's strDPoSOwnerNodePublicKeys
-			// array slot. The mempool keeps owner keys and node keys in two slots, and
-			// CRCouncilMemberClaimNode is a member of the NODE slot only -- so the pairing
-			// "producer OWNER key == claimed node key in one block" is NOT a mempool
-			// conflict while this guard does reject it. That is STRICTER, never looser; it
-			// is deterministic; it is what NX-10's prescribed fix asks for; and a full
-			// census of the retained chain (2,260,597 blocks, this guard run with its gate
-			// forced to 0) rejects ZERO real blocks, so no retained history depends on the
-			// looser reading.
+			// producerCRKeys is a single map holding producer owner keys, producer node keys,
+			// RegisterCR keys and claimed node keys, mirroring the mempool's
+			// strDPoSOwnerNodePublicKeys array slot. The mempool keeps owner keys and node keys in
+			// two separate slots and CRCouncilMemberClaimNode belongs to the node slot only, so a
+			// block pairing a producer owner key with a claimed node key is rejected here although
+			// it is not a mempool conflict. That asymmetry is stricter than the mempool, never
+			// looser, and deterministic, which is what makes it safe: nothing the mempool rejects
+			// is accepted here, and every node reaches the same verdict on the same block.
 			if _, exists := producerCRKeys[nodeKey]; exists {
 				return errors.New("[PowCheckBlockSanity] block contains conflicting producer/CR public key")
 			}
 			producerCRKeys[nodeKey] = struct{}{}
-			// F-083: mirror mempool slotCRCouncilMemberDID. processCRCouncilMemberClaimNode
-			// captures the member's old DPoS key / member state OUTSIDE the History forward
-			// closure (oriPublicKey/oriMemberState/oriInactiveCount are read at process time,
-			// = pre-block state). A second claim by the SAME council member in one block --
-			// with a DIFFERENT node key, so the node-key guard above does not catch it --
-			// touches that same member twice; the History comment states such capture-outside
-			// revert patterns are only safe if no two same-block changes touch the same key.
-			// The mempool forbids this pairing (slotCRCouncilMemberDID), so no honest
-			// mempool-built block is affected; this catches a malicious block-packer. Reject
-			// a repeated council-member DID.
+			// Mirror mempool slotCRCouncilMemberDID. processCRCouncilMemberClaimNode captures
+			// the member's old DPoS key and member state outside the History forward closure
+			// (oriPublicKey/oriMemberState/oriInactiveCount are read at process time, so they
+			// hold pre-block state). A second claim by the same council member in one block,
+			// with a different node key so the node-key guard above does not catch it, touches
+			// that member twice; the History comment states such capture-outside-revert patterns
+			// are only safe if no two same-block changes touch the same key. The mempool forbids
+			// this pairing (slotCRCouncilMemberDID), so no honest mempool-built block is
+			// affected; this catches a malicious block-packer. Reject a repeated council-member
+			// DID.
 			if _, exists := claimNodeDIDs[p.CRCouncilCommitteeDID]; exists {
 				return errors.New("[PowCheckBlockSanity] block contains duplicate CR claim council member DID")
 			}
 			claimNodeDIDs[p.CRCouncilCommitteeDID] = struct{}{}
 		case common.CRCProposal:
-			// F-072 (DraftHash only): mirror mempool slotCRCProposalDraftHash. A
-			// same-block duplicate DraftHash is never legitimate (the draft hash is a
-			// hash over the draft data) and breaks the ExistDraft uniqueness invariant
-			// + shares a ProposalDraftDataBucketName key (rollback corruption). DID /
-			// CustomID uniqueness is NOT promoted here (a member may legitimately file
-			// multiple distinct-draft proposals) - see INFERRED-ITEMS.
+			// Mirror mempool slotCRCProposalDraftHash, DraftHash only. A same-block duplicate
+			// DraftHash is never legitimate (the draft hash is a hash over the draft data), it
+			// breaks the ExistDraft uniqueness invariant and it shares a
+			// ProposalDraftDataBucketName key, which corrupts rollback. DID and CustomID
+			// uniqueness are not promoted here: a member may legitimately file multiple proposals
+			// with distinct drafts.
 			p, ok := txn.Payload().(*payload.CRCProposal)
 			if !ok {
 				return errors.New("[PowCheckBlockSanity] invalid CRCProposal payload")
@@ -457,12 +452,12 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 			}
 			proposalDraft[p.DraftHash] = struct{}{}
 		case common.WithdrawFromSideChain:
-			// F-017/F-051: mirror mempool slotSidechainTxHashes. The committed
-			// IsSidechainTxHashDuplicate read does not see an earlier same-block tx
-			// (Tx3Index is written post-validation), and V1/V2 carry the hash in
-			// output payloads that CheckDuplicateTx never inspects, so two same-block
-			// withdraws crediting one sidechain burn both pass -> double main-chain
-			// credit. Reject a repeated sidechain tx hash.
+			// Mirror mempool slotSidechainTxHashes. The committed IsSidechainTxHashDuplicate
+			// read does not see an earlier same-block tx (Tx3Index is written
+			// post-validation), and V1/V2 carry the hash in output payloads that
+			// CheckDuplicateTx never inspects, so two same-block withdraws crediting one
+			// sidechain burn both pass and the main chain is credited twice. Reject a
+			// repeated sidechain tx hash.
 			for _, h := range sidechainWithdrawHashes(txn) {
 				if _, exists := sidechainWithdraw[h]; exists {
 					return errors.New("[PowCheckBlockSanity] block contains duplicate sidechain withdraw hash")
@@ -470,10 +465,10 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				sidechainWithdraw[h] = struct{}{}
 			}
 		case common.ReturnSideChainDepositCoin:
-			// F-016: mirror mempool slotSidechainReturnDepositTxHashes. The committed
-			// IsSidechainReturnDepositTxHashDuplicate read does not see an earlier
-			// same-block tx, so two same-block returns refunding one sidechain deposit
-			// both pass -> double refund. Reject a repeated deposit tx hash.
+			// Mirror mempool slotSidechainReturnDepositTxHashes. The committed
+			// IsSidechainReturnDepositTxHashDuplicate read does not see an earlier same-block
+			// tx, so two same-block returns refunding one sidechain deposit both pass and the
+			// deposit is refunded twice. Reject a repeated deposit tx hash.
 			for _, h := range sidechainReturnDepositHashes(txn) {
 				if _, exists := sidechainReturnDeposit[h]; exists {
 					return errors.New("[PowCheckBlockSanity] block contains duplicate sidechain return-deposit hash")
@@ -481,21 +476,22 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				sidechainReturnDeposit[h] = struct{}{}
 			}
 		case common.NFTDestroyFromSideChain:
-			// F-118: mirror mempool slotNFTDestroyFromSideChainHash. NFTDestroy
-			// SpecialContextCheck reads committed state only, so two same-block NFTDestroy
-			// txs sharing an NFT id both pass and double-apply the destroy. Reject a
-			// repeated id. Gated with the function (returns nil below `gate`).
+			// Mirror mempool slotNFTDestroyFromSideChainHash. NFTDestroy SpecialContextCheck
+			// reads committed state only, so two same-block NFTDestroy txs sharing an NFT id
+			// both pass and double-apply the destroy. Reject a repeated id. Gated with the
+			// function, which returns nil below `gate`.
 			if p, ok := txn.Payload().(*payload.NFTDestroyFromSideChain); ok {
 				for _, id := range p.IDs {
 					if _, exists := nftDestroyIDs[id]; exists {
 						return errors.New("[PowCheckBlockSanity] block contains duplicate NFTDestroy id")
 					}
 					nftDestroyIDs[id] = struct{}{}
-					// FV-09: record this NFT's DERIVED stake address, the key
-					// processNFTDestroyFromSideChain folds DPoSV2RewardInfo out of. Derivation
-					// is identical to the per-tx F-073 guard. A derivation error is left to the
-					// per-tx SpecialContextCheck (canonical error), exactly as the RegisterCR
-					// arm above leaves a malformed code to its own checker.
+					// Record this NFT's derived stake address, the key
+					// processNFTDestroyFromSideChain folds DPoSV2RewardInfo out of. Derivation is
+					// identical to the per-transaction guard in nftdestroytransaction.go. A derivation
+					// error is left to the per-transaction SpecialContextCheck, which reports the
+					// canonical error, exactly as the RegisterCR arm below leaves a malformed code to
+					// its own checker.
 					if ct, err := contract.CreateStakeContractByCode(id.Bytes()); err == nil {
 						nftDestroyedStakeAddrs[*ct.ToProgramHash()] = struct{}{}
 					}
@@ -503,14 +499,13 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				nftNamedOwners = append(nftNamedOwners, p.OwnerStakeAddresses...)
 			}
 		case common.RegisterProducer:
-			// F-100: mirror mempool slotDPoSOwnerPublicKey + slotDPoSNodePublicKey (the
-			// producer/CR-overlap slots). RegisterProducer.SpecialContextCheck rejects a key
+			// Mirror mempool slotDPoSOwnerPublicKey and slotDPoSNodePublicKey, the
+			// producer/CR-overlap slots. RegisterProducer.SpecialContextCheck rejects a key
 			// already registered as a producer (ProducerOwnerPublicKeyExists /
-			// ProducerOrCRNodePublicKeyExists) or CR (ExistCR), but those read committed
-			// state only, so two same-block registrations sharing a key -- or a
-			// RegisterProducer and a RegisterCR keyed on the SAME public key -- both pass and
-			// bind one key to two identities (producer<->producer or producer<->CR). Reject a
-			// repeated producer owner/node public key.
+			// ProducerOrCRNodePublicKeyExists) or as a CR (ExistCR), but those read committed
+			// state only, so two same-block registrations sharing a key, or a RegisterProducer
+			// and a RegisterCR keyed on the same public key, both pass and bind one key to two
+			// identities. Reject a repeated producer owner or node public key.
 			p, ok := txn.Payload().(*payload.ProducerInfo)
 			if !ok {
 				return errors.New("[PowCheckBlockSanity] invalid RegisterProducer payload")
@@ -521,38 +516,35 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				}
 				producerCRKeys[k] = struct{}{}
 			}
-			// NX-10/FV-08 (nickname slot): the RegisterProducer half of mempool
-			// slotDPoSNickname. See addProducerNickname for why the block level needed it.
+			// The RegisterProducer half of mempool slotDPoSNickname. See addProducerNickname
+			// for what the block level enforces.
 			if err := addProducerNickname(producerNicknames, p.NickName); err != nil {
 				return err
 			}
 		case common.UpdateProducer:
-			// NX-10/FV-08: UpdateProducer is the SECOND of the five transaction types the
-			// mempool holds in one slotDPoSNodePublicKey slot (mempool/conflictmanager.go:175-199)
-			// and is also a member of slotDPoSOwnerPublicKey and slotDPoSOwnerNodePublicKeys --
-			// yet it had NO arm in this function at all, so the block mirror of a five-member
-			// slot had arms for two.
+			// UpdateProducer is one of the five transaction types the mempool holds in a single
+			// slotDPoSNodePublicKey slot (mempool/conflictmanager.go:175-199) and is also a member
+			// of slotDPoSOwnerPublicKey and slotDPoSOwnerNodePublicKeys.
 			//
-			// What was NOT the gap: CheckDuplicateTx (upstream, ungated, runs on every block)
-			// already shares existingProducer across RegisterProducer/UpdateProducer/CancelProducer
-			// and existingProducerNode across RegisterProducer/UpdateProducer, so a repeated
-			// producer OWNER key and a repeated producer NODE key are already rejected.
+			// CheckDuplicateTx (upstream, ungated, runs on every block) already shares
+			// existingProducer across RegisterProducer/UpdateProducer/CancelProducer and
+			// existingProducerNode across RegisterProducer/UpdateProducer, so a repeated producer
+			// owner key and a repeated producer node key are rejected there.
 			//
-			// What WAS the gap is the CROSS-IDENTITY pairing, because CheckDuplicateTx has no
-			// RegisterCR and no CRCouncilMemberClaimNode arm and this function had no
-			// UpdateProducer arm: UpdateProducer(node=X) + RegisterCR(key=X) in ONE block both
-			// pass -- UpdateProducer's ExistCR(nodeCode) read (updateproducertransaction.go)
-			// and RegisterCR's ProducerExists read (registercrtransaction.go) are both
-			// COMMITTED-state reads and neither can see the sibling transaction -- so one DPoS
-			// node public key ends up bound to a producer identity AND a CR identity, which is
-			// the uniqueness invariant that arbiter-membership resolution, reward attribution
-			// and illegal-evidence slashing all rest on. Deterministic (every node computes the
-			// same corrupted state), so it does not fork the chain.
+			// What this arm adds is the cross-identity pairing, which CheckDuplicateTx cannot see
+			// because it has no RegisterCR and no CRCouncilMemberClaimNode arm:
+			// UpdateProducer(node=X) plus RegisterCR(key=X) in one block otherwise both pass, since
+			// UpdateProducer's ExistCR(nodeCode) read (updateproducertransaction.go) and
+			// RegisterCR's ProducerExists read (registercrtransaction.go) are both committed-state
+			// reads and neither can see the sibling transaction. One DPoS node public key would end
+			// up bound to a producer identity and a CR identity, the uniqueness invariant that
+			// arbiter-membership resolution, reward attribution and illegal-evidence slashing all
+			// rest on. The corruption is deterministic, so it does not fork the chain.
 			//
-			// Feed the SAME shared producerCRKeys map the F-100 arms use, keyed on owner and
-			// node key with the existing dedupHexKeys helper, which mirrors the mempool's
-			// strDPoSOwnerNodePublicKeys owner==node dedup so a producer whose owner key equals
-			// its own node key does not self-collide.
+			// Feed the same shared producerCRKeys map the RegisterProducer and RegisterCR arms use,
+			// keyed on owner and node key through dedupHexKeys, which mirrors the mempool's
+			// strDPoSOwnerNodePublicKeys owner==node dedup so a producer whose owner key equals its
+			// own node key does not self-collide.
 			p, ok := txn.Payload().(*payload.ProducerInfo)
 			if !ok {
 				return errors.New("[PowCheckBlockSanity] invalid UpdateProducer payload")
@@ -563,16 +555,16 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 				}
 				producerCRKeys[k] = struct{}{}
 			}
-			// NX-10/FV-08 (nickname slot): the UpdateProducer half of mempool slotDPoSNickname.
+			// The UpdateProducer half of mempool slotDPoSNickname.
 			if err := addProducerNickname(producerNicknames, p.NickName); err != nil {
 				return err
 			}
 		case common.RegisterCR:
-			// F-100: the RegisterCR side of the same two mempool slots. RegisterCR rejects a
-			// public key already in the producer list (ProducerExists) but reads committed
-			// state only, so a same-block RegisterCR + RegisterProducer (or a second
-			// RegisterCR) sharing one key both pass. Extract the CR registration public key
-			// exactly as the RegisterCR check derives the key it feeds to ProducerExists.
+			// The RegisterCR side of the same two mempool slots. RegisterCR rejects a public key
+			// already in the producer list (ProducerExists) but reads committed state only, so a
+			// same-block RegisterCR plus RegisterProducer, or a second RegisterCR, sharing one key
+			// both pass. Extract the CR registration public key exactly as the RegisterCR check
+			// derives the key it feeds to ProducerExists.
 			key, ok := registerCRConflictKey(txn)
 			if !ok {
 				// Malformed / unsupported CR code: leave rejection to the per-tx
@@ -586,33 +578,31 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 		case common.IllegalProposalEvidence, common.IllegalVoteEvidence,
 			common.IllegalBlockEvidence, common.IllegalSidechainEvidence,
 			common.InactiveArbitrators:
-			// F-030 closeout (Track A): mirror mempool slotSpecialTxHash for the
-			// illegal-evidence / inactive-arbitrators special txs. The committed-state dedup
+			// Mirror mempool slotSpecialTxHash for the illegal-evidence and
+			// inactive-arbitrators special txs. The committed-state dedup
 			// GetState().SpecialTxExists reads pre-block state, so it never sees an earlier
-			// same-block evidence tx; CheckDuplicateTx keys on the full tx hash, which two
-			// AuxPow re-encodings of ONE logical illegal block (F-030) -- or any two txs
-			// wrapping one logical evidence payload with differing tx-level bytes -- do not
-			// share; and this switch had no illegal-evidence arm. So both txs pass and
-			// processIllegalEvidence / processEmergencyInactiveArbitrators runs twice,
-			// applying the illegal penalty twice (bounded by block size, deterministic and
-			// non-forking, but a genuine double-penalty on a guilty double-signer). Key by the
-			// SAME logical identity the committed dedup uses (payload.SpecialTxDedupKey at
-			// StrictMoneyRangeHeight == gate) so the re-encodings collide within the block.
-			// Reject the second. The mempool slot the guard mirrors (slotSpecialTxHash) covers
-			// all five special-tx types, so all five share this arm.
+			// same-block evidence tx; CheckDuplicateTx keys on the full tx hash, which two AuxPow
+			// re-encodings of one logical illegal block, or any two txs wrapping one logical
+			// evidence payload with differing tx-level bytes, do not share. Both txs would
+			// otherwise pass and processIllegalEvidence / processEmergencyInactiveArbitrators
+			// would run twice, applying the illegal penalty twice to a guilty double-signer
+			// (bounded by block size, deterministic and non-forking). Key by the same logical
+			// identity the committed dedup uses (payload.SpecialTxDedupKey at
+			// StrictMoneyRangeHeight == gate) so the re-encodings collide within the block, and
+			// reject the second. The mempool slot this mirrors covers all five special-tx types,
+			// so all five share this arm.
 			//
-			// NX-08 CORRECTION -- the previous text here said the mirrored key covered "all five
-			// special-tx types", which conflated the ARM (five types) with the FOLD (one type).
-			// Stated precisely, at and above the gate SpecialTxDedupKey now folds THREE of the
-			// five to a logical identity: DPOSIllegalBlocks by AuxPow-independent block identity
-			// (F-030), and DPOSIllegalProposals / DPOSIllegalVotes by BlockHeader-independent
-			// evidence identity (NX-08 -- one appended byte to the raw header blob used to mint a
-			// fresh key, so one equivocation minted unbounded distinct evidence transactions).
+			// The arm covers five types; the fold covers three. At and above the gate
+			// SpecialTxDedupKey folds DPOSIllegalBlocks to an AuxPow-independent block identity,
+			// and DPOSIllegalProposals / DPOSIllegalVotes to a BlockHeader-independent evidence
+			// identity, because one appended byte to the raw header blob otherwise mints a fresh
+			// key and so one equivocation mints unbounded distinct evidence transactions.
 			// SidechainIllegalData and InactiveArbitrators keep the raw payload Hash(); neither
-			// carries a malleable raw header blob, and neither has been folded here.
-			// Residual, unchanged: evidence whose OWN BlockHeight is below the gate but included
-			// above it stays raw-keyed, matching SpecialTxExists / recordSpecialTx exactly --
-			// read and write must agree, so the guard must not re-key independently.
+			// carries a malleable raw header blob.
+			//
+			// Evidence whose own BlockHeight is below the gate but which is included above it
+			// stays raw-keyed, matching SpecialTxExists and recordSpecialTx exactly: read and
+			// write must agree, so this guard must not re-key independently.
 			illegalData, ok := txn.Payload().(payload.DPOSIllegalData)
 			if !ok {
 				return errors.New("[PowCheckBlockSanity] invalid illegal-evidence special tx payload")
@@ -624,22 +614,22 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 			specialTxHashes[key] = struct{}{}
 		}
 	}
-	// FV-09 (gap in our own F-073): the per-tx F-073 guard rejects only an
-	// OwnerStakeAddresses entry that aliases an NFT stake address destroyed by the SAME
-	// payload, so the vector SPLITS across two same-block NFTDestroy txs -- tx1 destroys
-	// NFT A naming NFT B's derived stake address, tx2 destroys NFT B. Each payload passes
-	// the per-tx guard trivially (disjoint sets) and the F-118 arm above passes too
-	// (A != B), yet the state-apply forwards COMPOSE at Commit: state.go's
-	// `DPoSV2RewardInfo[owner] += DPoSV2RewardInfo[nftStake]` is a LIVE lookup, so tx2
-	// reads B's key AFTER tx1 folded A's reward into it, and a reorg then misallocates
-	// A's claimable reward. (PROVEN by executed test; this is a claimable-BALANCE
-	// accounting defect -- NO mint and NO supply inflation is involved.) The block is the
-	// only scope at which the composition is visible, so reject it here. Deliberately a
-	// post-loop intersection, not an in-loop check: the naming tx may come FIRST in block
-	// order, before the aliased NFT's id has been seen. A legitimate new owner is a user
-	// stake address, never a derived NFT stake address, so this rejects only the attack.
-	// Gated with the function (returns nil below `gate` == StrictMoneyRangeHeight), so
-	// retained history re-derives byte-identically.
+	// The per-transaction guard in nftdestroytransaction.go rejects only an
+	// OwnerStakeAddresses entry that aliases an NFT stake address destroyed by the same
+	// payload, so the vector splits across two same-block NFTDestroy txs: tx1 destroys NFT
+	// A naming NFT B's derived stake address, tx2 destroys NFT B. Each payload passes the
+	// per-transaction guard trivially (the sets are disjoint) and the NFTDestroy arm above
+	// passes too (A != B), yet the state-apply forwards compose at Commit: state.go's
+	// `DPoSV2RewardInfo[owner] += DPoSV2RewardInfo[nftStake]` is a live lookup, so tx2
+	// reads B's key after tx1 folded A's reward into it, and a reorg then misallocates A's
+	// claimable reward. This misallocates a claimable balance; no mint and no supply
+	// inflation is involved. The block is the only scope at which the composition is
+	// visible, so reject it here. This is a post-loop intersection rather than an in-loop
+	// check because the naming tx may come first in block order, before the aliased NFT's
+	// id has been seen. A legitimate new owner is a user stake address, never a derived NFT
+	// stake address, so this rejects only the attack. Gated with the function, which
+	// returns nil below `gate` == StrictMoneyRangeHeight, so retained history re-derives
+	// byte-identically.
 	if len(nftDestroyedStakeAddrs) != 0 {
 		for _, owner := range nftNamedOwners {
 			if _, clash := nftDestroyedStakeAddrs[owner]; clash {
@@ -651,22 +641,20 @@ func CheckSameBlockConflicts(block *Block, gate uint32) error {
 }
 
 // addProducerNickname mirrors the mempool slotDPoSNickname slot
-// (mempool/conflictmanager.go:235-248 -- RegisterProducer + UpdateProducer, keyed on
-// ProducerInfo.NickName) at block level, where there was NO nickname handling of any kind:
-// a grep of this file found zero nickname reads, and the only UpdateProducer arm anywhere
-// was CheckDuplicateTx's owner/node-key one.
+// (mempool/conflictmanager.go:235-248, RegisterProducer plus UpdateProducer, keyed on
+// ProducerInfo.NickName) at block level.
 //
-// The defect (NX-10/FV-08): both producer transactions check nickname uniqueness with
-// GetState().NicknameExists, a COMMITTED-state read that cannot see an earlier transaction
-// in the same block, so two same-block registrations/updates binding ONE nickname to two
-// DIFFERENT owner keys both pass. StateKeyFrame.Nicknames is a SET (dpos/state/keyframe.go),
-// so the two forward inserts are idempotent while the two reverts each delete once -- one
-// cancel or one reorg then frees a nickname another LIVE producer still holds, breaking the
-// uniqueness invariant in the durable direction.
+// Both producer transactions check nickname uniqueness with GetState().NicknameExists, a
+// committed-state read that cannot see an earlier transaction in the same block, so two
+// same-block registrations or updates binding one nickname to two different owner keys
+// both pass. StateKeyFrame.Nicknames is a set (dpos/state/keyframe.go), so the two forward
+// inserts are idempotent while the two reverts each delete once: one cancel or one reorg
+// then frees a nickname another live producer still holds, breaking the uniqueness
+// invariant in the durable direction.
 //
-// An EMPTY nickname is deliberately not keyed: checkStringField(NickName, allowEmpty=false)
-// rejects it per-transaction anyway, and keying it would let two malformed payloads collide
-// here and be reported as a conflict rather than as the malformed payloads they are.
+// An empty nickname is not keyed. checkStringField(NickName, allowEmpty=false) rejects it
+// per transaction anyway, and keying it would let two malformed payloads collide here and
+// be reported as a conflict rather than as the malformed payloads they are.
 func addProducerNickname(seen map[string]struct{}, nickname string) error {
 	if nickname == "" {
 		return nil
@@ -847,13 +835,14 @@ func RecordCRCProposalAmount(usedAmount *Fixed64, txn interfaces.Transaction) {
 	}
 }
 
-// checkCoinbaseBIP30 closes F-089: the coinbase carries its own IsTxHashDuplicate
-// guard (coinbasetransaction.go) but it is DEAD on connect -- checkTxsContext
-// validates only txs[1:], so the coinbase (index 0) never runs it. A malicious
-// block producer could replay a prior identical coinbase (same txid) to resurrect
-// already-spent coinbase outputs (BIP30). At/above the gate we reject a block whose
-// coinbase txid already exists in the ledger. Below the gate: legacy (no check),
-// for replay-safety. isDuplicate is injected for testability.
+// checkCoinbaseBIP30 enforces the coinbase BIP30 rule on the block-connect path. The
+// coinbase carries its own IsTxHashDuplicate guard (coinbasetransaction.go) but that
+// guard is dead on connect: checkTxsContext validates only txs[1:], so the coinbase at
+// index 0 never runs it, and a malicious block producer could replay a prior identical
+// coinbase (same txid) to resurrect already-spent coinbase outputs. At and above the
+// gate, reject a block whose coinbase txid already exists in the ledger. Below the gate
+// the check is skipped so retained history replays byte-identically. isDuplicate is
+// injected so the rule can be tested without a ledger.
 func checkCoinbaseBIP30(coinbaseHash Uint256, height, gate uint32, isDuplicate func(Uint256) bool) error {
 	if height < gate {
 		return nil
@@ -865,8 +854,8 @@ func checkCoinbaseBIP30(coinbaseHash Uint256, height, gate uint32, isDuplicate f
 }
 
 // checkTxsContext validates every non-coinbase transaction of block in the context
-// of the chain ENDING AT prevNode -- the block's own parent, not the validating
-// node's best tip (FV-22).
+// of the chain ending at prevNode, the block's own parent, not the validating
+// node's best tip.
 func (b *BlockChain) checkTxsContext(block *Block, prevNode *BlockNode) error {
 	if len(block.Transactions) > 0 {
 		if err := checkCoinbaseBIP30(block.Transactions[0].Hash(), block.Height,
@@ -912,22 +901,23 @@ func (b *BlockChain) checkTxsContext(block *Block, prevNode *BlockNode) error {
 		}
 	}
 	var dposReward Fixed64
-	// F-011/086 (re-gated per Q-B6): derive the arbiter reward leg from the ELA-filtered
-	// totalTxFee (same basis as the CR/miner legs) instead of the all-asset tx.Fee() sum,
-	// else a non-ELA fee inflates coinbase[2] above its ELA backing. The core engineers
-	// asked that this reward-rule change activate at a FRESH future height
-	// (RevisedDPoSRewardHeight), NOT the incident-recovery gate (StrictMoneyRangeHeight).
-	// MEASURED (not assumed): a full scan of the retained chain — all 2,260,597 blocks to the
-	// frozen tip 2260595 — found ZERO outputs carrying a non-ELA AssetID, and F-056 rejects
-	// RegisterAsset at/above StrictMoneyRangeHeight, so no non-ELA asset can appear after the
-	// restart either. With every fee in ELA the two bases are the same number (the coinbase
-	// contributes 0 to both: CalculateTxsFee skips it and this loop sums from i=1), so
-	// activating at 2265000 is a provable no-op and cannot split the fleet.
-	// CLASSIFICATION: real code defect, exposure DORMANT — realized over-mint to date is zero
-	// and its precondition is now structurally unreachable. Kept as defence in depth.
-	// Same scan validated the reward model itself: 233,271 fee-free blocks above height
-	// 2,000,000 reproduce ceil(0.3R)/ceil(0.35R)/remainder exactly, 0 mismatches, at halving
-	// factor 3 (R = 76,103,500 sela; next halving at 3,153,600, far outside this window).
+	// At and above RevisedDPoSRewardHeight the arbiter reward leg derives from the
+	// ELA-filtered totalTxFee, the same basis as the CR and miner legs, rather than from the
+	// all-asset tx.Fee() sum, so a non-ELA fee cannot inflate coinbase[2] above its ELA
+	// backing. This is a reward-rule change and activates at RevisedDPoSRewardHeight, not at
+	// the incident-recovery gate StrictMoneyRangeHeight.
+	//
+	// Activating at RevisedDPoSRewardHeight cannot split the fleet: no output anywhere on the
+	// retained chain carries a non-ELA AssetID, and RegisterAsset is rejected at and above
+	// StrictMoneyRangeHeight, so no non-ELA asset can appear after the restart either. With
+	// every fee in ELA the two bases are the same number, and the coinbase contributes 0 to
+	// both, since CalculateTxsFee skips it and this loop sums from i=1. No over-issue has
+	// occurred and the precondition is unreachable after the restart; the strict form stays so
+	// that a future asset type cannot reopen it.
+	//
+	// The reward split itself is unchanged: ceil(0.3R) to CR, ceil(0.35R) to arbiters,
+	// remainder to the miner, at halving factor 3 (R = 76,103,500 sela; the next halving is at
+	// height 3,153,600, far outside this window).
 	if block.Height >= b.chainParams.RevisedDPoSRewardHeight {
 		var err error
 		dposReward, err = b.GetBlockDPOSRewardStrict(block.Height, totalTxFee)
@@ -1027,50 +1017,49 @@ func (b *BlockChain) CheckBlockContext(block *Block, prevNode *BlockNode) error 
 			return errors.New("confirmed block must have record sponsor transaction")
 		}
 
-		// NX-01 (Tier 0 release-shape decision) -- F-032's block-VALIDITY binding is
-		// WITHDRAWN, deliberately and permanently. It rejected a block whose in-block
-		// RecordSponsor payload differed from lastBlock.Confirm.Proposal.Sponsor. That
+		// The in-block RecordSponsor payload is not compared against
+		// lastBlock.Confirm.Proposal.Sponsor as a validity rule, and must not be. That
 		// comparand is not a function of the chain:
 		//   * nothing commits to it. Block.Hash() covers only the header; the Confirm
 		//     rides alongside in types.DposBlock and is persisted per node by
 		//     dbStoreBlock (blockchain.go connectBlockBracketed).
-		//   * producer and validator derived it by DIFFERENT rules. The miner reads it
-		//     RAW (pow/service.go GenerateBlock -> bestBlock.Confirm.Proposal.Sponsor);
-		//     the validator resolved it through the operator-local
-		//     BlockConfirmProposalSponsors override map. Any override entry for a height
-		//     at/above the gate was therefore a deterministic, self-inflicted halt: every
-		//     node holding the file rejects the block every miner produces. (NX-05)
+		//   * producer and validator derive it by different rules. The miner reads it
+		//     raw (pow/service.go GenerateBlock -> bestBlock.Confirm.Proposal.Sponsor);
+		//     a validator resolving it through the operator-local
+		//     BlockConfirmProposalSponsors override map would turn any override entry
+		//     for a height at or above the gate into a deterministic self-inflicted
+		//     halt: every node holding the file rejects the block every miner produces.
 		//   * honest nodes legitimately disagree about it. On a DPoS view change
-		//     DPOSOnDutyHandler.ChangeView re-proposes the SAME block hash under a new
+		//     DPOSOnDutyHandler.ChangeView re-proposes the same block hash under a new
 		//     Sponsor (proposaldispatcher.go StartProposal), and
 		//     IllegalBehaviorMonitor.isProposalsIllegal returns false the instant the two
-		//     proposals share a BlockHash -- so two valid confirms with different sponsors
+		//     proposals share a BlockHash, so two valid confirms with different sponsors
 		//     can exist, mempool/blockpool.go appendConfirm keeps whichever arrived last,
 		//     and each node then re-serves its own via pushConfirmedBlockMsg.
-		// Armed at RevisedDPoSRewardHeight (~4,400 blocks past the restart tip) this was a
-		// permanent, unrecoverable consensus split.
+		// Bound as a validity rule at RevisedDPoSRewardHeight, a few thousand blocks past the
+		// restart tip, this would be a permanent, unrecoverable consensus split.
 		//
-		// It is NOT re-expressed as a reward rule either. Upstream's RecordSponsor design
+		// It is not re-expressed as a reward rule either. Upstream's RecordSponsor design
 		// (live from RecordSponsorStartHeight) exists precisely to move sponsor
-		// attribution OFF the node-local confirm and INTO the block: above that height
+		// attribution off the node-local confirm and into the block: above that height
 		// accumulateReward keys on the in-block payload, and only the pre-RecordSponsor
 		// branch still reads confirm.Proposal.Sponsor with the override applied. Crediting
 		// from the confirm again would push node-local state back into DPoSV2RewardInfo,
-		// which DPoSV2ClaimRewardTransaction validates against -- trading a fast fork for
-		// a slow one. So the residual F-032 exposure is ACCEPTED: a block producer may
-		// name any current/last arbiter (recordsponsortransaction.go SpecialContextCheck
-		// still enforces membership) and redistribute a CONSERVED, non-inflationary
-		// sponsor reward between arbiters. No supply effect is claimed or implied.
+		// which DPoSV2ClaimRewardTransaction validates against, trading a fast fork for a
+		// slow one. The residual exposure is accepted: a block producer may name any
+		// current or last arbiter (recordsponsortransaction.go SpecialContextCheck still
+		// enforces membership) and redistribute a conserved, non-inflationary sponsor
+		// reward between arbiters. There is no supply effect.
 		//
-		// The confirm-PRESENCE checks above are upstream (d8488bf) and stay: presence is
-		// agreed by every node in the view-change case (both competing confirms are
-		// present), whereas identity is not. Forged-confirm presence in POW mode is a
-		// separate finding (NX-06) and is not touched here.
+		// The confirm-presence checks above are upstream (d8488bf) and stay: presence is
+		// agreed by every node in the view-change case, where both competing confirms are
+		// present, whereas identity is not. Forged-confirm presence in PoW mode is a
+		// separate concern and is not handled here.
 		//
-		// What is left is a pure DIAGNOSTIC. It returns no error, is reached on every
-		// block, and can never reject one -- but it is the only fleet-visible signal that
-		// this node's stored confirm disagrees with the block producer's, which is the
-		// partition symptom nothing surfaced before.
+		// What is left is a diagnostic. It returns no error, is reached on every block, and
+		// can never reject one, but it is the only fleet-visible signal that this node's
+		// stored confirm disagrees with the block producer's, which is the partition
+		// symptom.
 		if recordSponsorExist && !bytes.Equal(recordedSponsor, lastBlock.Confirm.Proposal.Sponsor) {
 			log.Warnf("[CheckBlockContext] RECORD SPONSOR DIVERGENCE at height %d: the block "+
 				"records sponsor %s for height %d, but this node's stored confirm names %s. "+
@@ -1155,18 +1144,19 @@ func IsFinalizedTransaction(msgTx interfaces.Transaction, blockHeight uint32) bo
 // GetTxFeeMap it rejects negative amounts, per-amount money-range breaches and
 // signed 64-bit overflow instead of wrapping.
 //
-// XM-02: it also rejects a NEGATIVE per-asset fee. SubtractFixed64 guards overflow but
-// not sign, so pre-fix an asset that appeared in the outputs with no (or insufficient)
-// input backing simply produced feeMap[asset] < 0 and no error. Because every caller asks
-// only for feeMap[core.ELAAssetID], a negative entry for some OTHER asset was silently
-// discarded -- that is the missing per-asset conservation rule: a transaction could emit
-// value in an asset it never spent. It is also the leg that turns a fabricated coinbase
-// asset (XM-01) into ELA: inputs {FAKE:X, ELA:Y} -> outputs {ELA:Y+X-fee} leaves
-// feeMap[ELA] = -(X-fee) (accepted pre-fix) and feeMap[FAKE] = X, minting X-fee ELA that
-// no ELA input backs. Rejecting the negative entry makes conservation explicit and
-// per-asset: for every asset, outputs <= inputs, with the coinbase -- the one transaction
-// allowed to create value -- structurally excluded from this path (checkTxsContext
-// iterates from index 1, and mempool/txpool.go rejects a coinbase outright).
+// It also rejects a negative per-asset fee. SubtractFixed64 guards overflow but not
+// sign, so an asset that appears in the outputs with no, or insufficient, input
+// backing would simply produce feeMap[asset] < 0 and no error. Because every caller
+// asks only for feeMap[core.ELAAssetID], a negative entry for some other asset would
+// be silently discarded, which is the missing per-asset conservation rule: a
+// transaction could emit value in an asset it never spent. It is also the leg that
+// turns a fabricated coinbase asset into ELA: inputs {FAKE:X, ELA:Y} -> outputs
+// {ELA:Y+X-fee} leaves feeMap[ELA] = -(X-fee), accepted without this check, and
+// feeMap[FAKE] = X, minting X-fee ELA that no ELA input backs. Rejecting the negative
+// entry makes conservation explicit and per-asset: for every asset, outputs <=
+// inputs, with the coinbase, the one transaction allowed to create value,
+// structurally excluded from this path (checkTxsContext iterates from index 1, and
+// mempool/txpool.go rejects a coinbase outright).
 //
 // No documented tx type needs an exception: every non-coinbase type either has zero
 // outputs (illegal-evidence, UpdateVersion, ActivateProducer, RevertToPOW/DPOS,
@@ -1217,9 +1207,9 @@ func GetTxFeeMapStrict(tx interfaces.Transaction,
 		if err != nil {
 			return nil, fmt.Errorf("transaction fee amount: %w", err)
 		}
-		// XM-02: per-asset conservation. A negative fee means this transaction
-		// emitted more of outputAssetID than it spent, i.e. created value out of
-		// nothing in that asset.
+		// Per-asset conservation. A negative fee means this transaction
+		// emitted more of outputAssetID than it spent, that is, created value
+		// out of nothing in that asset.
 		if !MoneyRange(fee) {
 			return nil, fmt.Errorf("transaction fee amount for asset %s: %w",
 				outputAssetID.String(), ErrMoneyRange)
@@ -1307,22 +1297,20 @@ func (b *BlockChain) StrictMoneyActive(blockHeight uint32) bool {
 	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
 }
 
-// auxPowMalleationActive reports whether the canonical-AuxPow requirement
-// (F-041/F-090) binds at the given height: true at and above the coordinated
-// StrictMoneyRangeHeight activation. Shares the campaign gate so no third
-// activation height is introduced.
+// auxPowMalleationActive reports whether the canonical-AuxPow requirement binds at
+// the given height: true at and above StrictMoneyRangeHeight. It shares that gate so
+// no third activation height is introduced.
 func (b *BlockChain) auxPowMalleationActive(blockHeight uint32) bool {
 	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
 }
 
-// IllegalEvidenceStrictActive reports whether the strict illegal-evidence
-// validation binds at the given height: true at and above the coordinated
-// StrictMoneyRangeHeight activation. It gates F-029 (evidence signer set-equality)
-// and F-082 (height-scoped confirm voter universe) inside CheckDPOSIllegalBlocks.
-// Shares the campaign gate so no third activation height is introduced; below it,
-// illegal-evidence transactions validate exactly as before and replay
-// byte-identically. (F-030's dedup-key canonicalization is gated separately, on the
-// evidence's own BlockHeight, in payload.SpecialTxDedupKey.)
+// IllegalEvidenceStrictActive reports whether the strict illegal-evidence validation
+// binds at the given height: true at and above StrictMoneyRangeHeight. It gates the
+// evidence signer set-equality check and the height-scoped confirm voter universe
+// inside CheckDPOSIllegalBlocks. It shares the same gate so no third activation height
+// is introduced; below it, illegal-evidence transactions validate exactly as before and
+// replay byte-identically. The dedup-key canonicalization is gated separately, on the
+// evidence's own BlockHeight, in payload.SpecialTxDedupKey.
 func (b *BlockChain) IllegalEvidenceStrictActive(blockHeight uint32) bool {
 	return blockHeight >= b.chainParams.StrictMoneyRangeHeight
 }
@@ -1356,13 +1344,13 @@ func (b *BlockChain) coinbaseTotalReward(blockHeight uint32,
 	return totalReward, nil
 }
 
-// GetBlockDPOSRewardStrict is the post-activation form of GetBlockDPOSReward.
-// GetBlockDPOSRewardStrict returns the DPoS arbiter reward leg for the coinbase
-// at/above the gate. F-011/086: it takes the ELA-filtered totalTxFee (the same
-// value the CR/miner legs use) rather than summing all-asset tx.Fee(), so a
-// non-ELA fee can no longer inflate coinbase[2] above its ELA backing. For any
-// all-ELA block totalTxFee == sum tx.Fee(), so this is byte-identical for every
-// honest block (coinbase.Fee() is always 0).
+// GetBlockDPOSRewardStrict is the post-activation form of GetBlockDPOSReward. It
+// returns the DPoS arbiter reward leg for the coinbase at and above
+// RevisedDPoSRewardHeight, taking the ELA-filtered totalTxFee (the same value the CR
+// and miner legs use) rather than summing all-asset tx.Fee(), so a non-ELA fee cannot
+// inflate coinbase[2] above its ELA backing. For any all-ELA block totalTxFee equals
+// the sum of tx.Fee(), so this is byte-identical for every honest block; the coinbase's
+// own Fee() is always 0.
 func (b *BlockChain) GetBlockDPOSRewardStrict(blockHeight uint32, totalTxFee Fixed64) (Fixed64, error) {
 	totalReward, err := b.coinbaseTotalReward(blockHeight, totalTxFee)
 	if err != nil {
@@ -1394,11 +1382,11 @@ func RecordCRCProposalAmountStrict(usedAmount *Fixed64,
 	return nil
 }
 
-// GetBlockDPOSReward is the pre-RevisedDPoSRewardHeight arbiter reward leg. XM-04: the
-// fee total is no longer summed here -- it comes from state.SumBlockTxFees, the SINGLE
-// definition shared with the DPoS reward state (dpos/state/arbitrators.go
-// getBlockDPOSReward), so the validator and the state cannot drift apart again. Below the
-// gate SumBlockTxFees returns the legacy expression verbatim, so this is byte-identical.
+// GetBlockDPOSReward is the pre-RevisedDPoSRewardHeight arbiter reward leg. The fee
+// total is not summed here: it comes from state.SumBlockTxFees, the single definition
+// shared with the DPoS reward state (dpos/state/arbitrators.go getBlockDPOSReward), so
+// the validator and the state cannot drift apart. Below the gate SumBlockTxFees returns
+// the legacy expression verbatim, so this is byte-identical.
 func (b *BlockChain) GetBlockDPOSReward(block *Block) Fixed64 {
 	totalTxFx := state.SumBlockTxFees(block.Transactions, block.Height,
 		b.chainParams.RevisedDPoSRewardHeight)
@@ -1406,15 +1394,15 @@ func (b *BlockChain) GetBlockDPOSReward(block *Block) Fixed64 {
 		b.chainParams.GetBlockReward(block.Height)) * 0.35))
 }
 
-// checkCoinbaseFrozenOutputs closes F-013: the coinbase (block tx index 0) is the one
-// transaction that never runs checkFrozenAddresses. checkTxsContext validates only
-// txs[1:], and the coinbase's own ContextCheck / SpecialContextCheck are DEAD on connect
-// (the same reason F-089 had to relocate the coinbase BIP30 guard into this file), so the
-// "no sends TO a frozen address" half of the frozen-address rule was entirely unenforced
-// on the coinbase path. The coinbase merge-miner output (Outputs[1]) carries no address
+// checkCoinbaseFrozenOutputs applies the frozen-address rule to the coinbase, which is
+// the one transaction that never runs checkFrozenAddresses. checkTxsContext validates
+// only txs[1:], and the coinbase's own ContextCheck / SpecialContextCheck are dead on
+// connect (the same reason the coinbase BIP30 guard lives in this file), so the "no
+// sends to a frozen address" half of the frozen-address rule was unenforced on the
+// coinbase path. The coinbase merge-miner output (Outputs[1]) carries no address
 // constraint in checkCoinbaseTransactionContext, so a producer could direct the block
-// reward into a quarantined exploit address. At/above the campaign gate any coinbase
-// output paying a frozen address is rejected; below the gate the check is skipped so
+// reward into a quarantined exploit address. At and above the gate any coinbase output
+// paying a frozen address is rejected; below the gate the check is skipped so
 // retained-history replay stays byte-identical.
 func checkCoinbaseFrozenOutputs(coinbase interfaces.Transaction, blockHeight, gate uint32,
 	frozenAddresses []config.FrozenAddress) error {
@@ -1434,31 +1422,30 @@ func checkCoinbaseFrozenOutputs(coinbase interfaces.Transaction, blockHeight, ga
 	return nil
 }
 
-// checkCoinbaseLockTimePin closes FV-19, which is a gap in our OWN F-031 fix rather than a
-// fresh defect. The pin was written into CoinBaseTransaction.SpecialContextCheck, and
-// NOTHING on the block-connect path calls that method: its only caller is the coinbase's own
+// checkCoinbaseLockTimePin pins the coinbase LockTime on the block-connect path. The pin
+// also exists in CoinBaseTransaction.SpecialContextCheck, where nothing on the
+// block-connect path reaches it: that method's only caller is the coinbase's own
 // ContextCheck override, whose only non-test caller is BlockChain.CheckTransactionContext
-// (blockchain/txvalidator.go), and every one of that function's four call sites structurally
-// excludes the coinbase -- checkTxsContext and pow/service.go both iterate from index 1, and
-// the mempool rejects a coinbase outright (mempool/txpool.go, "coinbase tx cannot be added
-// into transaction pool"). This file already recorded that fact twice: checkCoinbaseBIP30
-// (F-089) and checkCoinbaseFrozenOutputs (F-013) were BOTH relocated here for exactly this
-// reason. F-031 was not, and the record that it was "fail-on-pristine tested" was true only
-// of a test that called the dead method directly.
+// (blockchain/txvalidator.go), and every one of that function's four call sites
+// structurally excludes the coinbase. checkTxsContext and pow/service.go both iterate from
+// index 1, and the mempool rejects a coinbase outright (mempool/txpool.go, "coinbase tx
+// cannot be added into transaction pool"). checkCoinbaseBIP30 and
+// checkCoinbaseFrozenOutputs live in this file for the same reason. A test that calls the
+// coinbase method directly does not exercise the connect path and cannot show the pin is
+// armed.
 //
-// Why the pin matters: checkInvalidUTXO (core/transaction/transactionchecker.go) derives the
-// CoinbaseMaturity window from the coinbase's OWN LockTime, so a block producer -- which
-// already chooses its coinbase, whose Outputs[1] pays an address of its choosing -- can set
-// LockTime = 0 (mature immediately) or any value ABOVE the spending height (the uint32
-// subtraction underflows to ~4e9, also mature) and spend its reward before the 100-block
-// reorg-safety window. This is NOT inflation: the reward AMOUNT is unchanged and is
-// separately validated by checkCoinbaseTransactionContext below.
+// Why the pin matters: checkInvalidUTXO (core/transaction/transactionchecker.go) derives
+// the CoinbaseMaturity window from the coinbase's own LockTime, so a block producer, which
+// already chooses its coinbase and whose Outputs[1] pays an address of its choosing, can
+// set LockTime = 0 (mature immediately) or any value above the spending height (the uint32
+// subtraction underflows to about 4e9, also mature) and spend its reward before the
+// 100-block reorg-safety window. The reward amount is unchanged and is separately
+// validated by checkCoinbaseTransactionContext below, so no inflation is involved.
 //
-// Gate 1 (StrictMoneyRangeHeight) -- the gate F-031 already chose; no new gate is
-// introduced. MEASURED over the retained chain (2,260,597 blocks to the frozen tip
-// 2,260,595): coinbases with LockTime != their own block height ZERO, with LockTime == 0
-// ZERO, with LockTime > height ZERO. Arming the pin on the real path therefore rejects no
-// retained block and is byte-identical over all retained history.
+// Gated at StrictMoneyRangeHeight; no new gate is introduced. Over the retained chain no
+// coinbase has a LockTime different from its own block height, none has LockTime 0 and
+// none has LockTime above its height, so arming the pin on the real path rejects no
+// retained block and replays byte-identically.
 func checkCoinbaseLockTimePin(coinbase interfaces.Transaction, blockHeight, gate uint32) error {
 	if blockHeight < gate {
 		return nil
@@ -1470,15 +1457,15 @@ func checkCoinbaseLockTimePin(coinbase interfaces.Transaction, blockHeight, gate
 }
 
 func (b *BlockChain) checkCoinbaseTransactionContext(blockHeight uint32, coinbase interfaces.Transaction, totalTxFee, dposReward Fixed64) error {
-	// F-013: enforce the frozen-address "no sends to" rule on the coinbase path, which
+	// Enforce the frozen-address "no sends to" rule on the coinbase path, which
 	// otherwise bypasses checkFrozenAddresses entirely (see checkCoinbaseFrozenOutputs).
 	if err := checkCoinbaseFrozenOutputs(coinbase, blockHeight,
 		b.chainParams.StrictMoneyRangeHeight, b.chainParams.FrozenAddresses); err != nil {
 		return err
 	}
-	// FV-19: the F-031 coinbase LockTime pin, relocated from the coinbase's dead
-	// SpecialContextCheck onto the path that actually runs on block connect. Same gate,
-	// same rule (see checkCoinbaseLockTimePin).
+	// The coinbase LockTime pin, applied on the path that runs on block connect rather
+	// than in the coinbase's own unreachable SpecialContextCheck. Same gate, same rule
+	// (see checkCoinbaseLockTimePin).
 	if err := checkCoinbaseLockTimePin(coinbase, blockHeight,
 		b.chainParams.StrictMoneyRangeHeight); err != nil {
 		return err

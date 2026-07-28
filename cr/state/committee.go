@@ -2051,12 +2051,12 @@ func (c *Committee) RegisterFuncitons(cfg *CommitteeFuncsConfig) {
 	c.getCurrentArbiters = cfg.GetCurrentArbiters
 }
 
-// F-113: this function and the five below MUTATE CR member state
-// (MemberState, InactiveCount, InactiveCountingHeight, and the deposit Penalty
-// reached through c.state) yet each used to hold only c.mtx.RLock(), a SHARED
-// read lock, so they raced every concurrent Committee reader. They take the
-// write lock now. This changes lock strength only - the mutations, their order
-// and the History undo pairing are untouched, so no acceptance decision moves.
+// This function and the five below mutate CR member state (MemberState,
+// InactiveCount, InactiveCountingHeight, and the deposit Penalty reached through
+// c.state), so they must hold c.mtx.Lock(). Holding only c.mtx.RLock(), a shared
+// read lock, races every concurrent Committee reader. The lock strength is the
+// only difference: the mutations, their order and the History undo pairing are
+// unchanged, so no acceptance decision moves.
 func (c *Committee) TryUpdateCRMemberInactivity(did common.Uint168,
 	needReset bool, height uint32) {
 	c.mtx.Lock()

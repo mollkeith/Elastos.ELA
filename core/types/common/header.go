@@ -39,13 +39,13 @@ func (header *Header) Serialize(w io.Writer) error {
 		return err
 	}
 
-	// F-128 (write side): the trailing sentinel byte used to be written with
-	// both return values discarded, so a writer that failed here emitted a
-	// truncated header and still reported success.
+	// Write side: the trailing sentinel byte must have both return values
+	// checked. Discarding them lets a writer that failed here emit a
+	// truncated header and still report success.
 	//
 	// The read side is deliberately NOT made strict here: Header.Deserialize
 	// discards the sentinel with r.Read(make([]byte, 1)), and requiring it
-	// would reject inputs that are accepted today on consensus paths -
+	// would reject inputs that are accepted today on consensus paths.
 	// blockchain/txvalidator.go checkDPOSElaIllegalBlockHeaders and
 	// ValidateProposalEvidence both deserialize an attacker-supplied header
 	// blob out of a transaction payload. Tightening that moves an acceptance

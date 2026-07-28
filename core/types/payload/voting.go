@@ -245,11 +245,11 @@ func (vc *VotesContent) Deserialize(r io.Reader, version byte) error {
 
 	for i := uint64(0); i < candidatesCount; i++ {
 		var cv VotesWithLockTime
-		// NOTE: this MUST bind and test the Deserialize error. The previous form
-		// `if cv.Deserialize(r, version); err != nil` discarded the return and
-		// re-tested the (nil) err from ReadVarUint above, so a truncated body never
-		// broke the loop -- it appended a zero value on every one of up to 2^64
-		// iterations until the node exhausted memory.
+		// NOTE: this must bind and test the Deserialize error. Writing
+		// `if cv.Deserialize(r, version); err != nil` discards the return and
+		// re-tests the (nil) err from ReadVarUint above, so a truncated body never
+		// breaks the loop: it appends a zero value on every one of up to 2^64
+		// iterations until the node exhausts memory.
 		if err := cv.Deserialize(r, version); err != nil {
 			return err
 		}
@@ -332,18 +332,18 @@ func (v *DetailedVoteInfo) bytes() []byte {
 }
 
 // DposV2MinVoteLockDuration and DposV2MaxVoteLockDuration mirror the consensus
-// DPoSV2MinVotesLockTime (7200) / DPoSV2MaxVotesLockTime (720000). They MUST match
+// DPoSV2MinVotesLockTime (7200) / DPoSV2MaxVotesLockTime (720000). They must match
 // the validation floor/ceiling so VoteRights is bit-identical to the legacy
 // formula for every vote that passed validation (duration in [7200, 720000]).
-// MEASURED, not assumed: a full-chain scan of the retained mainnet copy found every
-// one of the 33,653 on-chain votes inside that window INCLUSIVE (min 7200, max
-// 720000) -- see voterights_measured_test.go for the figures and the pinned rows.
+// Measured, not assumed: a full-chain scan of the retained mainnet copy found every
+// one of the 33,653 on-chain votes inside that window inclusive (min 7200, max
+// 720000). See voterights_measured_test.go for the figures and the pinned rows.
 const (
 	DposV2MinVoteLockDuration uint32 = 7200
 	DposV2MaxVoteLockDuration uint32 = 720000
 )
 
-// VoteRights returns the lock-time-weighted vote weight. It is the SINGLE
+// VoteRights returns the lock-time-weighted vote weight. It is the single
 // definition of vote weight; state accumulation, arbiter-ranking and reward
 // distribution all call this so the formula cannot exist in divergent copies (a
 // divergence would itself split consensus).
@@ -351,21 +351,21 @@ const (
 // It self-guards against malformed inputs instead of trusting upstream validation:
 //   - lockUntil <= castHeight would underflow the uint32 duration -> 0
 //   - duration below the min lock -> 0 (never a negative or -Inf multiplier)
-//   - duration clamped to the max lock as EXACT INTEGER input, not an output cap
+//   - duration clamped to the max lock as exact integer input, not an output cap
 //   - votes bounded to the money range so the float->Fixed64 product cannot reach
 //     the architecture-divergent out-of-range conversion
 // For every vote that passed validation (duration in [min,max], votes<=supply)
 // these guards are inert and the result equals the legacy formula exactly, so this
 // is behaviour-identical robustness hardening, not a consensus change.
 //
-// That identity is MEASURED over the whole retained chain, not inferred from what
+// That identity is measured over the whole retained chain, not inferred from what
 // validation ought to have enforced. Replaying the only two paths that create a
 // DetailedVoteInfo (State.processVotingContent and State.processRenewalVotingContent,
-// the latter carrying the ORIGINAL vote's BlockHeight) across all 2,260,596 retained
+// the latter carrying the original vote's BlockHeight) across all 2,260,596 retained
 // main-chain blocks yields 33,653 weight-bearing votes; evaluating both the legacy
-// v0.9.9.6 expression and this function on each gives ZERO divergences. No vote has
+// v0.9.9.6 expression and this function on each gives zero divergences. No vote has
 // duration outside [7200,720000], none has LockTime <= BlockHeight, none has Votes
-// <= 0 or outside MoneyRange, none yields weightF <= 0 -- so no guard and no clamp
+// <= 0 or outside MoneyRange, none yields weightF <= 0, so no guard and no clamp
 // ever changes a retained weight, and the arbiter ranking that sorts on these values
 // (dpos/state/arbitrators.go:2373/2377/2719/2723) is unchanged. Because nothing on
 // retained history changes verdict, this needs no height gate.

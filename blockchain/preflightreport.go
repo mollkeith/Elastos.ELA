@@ -60,7 +60,7 @@ type PreflightStoreState struct {
 	MarkerPresent bool   `json:"rewind_marker_present"`
 	MarkerTarget  uint32 `json:"rewind_marker_target,omitempty"`
 	MarkerStart   uint32 `json:"rewind_marker_start,omitempty"`
-	// Residue counts come from a full store census, and are only populated on the
+	// Residue counts come from a full store scan, and are only populated on the
 	// boots that actually run one (see Estimate.FullStoreScans).
 	Scanned         bool   `json:"residue_scanned"`
 	LiveAbove       int    `json:"live_above_target,omitempty"`
@@ -87,8 +87,8 @@ type PreflightStoreState struct {
 	PendingUncleanShutdownRepair string `json:"pending_unclean_shutdown_repair,omitempty"`
 }
 
-// PreflightEstimate is how long the forced-rollback work will take, from MEASURED
-// numbers. It is an estimate and says so.
+// PreflightEstimate is how long the forced-rollback work will take, derived from
+// measured timings. It is an estimate and says so.
 type PreflightEstimate struct {
 	FullStoreScans int    `json:"full_store_scans"`
 	LowSeconds     int    `json:"low_seconds"`
@@ -115,7 +115,7 @@ type PreflightReport struct {
 }
 
 // measuredScanSeconds is one full ScanForcedRollbackStore pass over the 25 GiB
-// mainnet store. MEASURED: an armed boot spent ~34 s in three such scans.
+// mainnet store: an armed boot spends about 34 s in three such scans.
 const measuredScanSeconds = 11.3
 
 // measuredStoreGiB is the store the timings above were measured on.
@@ -261,7 +261,7 @@ func (r *PreflightReport) predict(chain *BlockChain, opts PreflightOptions) erro
 					"the rollback target %d, which is beyond the %d-block "+
 					"incremental rewind window.", depth, target, maxHistoryCapacity))
 			// No full store scan runs on this boot: PreflightForcedRollback steps
-			// aside on capacity before it censuses anything, and ForceRollback
+			// aside on capacity before it scans anything, and ForceRollback
 			// refuses before it does either.
 			r.Estimate = estimate(0, r.Store.SizeBytes)
 			return nil
@@ -414,7 +414,7 @@ func (r *PreflightReport) readMarker(chain *BlockChain) error {
 	return nil
 }
 
-// recordScan copies a census into the report.
+// recordScan copies a store scan into the report.
 func (r *PreflightReport) recordScan(scan *ForcedRollbackStoreScan) {
 	r.Store.Scanned = true
 	r.Store.LiveAbove = len(scan.LiveAbove)
@@ -459,7 +459,7 @@ func discardedRollbackOverrides(params *config.Configuration,
 	return out
 }
 
-// estimate scales the MEASURED timings by store size.
+// estimate scales the measured timings by store size.
 func estimate(scans int, sizeBytes int64) PreflightEstimate {
 	ratio := float64(sizeBytes) / (measuredStoreGiB * 1024 * 1024 * 1024)
 	e := PreflightEstimate{FullStoreScans: scans}

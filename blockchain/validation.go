@@ -30,20 +30,21 @@ func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Progra
 		prefixType := contract.GetPrefixType(programHash)
 
 		// TODO: this implementation will be deprecated
-		// NOTE (F-218, verified BY-DESIGN — do NOT "restore" an ownerHash==codeHash bind
-		// here): a PrefixCrossChain custody address is derived from the SIDECHAIN GENESIS
-		// hash (contract.CreateCrossChainRedeemScript), NOT from the arbiter pubkeys, while
-		// a legitimate spend supplies program.Code = the arbiter m/n multisig script — so
-		// ToCodeHash(arbiterCode) can NEVER equal the genesis-derived ownerHash. Applying
-		// the generic bind below to this branch would reject EVERY legitimate
-		// WithdrawFromSideChain/Return (a consensus break). The real arbiter authorization
-		// lives in the tx-type SpecialContextCheck (withdrawfromsidechain / returnsidechain
-		// deposit) plus the checkTransactionCrossChainUTXO admit-list. The `continue` is
-		// therefore correct. DEFERRED (F-091): checkCrossChainSignatures lacks an
-		// `m<1||m>n` guard (VerifyMultisigSignatures treats m<=0 as satisfied), an
-		// anyone-can-spend on freeze-OFF paths (masked on mainnet by the freeze/restriction
-		// admit-list). A gated fix needs the block height threaded into RunPrograms — see
-		// INFERRED-ITEMS.md.
+		// Do not restore an ownerHash==codeHash bind on this branch: a PrefixCrossChain
+		// custody address is derived from the sidechain genesis hash
+		// (contract.CreateCrossChainRedeemScript), not from the arbiter pubkeys, while a
+		// legitimate spend supplies program.Code = the arbiter m/n multisig script, so
+		// ToCodeHash(arbiterCode) can never equal the genesis-derived ownerHash. Applying
+		// the generic bind below to this branch would reject every legitimate
+		// WithdrawFromSideChain and ReturnSideChainDeposit, which is a consensus break. The
+		// real arbiter authorization lives in the tx-type SpecialContextCheck
+		// (withdrawfromsidechain / returnsidechaindeposit) plus the
+		// checkTransactionCrossChainUTXO admit-list, so the `continue` is correct.
+		//
+		// Still open: checkCrossChainSignatures has no `m<1||m>n` guard
+		// (VerifyMultisigSignatures treats m<=0 as satisfied), which is an anyone-can-spend
+		// on freeze-off paths, masked on mainnet by the freeze/restriction admit-list. A
+		// gated fix needs the block height threaded into RunPrograms.
 		if prefixType == contract.PrefixCrossChain {
 			if contract.IsSchnorr(program.Code) {
 				if ok, err := checkSchnorrSignatures(*program, common.Sha256D(data[:]),
@@ -81,10 +82,10 @@ func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Progra
 					return err
 				}
 			} else if blockHeight >= strictMoneyHeight {
-				// F-049: a Standard/Deposit-prefixed program whose Code hashes to the
-				// address (ownerHash==codeHash) but is none of Schnorr/Standard/MultiSig
-				// otherwise fell through with NO signature check (anyone-can-spend of any
-				// UTXO parked at such an address). Fail closed at/above the gate.
+				// A Standard/Deposit-prefixed program whose Code hashes to the address
+				// (ownerHash==codeHash) but is none of Schnorr/Standard/MultiSig would
+				// otherwise fall through with no signature check, making any UTXO parked
+				// at such an address anyone-can-spend. Fail closed at and above the gate.
 				return errors.New("unknown standard/deposit signature type")
 			}
 		} else if prefixType == contract.PrefixMultiSig {
@@ -150,28 +151,25 @@ func checkSchnorrSignatures(program Program, data [32]byte,
 	copy(publicKey[:], program.Code[2:])
 
 	signature := [64]byte{}
-	// F-050: reject a malformed Schnorr program whose Parameter is not a
-	// full 64-byte signature before slicing; otherwise program.Parameter[:64]
-	// panics (slice bounds out of range) on any pre-auth P2P-relayed tx.
+	// Reject a malformed Schnorr program whose Parameter is not a full 64-byte
+	// signature before slicing; otherwise program.Parameter[:64] panics (slice
+	// bounds out of range) on any pre-auth P2P-relayed tx.
 	//
-	// The two malformed cases are NOT symmetric against the released base
-	// (c61c9e61), which had no length check at all and went straight to
+	// The two malformed cases are not symmetric and must not be treated alike.
+	// Without a length check the code goes straight to
 	// copy(signature[:], program.Parameter[:64]). One half is safe to reject
-	// everywhere, the other half is an accept -> reject flip on retained
-	// history and has to be gated. Treating them alike is the defect this
-	// splits apart.
+	// everywhere; the other half would be an accept-to-reject flip on retained
+	// history and has to be gated.
 	//
-	// len < 64 stays UNGATED, because the base could never ACCEPT such a
-	// program, it could only die on it. Program.Parameter is produced solely by
-	// Program.Deserialize -> common.ReadVarBytes, which for any count at or
-	// below maxPreallocBytes (64 KiB, and 64 is far below it) returns
-	// make([]byte, count). That gives cap == len, so Parameter[:64] on a
-	// shorter Parameter is a true out-of-range slice and not a reslice into
-	// spare capacity: it panics. The base at c61c9e61 allocated the same way.
-	// A panic aborts validation, so no block carrying one was ever accepted,
-	// and no retained block at or below 2,260,450 can contain one. Rejecting
-	// therefore cannot change any retained verdict, and it is strictly better
-	// than crashing a node on a pre-auth P2P-relayed tx.
+	// len < 64 stays ungated, because that case could never be accepted, only
+	// panicked on. Program.Parameter is produced solely by Program.Deserialize ->
+	// common.ReadVarBytes, which for any count at or below maxPreallocBytes (64 KiB,
+	// and 64 is far below it) returns make([]byte, count). That gives cap == len, so
+	// Parameter[:64] on a shorter Parameter is a true out-of-range slice and not a
+	// reslice into spare capacity: it panics. A panic aborts validation, so no block
+	// carrying one was ever accepted and no retained block at or below 2,260,450 can
+	// contain one. Rejecting therefore cannot change any retained verdict, and it is
+	// strictly better than crashing a node on a pre-auth P2P-relayed tx.
 	if len(program.Parameter) < 64 {
 		return false, errors.New("invalid schnorr signature length")
 	}
@@ -199,10 +197,11 @@ func checkCrossChainSignatures(program Program, data []byte,
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
 	m := int(code[0]) - crypto.PUSH1 + 1
-	// F-091: VerifyMultisigSignatures treats m<=0 as trivially satisfied, so an
-	// m<1 (or m>n) crosschain redeem script was anyone-can-spend on freeze-OFF
-	// paths. Reject at/above the gate (masked on mainnet by the freeze/restriction
-	// admit-list, so below-gate stays byte-identical).
+	// VerifyMultisigSignatures treats m<=0 as trivially satisfied, so an m<1 (or
+	// m>n) crosschain redeem script is anyone-can-spend on freeze-off paths.
+	// Reject at and above the gate. On mainnet this is masked by the
+	// freeze/restriction admit-list, so below-gate validation stays
+	// byte-identical.
 	if blockHeight >= strictMoneyHeight && (m < 1 || m > n) {
 		return errors.New("invalid crosschain multisig m/n")
 	}

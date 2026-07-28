@@ -25,15 +25,15 @@ func (t *UpdateCRTransaction) HeightVersionCheck() error {
 	blockHeight := t.parameters.BlockHeight
 	chainParams := t.parameters.Config
 
-	// F-046: UpdateCR historically had NO HeightVersionCheck (it fell through to the
+	// UpdateCR historically had no HeightVersionCheck (it fell through to the
 	// DefaultChecker no-op), so unknown/dormant payload versions bypassed the version
 	// discipline RegisterCR enforces: a v>=4 payload reached SpecialContextCheck's
 	// CheckPayloadSignature fall-through, and the dormant CRInfoSchnorrVersion path was
 	// bounded only by the general NormalSchnorrStartHeight rather than CRSchnorrStartHeight
 	// (MaxUint32, dormant on mainnet). Mirror RegisterCR's version gate, but activate the
 	// new rejections only at and above the coordinated-upgrade gate (StrictMoneyRangeHeight)
-	// so retained below-gate history replays byte-identically. Reuses the campaign gate --
-	// no third incident gate is introduced.
+	// so retained below-gate history replays byte-identically. Reuses gate 1; no third gate
+	// is introduced.
 	if blockHeight < chainParams.StrictMoneyRangeHeight {
 		return nil
 	}

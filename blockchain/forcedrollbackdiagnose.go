@@ -182,8 +182,8 @@ type ForcedRollbackResidueDiagnosis struct {
 	Err error
 }
 
-// DiagnoseForcedRollbackResidue censuses the store for a node at or below the
-// rollback target, WITHOUT purging anything and WITHOUT clearing any marker.
+// DiagnoseForcedRollbackResidue scans the store for a node at or below the
+// rollback target, without purging anything and without clearing any marker.
 func (b *BlockChain) DiagnoseForcedRollbackResidue() (
 	*ForcedRollbackResidueDiagnosis, error) {
 	d := &ForcedRollbackResidueDiagnosis{Target: b.chainParams.ForcedRollbackHeight}

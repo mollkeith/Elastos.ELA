@@ -163,10 +163,10 @@ func (tx *BaseTransaction) Serialize(w io.Writer) error {
 }
 
 // Serialize the BaseTransaction data without contracts
-// NOTE (F-205): these bytes carry NO chain identity -- no network magic, no
-// genesis hash, no chain id -- and no per-transaction anti-replay binding beyond
-// the inputs themselves. See the F-205 NOTE in updateproducertransaction.go for
-// the verified-real / refuted / deferred verdict and the mainnet measurements
+// NOTE: these bytes carry no chain identity, no network magic, no genesis hash and
+// no chain id, and no per-transaction anti-replay binding beyond the inputs
+// themselves. See the payload-signature NOTE in updateproducertransaction.go for
+// which parts of that are real, which are refuted, and the mainnet measurements
 // that rule out the obvious fixes; do not add a binding here without reading it.
 func (tx *BaseTransaction) SerializeUnsigned(w io.Writer) error {
 	// Version
@@ -556,12 +556,12 @@ func (tx *BaseTransaction) SerializeSizeStripped() int {
 
 func (tx *BaseTransaction) IsSmallTransfer(min common.Fixed64) bool {
 	var totalCrossAmt common.Fixed64
-	// F-001: accumulate cross-chain output values with an overflow-checked add.
+	// Accumulate cross-chain output values with an overflow-checked add.
 	// A wrapping int64 sum could turn a huge transfer negative and misclassify it
 	// as "small". Reachable in the mempool on nets where StrictMoneyRangeHeight is
 	// disabled (testnet/regnet, mainnet pre-activation), where the balance check
 	// that would otherwise bound the sum does not run. On overflow, treat the tx
-	// as NOT small (return false) — the safe classification. Mempool-only routing,
+	// as not small (return false), the safe classification. Mempool-only routing,
 	// never part of block replay, so no height gate is needed.
 	addCross := func(v common.Fixed64) bool {
 		sum, err := common.AddFixed64(totalCrossAmt, v)

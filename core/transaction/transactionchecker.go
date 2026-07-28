@@ -613,19 +613,18 @@ func (t *DefaultChecker) checkInvalidUTXO(txn interfaces.Transaction) error {
 			return err
 		}
 		if referTxn.IsCoinBaseTx() {
-			// FV-19 (defence in depth): the maturity window is computed on uint32, so a
-			// coinbase whose LockTime is ABOVE the spending height underflows to ~4e9 and
-			// reads as mature. Treat that as NOT mature instead of letting it wrap.
+			// Defence in depth: the maturity window is computed on uint32, so a
+			// coinbase whose LockTime is above the spending height underflows to ~4e9 and
+			// reads as mature. Treat that as not mature instead of letting it wrap.
 			//
-			// Gated at StrictMoneyRangeHeight although the finding suggested shipping it
-			// ungated: a census of the retained chain (2,260,597 blocks) found ZERO
-			// coinbases whose LockTime differs from their own block height, so no retained
-			// spend can reach this branch and the two forms are indistinguishable over
-			// retained history -- but this IS an acceptance decision, and the campaign rule
-			// is that acceptance-changing behaviour sits behind gate 1. It reuses gate 1, the
-			// same gate as the relocated pin (blockchain.checkCoinbaseLockTimePin), so no
-			// third gate is introduced and below-gate replay is byte-identical by
-			// construction rather than by measurement. Unreachable once that pin is live.
+			// Gated at StrictMoneyRangeHeight rather than shipped ungated: no retained coinbase
+			// in the 2,260,597-block chain has a LockTime differing from its own block height,
+			// so no retained spend can reach this branch and the two forms are
+			// indistinguishable over retained history, but this is an acceptance decision, and
+			// acceptance-changing behaviour sits behind gate 1. It reuses gate 1, the same gate
+			// as the relocated pin (blockchain.checkCoinbaseLockTimePin), so no third gate is
+			// introduced and below-gate replay is byte-identical by construction rather than by
+			// measurement. Unreachable once that pin is live.
 			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight &&
 				referTxn.LockTime() > currentHeight {
 				return errors.New("the utxo of coinbase is locking")
@@ -812,30 +811,30 @@ func checkFrozenAddresses(txn interfaces.Transaction,
 	return nil
 }
 
-// CheckTransactionFee gates the minimum fee AND stores the fee on the transaction.
+// CheckTransactionFee gates the minimum fee and stores the fee on the transaction.
 //
-// XM-03: pre-fix both used getTransactionFee (core/transaction/crcproposalwithdraw.go),
-// an ASSET-BLIND aggregate -- it sums every input Value and every output Value with no
-// regard to AssetID -- while ContextCheck computed the authoritative per-asset
+// Both used to come from getTransactionFee (core/transaction/crcproposalwithdraw.go),
+// an asset-blind aggregate: it sums every input Value and every output Value with no
+// regard to AssetID, while ContextCheck computed the authoritative per-asset
 // blockchain.GetTxFeeStrict(ELAAssetID) result two steps earlier and threw it away
 // (`if _, err := ...`). Two different fee numbers were therefore live for the same
 // transaction. The stored one is the damaging one: txn.SetFee is what
 // interfaces.Transaction.Fee() returns, and dpos/state/arbitrators.go getBlockDPOSReward
 // sums exactly that into a.accumulativeReward -> distributeDPOSReward -> arbitersRoundReward,
 // the pool that becomes claimable, spendable ELA. A non-ELA input therefore raised the
-// arbiter reward without any ELA backing it -- our F-011 fix corrected the block-validation
-// site (checkTxsContext) and missed this one.
+// arbiter reward without any ELA backing it. The block-validation site (checkTxsContext)
+// carries the matching correction; this is its transaction-level twin.
 //
-// At and above StrictMoneyRangeHeight the minimum-fee gate and the stored fee now BOTH use
+// At and above StrictMoneyRangeHeight the minimum-fee gate and the stored fee both use
 // the same authoritative GetTxFeeStrict(ELAAssetID) value that block validation uses. Below
 // the gate the original asset-blind expression is preserved exactly, so retained history
 // replays unchanged.
 //
-// Note the ordering dependency with XM-02: the asset-blind aggregate was, by accident, the
-// only bound on how much foreign-asset value a transaction could emit (a large fabricated
-// output made the aggregate fee negative and tripped the minimum-fee gate). Switching this
-// gate to the ELA-only fee WITHOUT the XM-02 per-asset non-negativity rule would remove that
-// accidental bound. The two changes must ship together.
+// Note the ordering dependency with the per-asset output non-negativity rule: the
+// asset-blind aggregate was, by accident, the only bound on how much foreign-asset value
+// a transaction could emit (a large fabricated output made the aggregate fee negative and
+// tripped the minimum-fee gate). Switching this gate to the ELA-only fee without that
+// per-asset rule would remove that accidental bound. The two changes must ship together.
 func (t *DefaultChecker) CheckTransactionFee(references map[*common2.Input]common2.Output) error {
 	log.Debug("DefaultChecker checkTransactionFee begin")
 	txn := t.parameters.Transaction
@@ -860,9 +859,9 @@ func (t *DefaultChecker) CheckTransactionFee(references map[*common2.Input]commo
 	return nil
 }
 
-// authoritativeFee returns THE fee for this transaction: the strict, per-asset,
+// authoritativeFee returns the fee for this transaction: the strict, per-asset,
 // ELA-only result at and above StrictMoneyRangeHeight, and the legacy asset-blind
-// aggregate below it. See CheckTransactionFee (XM-03).
+// aggregate below it. See CheckTransactionFee.
 func (t *DefaultChecker) authoritativeFee(
 	references map[*common2.Input]common2.Output) (common.Fixed64, error) {
 	if t.parameters.BlockHeight < t.parameters.Config.StrictMoneyRangeHeight {

@@ -16,8 +16,8 @@ import (
 
 const SidechainIllegalDataVersion byte = 0x00
 
-// MaxSidechainIllegalSigns bounds the signature slice at decode time (DoS ceiling,
-// F-012). Real sidechain-illegal signer sets are dozens; 1024 is far above any
+// MaxSidechainIllegalSigns bounds the signature slice at decode time (DoS ceiling).
+// Real sidechain-illegal signer sets are dozens; 1024 is far above any
 // legitimate value while preventing an unbounded make() OOM from a crafted varint.
 const MaxSidechainIllegalSigns = 1024
 
@@ -157,8 +157,8 @@ func (s *SidechainIllegalData) Deserialize(r io.Reader, version byte) error {
 	if signLen, err = common.ReadVarUint(r, 0); err != nil {
 		return err
 	}
-	// F-012: cap the count before allocating (a crafted varint -> unbounded make() ->
-	// remote OOM / `makeslice: len out of range` before any signature byte is read).
+	// Cap the count before allocating: a crafted varint gives an unbounded make() and a
+	// remote OOM or `makeslice: len out of range` before any signature byte is read.
 	if signLen > MaxSidechainIllegalSigns {
 		return errors.New("sidechain illegal signLen exceeds maximum")
 	}

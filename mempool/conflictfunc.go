@@ -578,11 +578,11 @@ func hashArraySidechainTransactionHashes(
 		return array, nil
 	} else if tx.PayloadVersion() == payload.WithdrawFromSideChainVersionV1 ||
 		tx.PayloadVersion() == payload.WithdrawFromSideChainVersionV2 {
-		// F-051: V2 also carries the sidechain hash in the OTWithdrawFromSideChain
-		// output payloads (Signers live in the tx payload), so the mempool conflict
-		// slot must read outputs for V2 too. The old else branch read the empty
-		// payload.SideChainTransactionHashes and never registered any V2 hash, so
-		// two V2 withdraws for one burn could both enter the pool.
+		// V2 also carries the sidechain hash in the OTWithdrawFromSideChain output
+		// payloads (Signers live in the tx payload), so this mempool conflict slot must
+		// read outputs for V2 too. Reading payload.SideChainTransactionHashes for V2
+		// finds it empty and registers no hash, which lets two V2 withdraws for one burn
+		// both enter the pool.
 		array := make([]common.Uint256, 0)
 		for _, output := range tx.Outputs() {
 			if output.Type != common2.OTWithdrawFromSideChain {

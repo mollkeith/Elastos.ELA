@@ -62,39 +62,39 @@ const forcedRollbackRemedy = "Remedy: this is not repairable in place. Restore a
 var ErrForcedRollbackAbandoned = errors.New(
 	"forced rollback: the store carries an in-progress rollback this node is not configured to finish")
 
-// CheckAbandonedForcedRollback closes the disarm trap, and it is the ONE check in
+// CheckAbandonedForcedRollback closes the disarm trap, and it is the one check in
 // this file that must run on every boot of every node whether or not a forced
 // rollback is configured.
 //
-// THE TRAP. ffldb buffers committed writes in RAM for up to 20 MiB / 300 s. Before
-// the flushes added alongside this check, a rewind could complete, verify itself,
+// The trap: ffldb buffers committed writes in RAM for up to 20 MiB / 300 s. Without
+// the flushes that sit alongside this check, a rewind can complete, verify itself,
 // clear its marker and log "block store rewound" with not one byte of any of it on
-// disk. An unclean exit inside that window silently discarded the whole rewind. If
-// the operator had by then acted on the completion line and disarmed the trigger,
-// the next boot took every early return in this file -- forcedRollbackConfigured is
-// false, so LocateForcedRollbackTrigger, VerifyForcedRollbackApplied and
-// CheckForcedRollbackResidue all decline -- and the node came up on the
-// PRE-ROLLBACK chain, serving the exploit block, with nothing anywhere saying so.
+// disk. An unclean exit inside that window silently discards the whole rewind. If the
+// operator has by then acted on the completion line and disarmed the trigger, the
+// next boot takes every early return in this file, since forcedRollbackConfigured is
+// false and LocateForcedRollbackTrigger, VerifyForcedRollbackApplied and
+// CheckForcedRollbackResidue all decline, and the node comes up on the pre-rollback
+// chain, serving the exploit block, with nothing anywhere saying so.
 //
 // The remedy has two halves and needs both. The flushes make the marker durable
-// BEFORE the first destructive step and the marker's clearing durable BEFORE the
+// before the first destructive step and the marker's clearing durable before the
 // completion line, so "a rewind started here and did not report finishing" is a fact
 // that survives the crash. This check is what reads that fact on a boot the operator
 // has disarmed, and refuses.
 //
-// It is deliberately NOT gated on configuration: gating it is the bug. It costs one
-// metadata point lookup on a node that has never run a rollback, and it is silent
-// when a marker exists but this node IS configured for that same target -- that node
-// is resuming, and the armed path owns it.
+// It is deliberately not gated on configuration: gating it reopens the trap. It costs
+// one metadata point lookup on a node that has never run a rollback, and it is silent
+// when a marker exists but this node is configured for that same target, because that
+// node is resuming and the armed path owns it.
 //
-// LIMITS, stated so nothing here reads as more than it is. It can only refuse on
-// evidence THIS binary's rewind wrote: a store rewound by the shipped binary, or
+// Limits, stated so nothing here reads as more than it is. It can only refuse on
+// evidence this binary's rewind wrote: a store rewound by an earlier binary, or
 // offline by `ela-cli rollback`, carries no marker and is invisible to it. Neither
-// has the flush-window trap this closes -- the shipped rewind ratchets instead, which
-// VerifyForcedRollbackApplied catches, and the offline command flushes on close -- but
-// a node whose data directory was assembled some other way is outside what this can
-// see, and the runbook control (disarm only after a clean shutdown plus an offline
-// residue census reading zero) is what covers that case.
+// has the flush-window trap this closes, since the earlier rewind ratchets instead,
+// which VerifyForcedRollbackApplied catches, and the offline command flushes on
+// close, but a node whose data directory was assembled some other way is outside what
+// this can see, and the runbook control (disarm only after a clean shutdown plus an
+// offline residue scan reading zero) is what covers that case.
 func (b *BlockChain) CheckAbandonedForcedRollback() error {
 	marker, err := b.ReadForcedRollbackMarker()
 	if err != nil {
@@ -295,25 +295,27 @@ func (b *BlockChain) announceForcedRollbackSettled(tip uint32) {
 		b.chainParams.ForcedRollbackTrigger, target+1, occupant, tip, target+1)
 }
 
-// VerifyForcedRollbackApplied is the boot-time post-condition that replaces reading
-// the ARMED flag as if it meant APPLIED.
+// VerifyForcedRollbackApplied is the boot-time post-condition. The armed flag says
+// what was requested, not what was applied, so it must not be read as if it meant
+// applied.
 //
-// It must be called on every boot where a forced rollback is configured -- including
-// the boots where nothing was armed -- because "armed" is exactly the fact that stops
+// It must be called on every boot where a forced rollback is configured, including
+// the boots where nothing was armed, because "armed" is exactly the fact that stops
 // being true the moment the rewind is declined or half-done, and it is the boots
 // after that which matter.
 //
 // The severities are not the same:
 //
-//   - the trigger is still MAIN-CHAIN INDEXED. Either this node is un-rolled-back on
+//   - the trigger is still main-chain indexed. Either this node is un-rolled-back on
 //     the exploit chain (a declined or skipped rewind), or a rewind was interrupted
-//     before the block's rollback transaction committed. In both cases the
-//     UTXO/derived-state processors for that block have not been reverted. The node
-//     must NOT join the recovered network: refuse to start.
+//     before the block's rollback transaction committed. In both cases the UTXO and
+//     derived-state processors for that block have not been reverted. The node must
+//     not join the recovered network: refuse to start.
 //   - the trigger survives only as a raw-store entry and/or an orphaned header row.
-//     That is retention residue: the chain is consistent, but the node still SERVES
-//     the exploit block by hash (PROVEN live). Both records are provably above the
-//     target, so remove exactly those two keys and continue.
+//     That is retention residue: the chain is consistent, but the node still serves
+//     the exploit block by hash, which has been reproduced on a live node. Both
+//     records are provably above the target, so remove exactly those two keys and
+//     continue.
 func (b *BlockChain) VerifyForcedRollbackApplied() error {
 	d, err := b.DiagnoseForcedRollbackApplied()
 	if err != nil {
@@ -377,14 +379,14 @@ func (b *BlockChain) VerifyForcedRollbackApplied() error {
 
 // PreflightForcedRollback is the pre-flight store scan on the ARMED path.
 //
-// Until now the armed path went straight into the rewind, so a store already damaged
-// by an earlier interrupted rollback -- the state the SHIPPED per-block ordering
-// leaves behind -- was only discovered mid-rewind.
+// Without it the armed path goes straight into the rewind, so a store already
+// damaged by an earlier interrupted rollback, which is the state the header-row-first
+// per-block ordering leaves behind, is only discovered mid-rewind.
 //
-// MEASURED (test/unit/b1b5_rollback_outcome_test.go, subtest
+// What that looks like (test/unit/b1b5_rollback_outcome_test.go, subtest
 // `pristine-sequence-fails-opaquely`): the rewind aborts on an internal
 // transaction-index assertion, "dbIndexDisconnectBlock must be called with the block
-// at the current index tip", quoting two raw hashes. It fails CLOSED, which is
+// at the current index tip", quoting two raw hashes. It fails closed, which is
 // right, but with no sentinel to classify it and no remedy to act on.
 //
 // A second hazard is structural rather than measured: had the rewind reached its
@@ -409,7 +411,7 @@ func (b *BlockChain) VerifyForcedRollbackApplied() error {
 func (b *BlockChain) PreflightForcedRollback() error {
 	// The census and the classification live in DiagnoseForcedRollbackPreflight, so
 	// that `ela-cli preflight` predicts this boot with the code that decides it
-	// rather than with a copy of its conditions -- and can report the census this
+	// rather than with a copy of its conditions, and can report the scan this
 	// scan already paid for instead of running a second one.
 	d, err := b.DiagnoseForcedRollbackPreflight()
 	if err != nil {
@@ -460,7 +462,7 @@ const (
 // pre-flight scan.
 type ForcedRollbackPreflightDiagnosis struct {
 	State ForcedRollbackPreflightState
-	// Scan is the store census, nil when no census was taken.
+	// Scan is the store scan result, nil when no scan was taken.
 	Scan               *ForcedRollbackStoreScan
 	Tip, Target, Depth uint32
 	// Orphaned are main-chain records above the target the loaded index cannot
@@ -470,7 +472,7 @@ type ForcedRollbackPreflightDiagnosis struct {
 	Err error
 }
 
-// DiagnoseForcedRollbackPreflight censuses the store for the ARMED path without
+// DiagnoseForcedRollbackPreflight scans the store for the armed path without
 // touching anything. Caller must have verified ForcedRollbackArmed first.
 func (b *BlockChain) DiagnoseForcedRollbackPreflight() (
 	*ForcedRollbackPreflightDiagnosis, error) {

@@ -80,9 +80,10 @@ func (b *BlockChain) ForcedRollbackArmed() (bool, error) {
 // InitCheckpoint, which fails the node loudly if an anomalous snapshot (e.g.
 // hand-edited) ever sat at/above the target.
 //
-// UNPROVEN: derived-state CONTENT correctness after rebuild is validated only by the
-// testnet reproduction (compare the arbiter/CR set at the target against a node
-// freshly synced to that height). Treat that as a hard gate before production.
+// Derived-state content correctness after the rebuild is not established by this
+// reasoning. It is validated only by the testnet reproduction, which compares the
+// arbiter and CR set at the target against a node freshly synced to that height.
+// Treat that comparison as a hard gate before production.
 //
 // Caller must have verified ForcedRollbackArmed first.
 
@@ -110,15 +111,12 @@ var ErrForcedRollbackInterrupted = errors.New("forced rollback interrupted by op
 // forcedRollbackDisarmRemedy is the sentence a refusal ends with when it offers
 // "or just do not roll back" as a way out.
 //
-// MEASURED: the shipped text told every operator that unsetting
-// --forcedrollbacktrigger lets the node start. On mainnet that is FALSE --
-// settings.enforceStrictMoneyAndRollbackHeights discards both the flag and the
-// config.json field and re-pins the coordinated values, so
+// On mainnet, unsetting --forcedrollbacktrigger does not let the node start, so the
+// remedy must not say it does: settings.enforceStrictMoneyAndRollbackHeights discards
+// both the flag and the config.json field and re-pins the coordinated values, so
 // `ela --forcedrollbacktrigger= --forcedrollbackheight=4294967295` still resolves to
-// target 2260450 and still arms. An operator following our own instructions on
-// restart day would have got a node that did not start and an explanation that was
-// not true. The predicate is config.IsMainNetActiveNet, the same label set the pin
-// switches on.
+// target 2260450 and still arms. The predicate is config.IsMainNetActiveNet, the same
+// label set the pin switches on.
 func (b *BlockChain) forcedRollbackDisarmRemedy() string {
 	if config.IsMainNetActiveNet(b.chainParams.ActiveNet) {
 		return "There is NO disarm on mainnet: --forcedrollbacktrigger and " +
@@ -163,16 +161,16 @@ type ForcedRollbackMarker struct {
 }
 
 // flushStore makes everything the rewind has written so far durable, so that the
-// next statement about the store -- a census, a log line an operator acts on, or the
-// clearing of the in-progress marker -- describes disk rather than the ffldb write
+// next statement about the store, a store scan, a log line an operator acts on, or
+// the clearing of the in-progress marker, describes disk rather than the ffldb write
 // cache. `what` names the work being made durable, for the error message.
 //
-// It is deliberately explicit at each call site rather than hidden inside the write
-// helpers: the rewind commits many small transactions, and flushing every one would
-// turn a 145-block mainnet rewind into 145 leveldb table writes without buying any
-// correctness -- the per-block ordering already makes an interrupted rewind resumable
-// whatever has reached disk. What matters is that a flush has run before anything
-// CLAIMS the work is done.
+// It is explicit at each call site rather than hidden inside the write helpers: the
+// rewind commits many small transactions, and flushing every one would turn a
+// 145-block mainnet rewind into 145 leveldb table writes without buying any
+// correctness, because the per-block ordering already makes an interrupted rewind
+// resumable whatever has reached disk. What matters is that a flush has run before
+// anything claims the work is done.
 func (b *BlockChain) flushStore(what string) error {
 	if err := b.db.GetFFLDB().FlushCache(); err != nil {
 		return fmt.Errorf("forced rollback: flush %s to disk: %w", what, err)
@@ -283,32 +281,32 @@ func (b *BlockChain) forcedRollbackPhase(hash *common.Uint256) (blockRollbackPha
 
 // RollbackOneBlock durably discards exactly one block from the tip.
 //
-// It is EXPORTED because it has two production callers, and they must not be two
+// It is exported because it has two production callers, and they must not be two
 // implementations. ForceRollback drives it on the automatic boot path, and
-// `ela-cli rollback` -- the offline remedy every forced-rollback refusal message
-// names -- drives it too. The manual command used to carry its own hand-copied
-// three-transaction sequence: it had picked up the header-row-last ORDERING, so an
-// interrupted run left the block in the index and resumable, but it had none of the
-// phase probe below, so the resumed run re-fetched the block and re-ran
-// RollbackBlock over a rollback that had already committed -- re-applying
-// per-transaction rollback processors that are not idempotent -- or, once the raw
-// entry was gone, failed on the fetch and could never finish at all.
+// `ela-cli rollback`, the offline remedy every forced-rollback refusal message
+// names, drives it too. A hand-copied three-transaction sequence in the manual
+// command carried the header-row-last ordering, so an interrupted run left the
+// block in the index and resumable, but it had none of the phase probe below, so
+// the resumed run re-fetched the block and re-ran RollbackBlock over a rollback
+// that had already committed, re-applying per-transaction rollback processors that
+// are not idempotent, or, once the raw entry was gone, failed on the fetch and
+// could never finish at all.
 //
-// ORDERING IS THE FIX. The shipped sequence was three separate database
-// transactions in the order
+// The ordering is the load-bearing part. Three separate database transactions in
+// the order
 //
 //	T1 DBRemoveBlockNode  ->  T2 RollbackBlock  ->  T3 DBRemoveBlockFromStore
 //
-// and T1 destroys the block-header-index row that b.Nodes is rebuilt from at
-// startup (chainio.go initChainState), while b.Nodes drives BOTH the arming
-// predicate and the rewind loop's bound. An interruption or a T2 error between T1
-// and T2 therefore made that block permanently un-rollbackable, and because
-// main.go exits on the error, each operator restart ate one more header row until
-// the node booted silently at exactly the target with none of the discarded blocks
-// rolled back -- on mainnet that residue includes block 2,260,451, the exploit
-// block. PROVEN on a live ffldb harness.
+// cannot work, because T1 destroys the block-header-index row that b.Nodes is
+// rebuilt from at startup (chainio.go initChainState), while b.Nodes drives both
+// the arming predicate and the rewind loop's bound. An interruption or a T2 error
+// between T1 and T2 makes that block permanently un-rollbackable, and because
+// main.go exits on the error, each operator restart eats one more header row until
+// the node boots silently at exactly the target with none of the discarded blocks
+// rolled back; on mainnet that residue includes block 2,260,451, the exploit block.
+// This was reproduced on a live ffldb harness.
 //
-// The sequence is now
+// The sequence is therefore
 //
 //	RollbackBlock  ->  DBRemoveBlockFromStore  ->  DBRemoveBlockNode
 //
@@ -320,15 +318,15 @@ func (b *BlockChain) forcedRollbackPhase(hash *common.Uint256) (blockRollbackPha
 // Re-attempting is exactly-once because each step is skipped when the store shows
 // it already committed. That matters most for RollbackBlock, which runs the
 // per-transaction rollback processors inside the same atomic transaction that
-// deletes the main-chain index entry -- so "still main-chain indexed" is a sound,
+// deletes the main-chain index entry, so "still main-chain indexed" is a sound,
 // self-describing proof that those processors have not run.
 //
-// Two constraints pin the middle step's position and are preserved:
-// DBRemoveBlockFromStore cannot move BEFORE RollbackBlock, because
+// Two constraints pin the middle step's position and must be preserved:
+// DBRemoveBlockFromStore cannot move before RollbackBlock, because
 // ChainStore.handleRollbackBlockTask re-fetches the block by hash as a
 // precondition; and it must happen at all, because RollbackBlock leaves the raw
-// by-hash entry behind (residue #2) and a rolled-back node would otherwise keep
-// serving the discarded blocks over P2P getdata / RPC getblock.
+// by-hash entry behind and a rolled-back node would otherwise keep serving the
+// discarded blocks over P2P getdata / RPC getblock.
 func (b *BlockChain) RollbackOneBlock(node, prevNode *BlockNode) error {
 	fflDB := b.db.GetFFLDB()
 
@@ -415,11 +413,10 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 	depth := start - target
 
 	if forcedRollbackExceedsCapacity(start, target) {
-		// FV-18: the remedy used to print the POSITIONAL form `ela-cli rollback <N>`,
-		// which -- measured on this tree -- prints the subcommand help and exits 0
-		// without touching the store, so a runbook step checking the exit status
-		// recorded success for an operation that never happened. --height is required
-		// and is now the form printed.
+		// The remedy must print the --height form. The positional form
+		// `ela-cli rollback <N>` prints the subcommand help and exits 0 without touching
+		// the store, so a runbook step checking the exit status records success for an
+		// operation that never happened.
 		return fmt.Errorf("forced rollback depth %d exceeds history capacity %d; "+
 			"refusing to rewind incrementally, and refusing to start -- a node that "+
 			"cannot complete the rollback must not join the recovered network on the "+
@@ -508,14 +505,14 @@ func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
 	// mainnet 2,260,451 -- nothing lowers the height at all and it stays at the value
 	// initChainState derived from the surviving header row, i.e. target+1.
 	//
-	// MEASURED on the ffldb harness (crash after block target+1's rollback commits,
-	// then resume): chain.GetHeight()=target while ChainStore.GetHeight()=target+1,
-	// and ChainStore.handlePersistBlockTask then rejects the RECOVERED chain's
+	// On the ffldb harness, crashing after block target+1's rollback commits and then
+	// resuming leaves chain.GetHeight()=target while ChainStore.GetHeight()=target+1,
+	// and ChainStore.handlePersistBlockTask then rejects the recovered chain's
 	// replacement block at target+1 with "block height less than current block
 	// height". The node rolls back correctly, reports success, and can never accept
-	// the first block of the chain it was rolled back FOR. Setting it here is
-	// unconditional and idempotent: on a clean run it restates what the last
-	// rollback transaction already wrote.
+	// the first block of the chain it was rolled back for. Setting it here is
+	// unconditional and idempotent: on a clean run it restates what the last rollback
+	// transaction already wrote.
 	b.db.SetHeight(uint32(len(b.Nodes) - 1))
 
 	// The per-iteration purge above walks only the accepted main chain (b.Nodes), so
@@ -609,7 +606,7 @@ func (b *BlockChain) VerifyForcedRollbackComplete() error {
 //
 // It must only be called when a forced rollback is configured for this network.
 func (b *BlockChain) CheckForcedRollbackResidue() error {
-	// The census and the classification live in DiagnoseForcedRollbackResidue, so
+	// The store scan and the classification live in DiagnoseForcedRollbackResidue, so
 	// that `ela-cli preflight` predicts this boot with the code that decides it
 	// rather than with a copy of its conditions.
 	d, err := b.DiagnoseForcedRollbackResidue()

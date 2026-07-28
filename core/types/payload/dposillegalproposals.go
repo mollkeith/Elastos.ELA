@@ -105,21 +105,20 @@ func (d *DPOSIllegalProposals) Hash() common.Uint256 {
 	return *d.hash
 }
 
-// DedupHash returns the SpecialTxHashes dedup key for illegal-PROPOSAL evidence.
+// DedupHash returns the SpecialTxHashes dedup key for illegal-proposal evidence.
 //
-// NX-08: F-030 folded the dedup key by logical identity for DPOSIllegalBlocks only;
-// DPOSIllegalProposals fell through to the raw payload Hash(), which serialises the whole
-// ProposalEvidence INCLUDING the raw BlockHeader blob. That blob is constrained only by
-// header.Deserialize succeeding, header.Height == evidence.BlockHeight and
-// header.Hash().IsEqual(evidence.Proposal.BlockHash) -- and Header.Deserialize discards a
-// trailing sentinel byte without asserting the buffer was consumed, so ARBITRARY TRAILING
-// BYTES survive into the stored blob and into Hash(). One genuine, unforgeable
-// equivocation therefore yielded unboundedly many distinct dedup keys, defeating
-// State.SpecialTxExists / recordSpecialTx and the CheckSameBlockConflicts illegal-evidence
-// arm, and permanently growing SpecialTxHashes (which is serialized into every DPoS
-// keyframe/checkpoint) with attacker-chosen input.
+// Without it DPOSIllegalProposals falls through to the raw payload Hash(), which
+// serialises the whole ProposalEvidence including the raw BlockHeader blob. That blob
+// is constrained only by header.Deserialize succeeding, header.Height ==
+// evidence.BlockHeight and header.Hash().IsEqual(evidence.Proposal.BlockHash), and
+// Header.Deserialize discards a trailing sentinel byte without asserting the buffer was
+// consumed, so arbitrary trailing bytes survive into the stored blob and into Hash().
+// One genuine, unforgeable equivocation therefore yields unboundedly many distinct
+// dedup keys, defeating State.SpecialTxExists / recordSpecialTx and the
+// CheckSameBlockConflicts illegal-evidence arm, and permanently growing SpecialTxHashes
+// (which is serialized into every DPoS keyframe/checkpoint) with attacker-chosen input.
 //
-// At and above the gate this keys on the LOGICAL equivocation identity instead: the two
+// At and above the gate this keys on the logical equivocation identity instead: the two
 // DPOSProposal hashes in canonical order plus the evidenced BlockHeight, with the
 // BlockHeader blob excluded entirely. DPOSProposal.Hash() is SerializeUnsigned (sponsor,
 // block hash, view offset) so it is signature-malleability-proof too. Below the gate it
@@ -127,9 +126,9 @@ func (d *DPOSIllegalProposals) Hash() common.Uint256 {
 // byte-identically. Mirrors DPOSIllegalBlocks.DedupHash so the families stay symmetric.
 // The domain tag keeps the proposal / vote / block key spaces disjoint.
 //
-// Census support (PROVEN, ~/ela-repro/mainnet-copy, 2,260,597 blocks): 13
-// IllegalProposalEvidence and 269 IllegalVoteEvidence transactions in ALL history, and
-// ZERO of either at or above the gate -- so re-keying touches zero real history.
+// Retained history is untouched by the re-keying: there are 13
+// IllegalProposalEvidence and 269 IllegalVoteEvidence transactions in all of
+// history, and none of either at or above the gate.
 func (d *DPOSIllegalProposals) DedupHash(strictActive bool) common.Uint256 {
 	if !strictActive {
 		return d.Hash()

@@ -63,11 +63,11 @@ func (t *DposV2ClaimRewardRealWithdrawTransaction) SpecialContextCheck() (result
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid real withdraw transaction hashes count")), true
 	}
 
-	// F-015: real-withdraw txs are EXEMPT from RunPrograms, so the ONLY authorization is
-	// that the inputs come from the treasury. Bind every input AND the change output to the
+	// Real-withdraw txs are exempt from RunPrograms, so the only authorization is that
+	// the inputs come from the treasury. Bind every input and the change output to the
 	// DPoSV2 reward accumulate pool (the source honest DposV2 real-withdraws draw from),
-	// else an attacker funds the withdraw from a VICTIM UTXO and pockets the unbound change.
-	// Gated for replay-safety.
+	// else an attacker funds the withdraw from a victim UTXO and pockets the unbound
+	// change. Gated for replay-safety.
 	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
 		rewardPool := t.parameters.Config.DPoSConfiguration.DPoSV2RewardAccumulateProgramHash
 		for _, ref := range t.references {

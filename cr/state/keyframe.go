@@ -750,11 +750,11 @@ func (kf *KeyFrame) Snapshot() *KeyFrame {
 	frame.AppropriationAmount = kf.AppropriationAmount
 	frame.CommitteeUsedAmount = kf.CommitteeUsedAmount
 	frame.Members = copyMembersMap(kf.Members)
-	// F-145: NextMembers, ClaimedDPoSKeys and NextClaimedDPoSKeys are part of the
-	// KeyFrame and are written by the disk Serialize path (serializeMembersMap /
-	// serializeClaimedDPoSKeysMap), but were left out of the in-memory snapshot, so
-	// a snapshot silently dropped the next-term committee and the claimed DPoS node
-	// keys and compared equal to a state that had lost them.
+	// NextMembers, ClaimedDPoSKeys and NextClaimedDPoSKeys are part of the KeyFrame
+	// and are written by the disk Serialize path (serializeMembersMap /
+	// serializeClaimedDPoSKeysMap), so the in-memory snapshot must copy them too.
+	// Omitting them makes a snapshot silently drop the next-term committee and the
+	// claimed DPoS node keys, and compare equal to a state that has lost them.
 	frame.NextMembers = copyMembersMap(kf.NextMembers)
 	frame.ClaimedDPoSKeys = copyClaimedDPoSKeysMap(kf.ClaimedDPoSKeys)
 	frame.NextClaimedDPoSKeys = copyClaimedDPoSKeysMap(kf.NextClaimedDPoSKeys)
@@ -818,9 +818,9 @@ func (kf *StateKeyFrame) SerializeProgramHashVotesInfoMap(vmap map[common.Uint16
 		if err = k.Serialize(w); err != nil {
 			return
 		}
-		// F-143: both of these writes discarded their error while every neighbouring
-		// write in this file checks its own, so a short or failing write truncated the
-		// keyframe and the caller was told the checkpoint had serialized cleanly.
+		// Both of these writes must check their error, as every neighbouring write in
+		// this file does. Discarding it lets a short or failing write truncate the
+		// keyframe while the caller is told the checkpoint serialized cleanly.
 		if err = common.WriteVarUint(w, uint64(len(v))); err != nil {
 			return
 		}
@@ -1969,10 +1969,11 @@ func (p *ProposalKeyFrame) deserializeWithdrawableTransactionsMap(r io.Reader) (
 		if err = withdrawInfo.Deserialize(r); err != nil {
 			return
 		}
-		// F-142: store the deserialized entry. The loop read hash+info off the wire
-		// but never inserted it, so every CR checkpoint round-trip / restart returned
-		// an EMPTY map — wiping the CRC RealWithdraw pending queue (WithdrawableTxInfo)
-		// -> peer desync. Mirror the serialize side.
+		// Store the deserialized entry. Reading hash and info off the wire without
+		// inserting them makes every CR checkpoint round-trip and restart return an
+		// empty map, which wipes the CRC RealWithdraw pending queue
+		// (WithdrawableTxInfo) and desyncs the node from its peers. Mirror the
+		// serialize side.
 		withdrawableTxsMap[hash] = withdrawInfo
 	}
 	return

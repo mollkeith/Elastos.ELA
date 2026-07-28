@@ -82,15 +82,15 @@ func (l *Ledger) GetLocalBlockChainHeight() uint32 {
 	return l.Blockchain.GetHeight()
 }
 
-// ErrDposBlockRecoveryUnimplemented is returned by the DPoS block-recovery
-// entry points below. F-137: both were `//todo complete me` stubs that returned
-// a nil error, so every caller was told the recovery had SUCCEEDED while nothing
-// at all had happened. The protocol they belong to is inert end to end (the only
-// GetBlocks sender is commented out at dpos/manager/dposmanager.go:816 and
-// DPOSHandlerSwitch.ResponseGetBlocks has a fully commented-out body), so
-// failing loudly changes no live behaviour - it only stops the silent success.
-// Deliberately NOT re-implemented: reviving a dormant consensus-recovery path is
-// an owner/core-engineer decision, not a hardening change.
+// ErrDposBlockRecoveryUnimplemented is returned by the DPoS block-recovery entry
+// points below. Both are unimplemented; returning a nil error instead would tell
+// every caller the recovery had succeeded while nothing at all had happened. The
+// protocol they belong to is inert end to end (the only GetBlocks sender is
+// commented out at dpos/manager/dposmanager.go:816 and
+// DPOSHandlerSwitch.ResponseGetBlocks has a fully commented-out body), so failing
+// loudly changes no live behaviour, it only stops the silent success. Reviving a
+// dormant consensus-recovery path is an owner and core-engineer decision, so the
+// entry points are not implemented here.
 var ErrDposBlockRecoveryUnimplemented = errors.New(
 	"[Ledger] DPoS block recovery is not implemented")
 
