@@ -95,6 +95,53 @@ func (s *Settings) SetupConfig(withScrew bool, about string, version string) *co
 				"to be MAINNET it will refuse to start (F-043 part 2 / G3).\n", conf.ActiveNet)
 	}
 
+	// Pin the three block-shape limits on MAINNET before they reach the pact
+	// globals. Each is settable from config.json and by CLI flag, each is a
+	// consensus rule, and a node that differs from the fleet on any of them
+	// PERMANENTLY PARTITIONS: it accepts blocks the fleet rejects, or rejects
+	// blocks the fleet accepts, at every height, with no gate and no recovery.
+	//
+	// This pin has to live HERE rather than in enforceCoordinatedMainnetParameters
+	// (which runs later, at the enforceCoordinatedMainnetParameters call below):
+	// by the time that function runs, the assignments beneath this comment have
+	// already copied the operator's value into the pact globals, and pinning the
+	// Configuration field afterwards would not undo it. That ordering is exactly
+	// why this was missed when DPoSV2StartHeight and the Schnorr heights were
+	// pinned -- those are read from Configuration at use time, these are not.
+	//
+	// Values are the compiled-in mainnet defaults, so a correctly configured
+	// mainnet node sees NO change; only an override is discarded, loudly.
+	// Non-mainnet is untouched: testnet legitimately runs a larger block.
+	if !testNet && isMainNetName(conf.ActiveNet) {
+		const (
+			mainnetMaxBlockContextSize = 2000000
+			mainnetMaxTxPerBlock       = 10000
+		)
+		if conf.MaxBlockSize != 0 && conf.MaxBlockSize != mainnetMaxBlockContextSize {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: ignoring mainnet MaxBlockSize %d - pinned to the coordinated "+
+					"mainnet value %d. A node using the supplied value would accept or "+
+					"reject blocks the rest of the network does not, at every height, "+
+					"and would be permanently partitioned.\n",
+				conf.MaxBlockSize, mainnetMaxBlockContextSize)
+		}
+		conf.MaxBlockSize = mainnetMaxBlockContextSize
+		if conf.MaxTxPerBlock != 0 && conf.MaxTxPerBlock != mainnetMaxTxPerBlock {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: ignoring mainnet MaxTxPerBlock %d - pinned to the coordinated "+
+					"mainnet value %d (same partition risk as MaxBlockSize).\n",
+				conf.MaxTxPerBlock, mainnetMaxTxPerBlock)
+		}
+		conf.MaxTxPerBlock = mainnetMaxTxPerBlock
+		if conf.MaxBlockHeaderSize != 0 {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: ignoring mainnet MaxBlockHeaderSize %d - mainnet uses the "+
+					"compiled-in default (same partition risk as MaxBlockSize).\n",
+				conf.MaxBlockHeaderSize)
+			conf.MaxBlockHeaderSize = 0
+		}
+	}
+
 	if conf.MaxBlockSize > 0 {
 		pact.MaxBlockContextSize = conf.MaxBlockSize
 	} else if !testNet {
@@ -551,4 +598,19 @@ func NewSettings() *Settings {
 		viper: viper.New(),
 	}
 	return settings
+}
+
+// isMainNetName reports whether an ActiveNet string selects the MAINNET chain
+// parameters. It mirrors the switch in SetupConfig exactly, including the F-043
+// case: an EMPTY or UNRECOGNISED name keeps the mainnet params (the switch there
+// has no default), so it must be treated as mainnet here too. Getting that wrong
+// in the permissive direction would leave a typo-mainnet node running unpinned
+// block limits, which is the partition this pin exists to prevent.
+func isMainNetName(activeNet string) bool {
+	switch strings.ToLower(strings.TrimSpace(activeNet)) {
+	case "testnet", "test", "regnet", "regtest", "reg":
+		return false
+	default:
+		return true
+	}
 }
