@@ -210,6 +210,26 @@ func newConflictManager() conflictManager {
 						Type: common2.UpdateProducer,
 						Func: strDPoSOwnerNodePublicKeys,
 					},
+					// NX-10b: CRCouncilMemberClaimNode belongs in this UNION slot, not only
+					// in slotDPoSNodePublicKey. blockchain.CheckSameBlockConflicts folds the
+					// claimed node key into the same producerCRKeys map that already holds
+					// producer OWNER keys, so "RegisterProducer.OwnerKey == claimed node key"
+					// is a BLOCK conflict. Without this pair it was not a MEMPOOL conflict:
+					// both transactions were admitted, GenerateBlock (which never runs
+					// CheckSameBlockConflicts) packed both, the block failed its own sanity
+					// check, and nothing evicted either transaction -- so every proposer
+					// repeated the failure. A durable halt, reachable by one CR seat plus one
+					// producer deposit.
+					//
+					// UNGATED, and it cannot affect consensus: the conflict manager is
+					// admission-only. It is referenced nowhere outside mempool/, and every
+					// AppendToTxPool call site is P2P relay, RPC or the DPoS manager. No
+					// retained block changes verdict because no block validation path reads
+					// this structure at all.
+					keyTypeFuncPair{
+						Type: common2.CRCouncilMemberClaimNode,
+						Func: strCRManagementPublicKeys,
+					},
 				),
 			},
 			// CR claim DPOS node public key

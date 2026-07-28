@@ -21,7 +21,10 @@ func TestF050SchnorrShortParameter(t *testing.T) {
 
 	prog := program.Program{Code: code, Parameter: make([]byte, 10)}
 
-	ok, err := checkSchnorrSignatures(prog, [32]byte{})
+	// Height 0 against a never-reached gate, so this asserts the short-Parameter
+	// rejection is UNGATED. See checkSchnorrSignatures for why the short half
+	// needs no gate: the base panicked on it, so no retained block carries one.
+	ok, err := checkSchnorrSignatures(prog, [32]byte{}, 0, ^uint32(0))
 	if ok {
 		t.Fatal("expected checkSchnorrSignatures to fail on a short Parameter")
 	}

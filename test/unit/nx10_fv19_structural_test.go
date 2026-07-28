@@ -50,7 +50,7 @@ import (
 var identitySlots = map[string][]string{
 	"slotDPoSOwnerPublicKey":           {"RegisterProducer", "UpdateProducer", "CancelProducer", "RegisterCR"},
 	"slotDPoSNodePublicKey":            {"RegisterProducer", "UpdateProducer", "ActivateProducer", "RegisterCR", "CRCouncilMemberClaimNode"},
-	"slotDPoSOwnerNodePublicKeys":      {"RegisterProducer", "UpdateProducer"},
+	"slotDPoSOwnerNodePublicKeys":      {"RegisterProducer", "UpdateProducer", "CRCouncilMemberClaimNode"},
 	"slotDPoSNickname":                 {"RegisterProducer", "UpdateProducer"},
 	"slotCRCouncilMemberNodePublicKey": {"CRCouncilMemberClaimNode"},
 	"slotCRCouncilMemberDID":           {"CRCouncilMemberClaimNode"},
@@ -88,6 +88,15 @@ var slotMirrors = []mirror{
 	// slotDPoSOwnerNodePublicKeys — the owner<->node cross-namespace array slot.
 	{"slotDPoSOwnerNodePublicKeys", "RegisterProducer", "CheckSameBlockConflicts", "dedupHexKeys", "F-100"},
 	{"slotDPoSOwnerNodePublicKeys", "UpdateProducer", "CheckSameBlockConflicts", "dedupHexKeys", "NX-10/FV-08: added by this batch"},
+	// NX-10b: the LAST member of the block-level producerCRKeys union that the mempool did
+	// not mirror. blockvalidator.go feeds the claimed node key into producerCRKeys, which
+	// already holds producer OWNER keys, so "RegisterProducer.OwnerKey == claimed node key"
+	// was a BLOCK conflict and not a MEMPOOL conflict. GenerateBlock never runs
+	// CheckSameBlockConflicts, so both transactions were admitted, packed, and the block
+	// failed its own sanity check with nothing evicting either one: a durable halt of block
+	// production reachable by one CR council seat plus one producer deposit. Joining this
+	// array slot closes the drift this file was written to detect.
+	{"slotDPoSOwnerNodePublicKeys", "CRCouncilMemberClaimNode", "CheckSameBlockConflicts", "producerCRKeys", "NX-10b: added by this batch"},
 
 	// slotDPoSNickname — FV-08's genuinely new half; there was NO block-level nickname
 	// structure before this batch.

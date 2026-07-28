@@ -2354,6 +2354,32 @@ func (b *BlockChain) ReorganizeChain2(block *Block) error {
 func (b *BlockChain) processBlock(block *Block, confirm *payload.Confirm) (bool, bool, error) {
 	blockHash := block.Hash()
 
+	// FR-BAN: the forced-rollback trigger block is refused permanently, before anything
+	// else touches it. See the file header on ForcedRollbackArmed for why the trigger is
+	// parsed in REVERSED byte order: the config value is written in display order so an
+	// operator can check it against a block explorer, and using the non-reversed parse
+	// silently disarms the comparison.
+	//
+	// This must come before the exists check, the orphan map and CheckBlockSanity, because
+	// the damage is done by RETAINING the block, not by connecting it. connectBestChain's
+	// side-chain arm caches it unvalidated and returns (false,false,nil), which
+	// mempool/blockpool.go reads as "not main chain, not orphan" and answers by calling
+	// CheckConfirmedBlockOnFork. That builds DPOSIllegalBlocks from both confirms, and
+	// dpos/state punishes the INTERSECTION of their signers -- which for two confirms of
+	// one height is the entire arbiter set. Below the 25-of-36 threshold the chain halts.
+	//
+	// UNGATED and it needs no gate: this only ever REJECTS, it names a single hash above
+	// the rollback target, and a node that already holds the block still arms the rewind
+	// from the stored index rather than through this path.
+	if trigger := b.chainParams.ForcedRollbackTrigger; trigger != "" {
+		if triggerHash, err := Uint256FromReversedHexString(trigger); err == nil {
+			if blockHash.IsEqual(*triggerHash) {
+				return false, false, fmt.Errorf("block %s is the forced-rollback trigger "+
+					"and is permanently rejected", blockHash)
+			}
+		}
+	}
+
 	log.Debugf("[ProcessBLock] height = %d, hash = %x", block.Header.Height, blockHash.Bytes())
 
 	// The block must not already exist in the main chain or side chains.

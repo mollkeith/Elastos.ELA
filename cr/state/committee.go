@@ -1333,7 +1333,21 @@ func (c *Committee) RollbackTo(height uint32) error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	currentHeight := c.committeeHistory.Height()
-	for i := currentHeight - 1; i >= height; i-- {
+	// Guard BOTH unsigned underflows. currentHeight is uint32, so:
+	//   currentHeight == 0      -> currentHeight-1 wraps to 4,294,967,295 and the loop
+	//                              runs ~4.29 billion iterations at six sub-rollbacks
+	//                              each, holding c.mtx. Committee.Recover installs fresh
+	//                              histories at height 0 and runs from OnInit on every
+	//                              boot's checkpoint restore, so this is precisely the
+	//                              post-rewind state.
+	//   height == 0             -> `i >= height` is permanently true for an unsigned
+	//                              counter, so the loop never terminates even from a sane
+	//                              start.
+	// Nothing to roll back when the history is already at or below the target.
+	if currentHeight == 0 || currentHeight-1 < height {
+		return nil
+	}
+	for i := currentHeight - 1; ; i-- {
 		if err := c.appropriationHistory.RollbackTo(i); err != nil {
 			log.Debug("committee appropriationHistory rollback err:", err)
 		}
@@ -1351,6 +1365,10 @@ func (c *Committee) RollbackTo(height uint32) error {
 		}
 		if err := c.firstHistory.RollbackTo(i); err != nil {
 			log.Debug("committee first History rollback err:", err)
+		}
+		// Break BEFORE decrementing so i never underflows when height == 0.
+		if i == height {
+			break
 		}
 	}
 

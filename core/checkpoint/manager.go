@@ -25,7 +25,6 @@ import (
 	"github.com/elastos/Elastos.ELA/utils"
 )
 
-// todo remove this
 const (
 	txpoolCheckpointKey = "cp_txPool"
 	dposCheckpointKey   = "cp_dpos"
@@ -33,6 +32,70 @@ const (
 
 	MaxCheckPointFilesCount int = 36
 )
+
+// registeredCheckpointKeys is the complete set of keys a node registers with a
+// Manager. There are exactly three registration sites and all three are
+// unconditional constructor calls: mempool.NewTxPool (mempool/txpool.go:735)
+// registers cp_txPool, state.NewArbitrators (dpos/state/arbitrators.go:3659)
+// registers cp_dpos and state.NewCommittee (cr/state/committee.go:2176) registers
+// cp_cr. wallet.CoinsCheckPoint ("utxo") and indexers.Checkpoint ("utx") also
+// implement ICheckPoint but nothing ever registers them, so nothing ever restores
+// them either.
+//
+// Why this belongs here rather than in the caller: Restore walks the REGISTERED
+// checkpoints and builds each path from the checkpoint's own Key()
+// (getCheckpointDirectory, below). It never lists the checkpoints directory. So a
+// directory under <dataDir>/checkpoints whose name is not one of these keys is
+// never opened by a start, whatever height its files carry.
+//
+// blockchain.PredictRestoredCheckpointMaxHeight predicts MaxHeight() from that
+// on-disk layout, and it used to hold its own copy of the "cp_txPool" literal and
+// treat every OTHER directory as a real checkpoint. An operator backup named
+// cp_txPool.bak is not equal to "cp_txPool", so the prediction counted it, and the
+// tx-pool snapshot tracks the chain tip. The two sets now read this one table.
+//
+// Registering a new ICheckPoint means adding its key here.
+var registeredCheckpointKeys = map[string]struct{}{
+	crCheckpointKey:     {},
+	dposCheckpointKey:   {},
+	txpoolCheckpointKey: {},
+}
+
+// IsRegisteredCheckpointKey reports whether key names a checkpoint a node actually
+// registers, and therefore whether a directory of that name under the checkpoints
+// root is one a start will read.
+func IsRegisteredCheckpointKey(key string) bool {
+	_, ok := registeredCheckpointKeys[key]
+	return ok
+}
+
+// RegisteredCheckpointKeys returns the registered keys in sorted order.
+func RegisteredCheckpointKeys() []string {
+	keys := make([]string, 0, len(registeredCheckpointKeys))
+	for k := range registeredCheckpointKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// excludedFromMaxHeight is MaxHeight's skip rule, stated once. The tx-pool
+// checkpoint follows the chain tip rather than settled derived state, so it is
+// never a baseline for anything.
+func excludedFromMaxHeight(key string) bool {
+	return key == txpoolCheckpointKey
+}
+
+// CountedInMaxHeight reports whether a checkpoint DIRECTORY named key contributes to
+// MaxHeight(). It is the conjunction of the two facts that loop depends on: a
+// checkpoint has to be registered to be in m.checkpoints at all, and it must not be
+// the one key the loop skips.
+//
+// MaxHeight itself deliberately does not consult registeredCheckpointKeys -- see the
+// comment on the loop.
+func CountedInMaxHeight(key string) bool {
+	return IsRegisteredCheckpointKey(key) && !excludedFromMaxHeight(key)
+}
 
 type Priority byte
 type RollBackStatus byte
@@ -284,7 +347,7 @@ func (m *Manager) SafeHeight() uint32 {
 
 	height := uint32(math.MaxUint32)
 	for _, v := range m.checkpoints {
-		if v.Key() == "cp_txPool" {
+		if v.Key() == txpoolCheckpointKey {
 			continue
 		}
 		var recordHeight uint32
@@ -307,13 +370,23 @@ func (m *Manager) SafeHeight() uint32 {
 // the highest RESTORED snapshot-file height, because init replay advances state but
 // skips SetHeight. A forced rollback uses this to verify no restored snapshot sits
 // at or above the rewound target -- the case a min-based SafeHeight cannot detect.
+//
+// The skip rule is excludedFromMaxHeight so that this loop and
+// CountedInMaxHeight, which blockchain.PredictRestoredCheckpointMaxHeight uses to
+// predict this number from the on-disk layout, cannot disagree about it.
 func (m *Manager) MaxHeight() uint32 {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 
 	var height uint32
 	for _, v := range m.checkpoints {
-		if v.Key() == "cp_txPool" {
+		// Not CountedInMaxHeight: everything in m.checkpoints is registered by
+		// definition, and filtering on registeredCheckpointKeys here would make a
+		// checkpoint added later but not listed there drop OUT of this gate. That
+		// is the unsafe direction -- it would let a node start on derived state
+		// this was supposed to refuse. Counting whatever is registered is the
+		// fail-safe reading and it is what shipped.
+		if excludedFromMaxHeight(v.Key()) {
 			continue
 		}
 		if v.GetHeight() > height {

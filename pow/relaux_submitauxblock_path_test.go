@@ -440,10 +440,25 @@ func TestRelauxSubmitAuxBlockAuxPowEncodingGate(t *testing.T) {
 	encs := []struct {
 		name string
 		enc  relauxEnc
+		// normalised is true when SubmitAuxBlock repairs the encoding before validation,
+		// so the submission CONNECTS at the gate instead of being rejected.
+		//
+		// F-041 submission side: ParentHash is read by neither AuxPow.Check() nor
+		// CheckProofOfWork(), so deriving it from ParBlockHeader cannot invalidate a valid
+		// proof of work. Pools were never required to send it canonically and nothing
+		// enforced it, so rejecting instead of repairing would have stopped a pool's blocks
+		// from the first block of the restart -- and the restart necessarily begins in PoW,
+		// which makes that pool the only thing able to move the chain.
+		//
+		// ParMerkleIndex is NOT repaired and must stay rejected: AuxPow.Check() consumes it
+		// through GetMerkleRoot(ParCoinbaseTx.Hash(), ParCoinBaseMerkle, ParMerkleIndex), so
+		// forcing it to 0 could silently break a genuine merkle proof. Repairing only the
+		// field that no verifier reads is the whole distinction.
+		normalised bool
 	}{
-		{"display-order ParentHash", relauxDisplayOrder},
-		{"zero ParentHash", relauxZeroParent},
-		{"malleated ParMerkleIndex", relauxBadMerkleIndex},
+		{"display-order ParentHash", relauxDisplayOrder, true},
+		{"zero ParentHash", relauxZeroParent, true},
+		{"malleated ParMerkleIndex", relauxBadMerkleIndex, false},
 	}
 
 	for _, e := range encs {
@@ -451,6 +466,19 @@ func TestRelauxSubmitAuxBlockAuxPowEncodingGate(t *testing.T) {
 		t.Run(e.name+"/at gate", func(t *testing.T) {
 			h := relauxNode(t, relauxGate)
 			err := relauxSubmit(t, h, relauxMined(t, h), e.enc)
+
+			if e.normalised {
+				if err != nil {
+					t.Fatalf("%s must be NORMALISED by SubmitAuxBlock and CONNECT at the "+
+						"gate, got: %s", e.name, relauxDeep(err))
+				}
+				if got := h.chain.GetHeight(); got != relauxGate {
+					t.Fatalf("a normalised submission must connect: expected tip %d, got %d",
+						relauxGate, got)
+				}
+				return
+			}
+
 			if err == nil {
 				t.Fatalf("%s must be REJECTED at the gate; the block connected "+
 					"instead (tip %d)", e.name, h.chain.GetHeight())
@@ -803,22 +831,52 @@ func TestRelauxSubmitAuxBlockAtMainnetGateHeight(t *testing.T) {
 		})
 	}
 
-	// Every non-canonical encoding is refused at and above the gate.
+	// At and above the gate, a non-canonical encoding is either REPAIRED by SubmitAuxBlock
+	// or refused. Which of the two depends on whether a verifier reads the field.
+	//
+	// ParentHash is read by neither AuxPow.Check() nor CheckProofOfWork(), so deriving it
+	// from ParBlockHeader cannot invalidate a valid proof of work. Repairing it is what
+	// keeps the restart minable by a pool whose stratum software was never required to send
+	// the field canonically -- and since the restart necessarily begins in PoW, that pool is
+	// the only thing that can move the chain.
+	//
+	// ParMerkleIndex IS read, through
+	// GetMerkleRoot(ParCoinbaseTx.Hash(), ParCoinBaseMerkle, ParMerkleIndex), so forcing it
+	// would risk silently breaking a genuine merkle proof. It stays refused.
 	for _, e := range []struct {
-		name string
-		enc  relauxEnc
+		name       string
+		enc        relauxEnc
+		normalised bool
 	}{
-		{"display-order ParentHash", relauxDisplayOrder},
-		{"zero ParentHash", relauxZeroParent},
-		{"malleated ParMerkleIndex", relauxBadMerkleIndex},
+		{"display-order ParentHash", relauxDisplayOrder, true},
+		{"zero ParentHash", relauxZeroParent, true},
+		{"malleated ParMerkleIndex", relauxBadMerkleIndex, false},
 	} {
 		e := e
-		t.Run(e.name+" refused at the gate", func(t *testing.T) {
+		label := " refused at the gate"
+		if e.normalised {
+			label = " normalised and cleared at the gate"
+		}
+		t.Run(e.name+label, func(t *testing.T) {
 			h := newNode(t)
 			err := relauxSubmit(t, h, relauxBlockAt(t, h, gate), e.enc)
-			if !strings.Contains(relauxDeep(err), relauxNonCanonicalErr) {
+			got := relauxDeep(err)
+
+			if e.normalised {
+				if strings.Contains(got, relauxNonCanonicalErr) {
+					t.Fatalf("%s must be REPAIRED by SubmitAuxBlock and clear the gate at "+
+						"height %d; it was refused instead: %s", e.name, gate, got)
+				}
+				if !strings.Contains(got, relauxPastSanityErr) {
+					t.Fatalf("%s: expected the repaired submission to reach "+
+						"maybeAcceptBlock, got: %s", e.name, got)
+				}
+				return
+			}
+
+			if !strings.Contains(got, relauxNonCanonicalErr) {
 				t.Fatalf("%s must be refused at height %d, got: %s",
-					e.name, gate, relauxDeep(err))
+					e.name, gate, got)
 			}
 		})
 

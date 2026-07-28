@@ -453,7 +453,34 @@ func (pow *Service) SubmitAuxBlock(hash *common.Uint256, auxPow *auxpow.AuxPow) 
 		return fmt.Errorf("block hash unknown")
 	}
 
-	msgAuxBlock.Header.AuxPow = *auxPow
+	// F-041 submission side: derive ParentHash rather than trusting the submitter.
+	//
+	// At and above gate 1 CheckBlockSanity rejects a non-canonical AuxPow, but nothing has
+	// ever enforced canonicality on this path: AuxPow.Check() and CheckProofOfWork() never
+	// read ParentHash, so any 32 bytes verify and only pool convention made it canonical.
+	// A pool whose stratum software sends the display-order hash, or leaves the field zero,
+	// has every submission rejected from the first block of the restart. Since the restart
+	// necessarily begins in PoW (the rewound tip is stale, so arbiters drop the first block
+	// before it reaches consensus), that pool is the only thing that can move the chain.
+	//
+	// Deriving it here removes the dependency on third-party software entirely instead of
+	// betting on it. It cannot invalidate a valid proof of work, because neither verifier
+	// reads the field.
+	//
+	// ParMerkleIndex is deliberately NOT normalised: AuxPow.Check() DOES consume it, via
+	// GetMerkleRoot(ParCoinbaseTx.Hash(), ParCoinBaseMerkle, ParMerkleIndex), so forcing it
+	// to 0 could silently break a genuine merkle proof. A malleated index keeps its existing
+	// gate rejection.
+	//
+	// UNGATED, and it needs no gate: this is block PRODUCTION. Retained blocks arrive from
+	// peers over P2P and never pass through SubmitAuxBlock, so no retained block's verdict
+	// can change. Same doctrine as the B2 SolveBlock stamp.
+	//
+	// Normalised on a COPY so the caller's structure is left exactly as the pool sent it.
+	canonicalAuxPow := *auxPow
+	canonicalAuxPow.ParentHash = canonicalAuxPow.ParBlockHeader.Hash()
+
+	msgAuxBlock.Header.AuxPow = canonicalAuxPow
 	_, _, err := pow.blkMemPool.AddDposBlock(&types.DposBlock{
 		Block: msgAuxBlock,
 	})

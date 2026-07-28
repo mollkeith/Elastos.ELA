@@ -1209,7 +1209,49 @@ func (a *Arbiters) distributeWithNormalArbitratorsV3(height uint32, reward commo
 		return roundReward, reward, nil
 	}
 	log.Debugf("totalTopProducersReward totalTopProducersReward %f", totalTopProducersReward)
-	rewardPerVote := totalTopProducersReward / float64(totalVotesInRound)
+	// Guard div-by-zero. totalVotesInRound is the snapshot sum of producer.Votes() over the
+	// non-CRC arbiters and candidates (snapshotVotesStates), and NOTHING above forces it
+	// non-zero: the early return rejects only an empty or an all-CRC arbiter set, so a round
+	// whose elected producers all hold zero votes reaches this line. Pristine then divides by
+	// zero and every per-producer reward becomes Fixed64 of a NaN or a +Inf.
+	//
+	// That is not merely a wrong number, it is a consensus split. Go leaves an out-of-range
+	// float-to-int conversion implementation-dependent, and it genuinely differs. MEASURED,
+	// same source and same inputs, reward 100 ELA and totalVotesInRound 0:
+	//   amd64: floor(0*rpv)=NaN -> -9223372036854775808, floor(v*rpv)=+Inf -> -9223372036854775808
+	//   arm64: floor(0*rpv)=NaN ->                    0, floor(v*rpv)=+Inf ->  9223372036854775807
+	// CheckCoinbaseArbitratorsReward compares these to the coinbase exactly, so an amd64 node
+	// and an arm64 node disagree on the same block. The change<0 backstop in
+	// distributeDPOSReward does NOT catch the amd64 case: realDPOSReward goes hugely negative,
+	// so change = reward - realDPOSReward goes POSITIVE and passes.
+	//
+	// NOT height-gated. No new gate is permitted and neither existing gate would work:
+	//  1. distributeDPOSReward is reachable only at heights <= DPoSV2ActiveHeight.
+	//     clearingDPOSReward is called from forceChange only when !isDPoSV2Run, and from the
+	//     normalChange leg only when !isDPoSV2Run or height == DPoSV2ActiveHeight.
+	//     DPoSV2ActiveHeight is a monotone latch, set once and never cleared except by the
+	//     reorg-undo of the entry that set it, and on mainnet it sits far below the retained
+	//     tip. Both permitted gates (StrictMoneyRangeHeight 2260451, RevisedDPoSRewardHeight
+	//     2265000) are ABOVE it, so gating here makes the guard unreachable on mainnet and
+	//     buys nothing at all.
+	//  2. On retained history the guard is inert unless totalVotesInRound was 0 on some block
+	//     at or below 2260450. If it ever was, that block has no single verdict to preserve
+	//     (see the measurement above), so no gate could restore byte-identity either. On every
+	//     block where the divisor was non-zero this guard changes nothing. The census is the
+	//     B6 full-replay derived-state comparison, which has chain data; this box does not.
+	// No votes -> no per-vote reward.
+	var rewardPerVote float64
+	// UNGATED, on MEASURED evidence rather than argument. cmd/cbcensus walked all 204
+	// block files of the frozen copy and inspected every coinbase output at or below the
+	// rollback target 2,260,450: 2,260,452 coinbase transactions, 7,630,730 outputs,
+	// minimum value 20, maximum 3,300,000,000,000,000, and ZERO outputs that are negative,
+	// MinInt64, or above MaxELAMoney. Had this division ever run with a zero divisor the
+	// per-producer rewards would have been Fixed64(+Inf), which on amd64 converts to
+	// MinInt64 and lands in the coinbase. None exists, so the divisor was never zero on
+	// retained history and the guard cannot change any retained verdict.
+	if totalVotesInRound > 0 {
+		rewardPerVote = totalTopProducersReward / float64(totalVotesInRound)
+	}
 	realDPOSReward := common.Fixed64(0)
 	for _, arbiter := range a.CurrentArbitrators {
 		ownerHash := arbiter.GetOwnerProgramHash()
@@ -1310,7 +1352,13 @@ func (a *Arbiters) distributeWithNormalArbitratorsV2(height uint32, reward commo
 		roundReward[*a.ChainParams.DestroyELAProgramHash] = reward
 		return roundReward, reward, nil
 	}
-	rewardPerVote := totalTopProducersReward / float64(totalVotesInRound)
+	// Guard div-by-zero, same defect and same reasoning as distributeWithNormalArbitratorsV3
+	// above: the early return rejects only an empty or an all-CRC arbiter set, never a zero
+	// divisor. Ungated for the reason recorded there. No votes -> no per-vote reward.
+	var rewardPerVote float64
+	if totalVotesInRound > 0 {
+		rewardPerVote = totalTopProducersReward / float64(totalVotesInRound)
+	}
 
 	realDPOSReward := common.Fixed64(0)
 	for _, arbiter := range a.CurrentArbitrators {
@@ -1382,7 +1430,13 @@ func (a *Arbiters) distributeWithNormalArbitratorsV1(height uint32, reward commo
 		roundReward[*a.ChainParams.CRConfiguration.CRCProgramHash] = reward
 		return roundReward, reward, nil
 	}
-	rewardPerVote := totalTopProducersReward / float64(totalVotesInRound)
+	// Guard div-by-zero, same defect and same reasoning as distributeWithNormalArbitratorsV3
+	// above: the early return rejects only an empty or an all-CRC arbiter set, never a zero
+	// divisor. Ungated for the reason recorded there. No votes -> no per-vote reward.
+	var rewardPerVote float64
+	if totalVotesInRound > 0 {
+		rewardPerVote = totalTopProducersReward / float64(totalVotesInRound)
+	}
 	realDPOSReward := common.Fixed64(0)
 	for _, arbiter := range a.CurrentArbitrators {
 		ownerHash := arbiter.GetOwnerProgramHash()
@@ -1949,8 +2003,19 @@ func (a *Arbiters) GetOnDutyCrossChainArbitrator() []byte {
 		sort.Slice(crcArbiters, func(i, j int) bool {
 			return bytes.Compare(crcArbiters[i].NodePublicKey, crcArbiters[j].NodePublicKey) < 0
 		})
-		ondutyIndex := int(height-a.ChainParams.CRCOnlyDPOSHeight+1) % len(crcArbiters)
-		arbiter = crcArbiters[ondutyIndex].NodePublicKey
+		// Same defect class as the branch below: modulo by zero panics when the CRC
+		// arbiter set is empty. This branch is live for heights in
+		// [CRCOnlyDPOSHeight-1, CRClaimDPOSNodeStartHeight), which on mainnet is retained
+		// history rather than the current tip, so it runs on every full resync.
+		//
+		// UNGATED: turns a panic into a defined nil return, and a panicking node accepts
+		// nothing, so no retained block's verdict can depend on it.
+		if len(crcArbiters) == 0 {
+			arbiter = nil
+		} else {
+			ondutyIndex := int(height-a.ChainParams.CRCOnlyDPOSHeight+1) % len(crcArbiters)
+			arbiter = crcArbiters[ondutyIndex].NodePublicKey
+		}
 		a.mtx.Unlock()
 	} else if height < a.ChainParams.DPoSConfiguration.DPOSNodeCrossChainHeight {
 		a.mtx.Lock()
@@ -1959,8 +2024,23 @@ func (a *Arbiters) GetOnDutyCrossChainArbitrator() []byte {
 			return bytes.Compare(crcArbiters[i].NodePublicKey,
 				crcArbiters[j].NodePublicKey) < 0
 		})
-		index := a.DutyIndex % len(a.CurrentCRCArbitersMap)
-		if crcArbiters[index].IsNormal {
+		// Modulo by zero panics. CurrentCRCArbitersMap is never allocated by
+		// initArbitrators, and this is the LIVE mainnet branch: mainnet sets
+		// DPOSNodeCrossChainHeight = math.MaxUint32, so the enclosing
+		// `height < DPOSNodeCrossChainHeight` holds at every real height. Reachable from
+		// a relayed SideChainPow transaction, i.e. from any peer. The sibling below
+		// already guards this way (`len(a.CurrentArbitrators) != 0 && ...`); this call
+		// site did not. crcArbiters is bounds-checked separately because it is a
+		// different collection from the map supplying the modulus.
+		//
+		// UNGATED: this turns a panic into a defined nil return. A panicking node accepts
+		// nothing, so no retained block can depend on the panic and no verdict changes.
+		index := 0
+		if len(a.CurrentCRCArbitersMap) != 0 {
+			index = a.DutyIndex % len(a.CurrentCRCArbitersMap)
+		}
+		if len(a.CurrentCRCArbitersMap) != 0 && index < len(crcArbiters) &&
+			crcArbiters[index].IsNormal {
 			arbiter = crcArbiters[index].NodePublicKey
 		} else {
 			arbiter = nil

@@ -147,12 +147,26 @@ func TestPredictedCheckpointHeightHandlesUnreadableSnapshots(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dataDir, "checkpoints", "cp_cr"), 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	// A key whose default snapshot is shorter than its height header.
-	shortDir := filepath.Join(dataDir, "checkpoints", "cp_short")
+	// A REGISTERED key whose default snapshot is shorter than its height header.
+	// It has to be a registered key to be read at all: the walk covers exactly the
+	// checkpoints Manager.Restore covers, and Restore derives every path from a
+	// registered checkpoint's own Key() rather than from the directory listing.
+	shortDir := filepath.Join(dataDir, "checkpoints", "cp_txPool")
 	if err := os.MkdirAll(shortDir, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(shortDir, "default.scp"), []byte{1, 2}, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(shortDir, "default.txpcp"), []byte{1, 2}, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// A directory that is not a registered key at all. Nothing registers "cp_short",
+	// so no start ever opens it and it must not appear in the prediction. This used
+	// to be counted as a real checkpoint, which is the same defect that let an
+	// operator's cp_txPool.bak refuse a correct node.
+	strayDir := filepath.Join(dataDir, "checkpoints", "cp_short")
+	if err := os.MkdirAll(strayDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(strayDir, "default.scp"), []byte{1, 2}, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -165,8 +179,11 @@ func TestPredictedCheckpointHeightHandlesUnreadableSnapshots(t *testing.T) {
 	}
 	assert.NotEmpty(t, byKey["cp_cr"].Err, "a missing snapshot must be reported")
 	assert.Zero(t, byKey["cp_cr"].Height)
-	assert.NotEmpty(t, byKey["cp_short"].Err, "a truncated snapshot must be reported")
-	assert.Zero(t, byKey["cp_short"].Height)
+	assert.NotEmpty(t, byKey["cp_txPool"].Err, "a truncated snapshot must be reported")
+	assert.Zero(t, byKey["cp_txPool"].Height)
+	_, stray := byKey["cp_short"]
+	assert.False(t, stray, "a directory that is not a registered checkpoint key is "+
+		"never restored, so it must not be reported as a checkpoint")
 
 	// No checkpoints directory at all: no prediction, no crash.
 	empty, none := blockchain.PredictRestoredCheckpointMaxHeight(t.TempDir())

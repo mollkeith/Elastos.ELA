@@ -46,7 +46,8 @@ func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Progra
 		// INFERRED-ITEMS.md.
 		if prefixType == contract.PrefixCrossChain {
 			if contract.IsSchnorr(program.Code) {
-				if ok, err := checkSchnorrSignatures(*program, common.Sha256D(data[:])); !ok {
+				if ok, err := checkSchnorrSignatures(*program, common.Sha256D(data[:]),
+					blockHeight, strictMoneyHeight); !ok {
 					return errors.New("check schnorr signature failed:" + err.Error())
 				}
 			} else {
@@ -66,7 +67,8 @@ func RunPrograms(data []byte, programHashes []common.Uint168, programs []*Progra
 		}
 		if prefixType == contract.PrefixStandard || prefixType == contract.PrefixDeposit {
 			if contract.IsSchnorr(program.Code) {
-				if ok, err := checkSchnorrSignatures(*program, common.Sha256D(data[:])); !ok {
+				if ok, err := checkSchnorrSignatures(*program, common.Sha256D(data[:]),
+					blockHeight, strictMoneyHeight); !ok {
 					return errors.New("check schnorr signature failed:" + err.Error())
 				}
 			} else if contract.IsStandard(program.Code) {
@@ -142,7 +144,8 @@ func CheckStandardSignature(program Program, data []byte) error {
 	return crypto.Verify(*publicKey, data, program.Parameter[1:])
 }
 
-func checkSchnorrSignatures(program Program, data [32]byte) (bool, error) {
+func checkSchnorrSignatures(program Program, data [32]byte,
+	blockHeight, strictMoneyHeight uint32) (bool, error) {
 	publicKey := [33]byte{}
 	copy(publicKey[:], program.Code[2:])
 
@@ -150,8 +153,39 @@ func checkSchnorrSignatures(program Program, data [32]byte) (bool, error) {
 	// F-050: reject a malformed Schnorr program whose Parameter is not a
 	// full 64-byte signature before slicing; otherwise program.Parameter[:64]
 	// panics (slice bounds out of range) on any pre-auth P2P-relayed tx.
-	if len(program.Parameter) != 64 {
+	//
+	// The two malformed cases are NOT symmetric against the released base
+	// (c61c9e61), which had no length check at all and went straight to
+	// copy(signature[:], program.Parameter[:64]). One half is safe to reject
+	// everywhere, the other half is an accept -> reject flip on retained
+	// history and has to be gated. Treating them alike is the defect this
+	// splits apart.
+	//
+	// len < 64 stays UNGATED, because the base could never ACCEPT such a
+	// program, it could only die on it. Program.Parameter is produced solely by
+	// Program.Deserialize -> common.ReadVarBytes, which for any count at or
+	// below maxPreallocBytes (64 KiB, and 64 is far below it) returns
+	// make([]byte, count). That gives cap == len, so Parameter[:64] on a
+	// shorter Parameter is a true out-of-range slice and not a reslice into
+	// spare capacity: it panics. The base at c61c9e61 allocated the same way.
+	// A panic aborts validation, so no block carrying one was ever accepted,
+	// and no retained block at or below 2,260,450 can contain one. Rejecting
+	// therefore cannot change any retained verdict, and it is strictly better
+	// than crashing a node on a pre-auth P2P-relayed tx.
+	if len(program.Parameter) < 64 {
 		return false, errors.New("invalid schnorr signature length")
+	}
+	// len > 64 MUST be gated, because the base ACCEPTED it. The slice simply
+	// took the leading 64 bytes and SchnorrVerify ran normally, so an over-long
+	// Parameter whose first 64 bytes are a valid signature was a valid spend.
+	// Single-key Schnorr has been live on mainnet since NormalSchnorrStartHeight
+	// (1,405,000), so roughly 855,000 retained blocks sit inside the exposure
+	// window. Rejecting it ungated would be an accept -> reject flip on retained
+	// history. Below the gate we keep the base behaviour byte for byte: take the
+	// first 64 bytes and verify. At and above StrictMoneyRangeHeight the trailing
+	// bytes are witness malleability with no meaning, so we fail closed.
+	if blockHeight >= strictMoneyHeight && len(program.Parameter) != 64 {
+		return false, errors.New("invalid schnorr signature length: trailing bytes after the 64 byte signature")
 	}
 	copy(signature[:], program.Parameter[:64])
 

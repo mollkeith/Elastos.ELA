@@ -14,16 +14,12 @@ import (
 
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/common/config"
+	"github.com/elastos/Elastos.ELA/core/checkpoint"
 )
 
 // checkpointDirName mirrors main.go's checkpointPath (main.go:57), the directory
 // under the chain data dir that main.go hands to Manager.SetDataPath (main.go:119).
 const checkpointDirName = "checkpoints"
-
-// txPoolCheckpointKey is the one checkpoint Manager.MaxHeight skips
-// (core/checkpoint/manager.go:315). Mirrored here so the prediction covers exactly
-// the same set as the gate it predicts.
-const txPoolCheckpointKey = "cp_txPool"
 
 // defaultCheckpointPrefix is checkpoint.DefaultCheckpoint. Manager.Restore loads
 // getDefaultPath -> "<dataDir>/checkpoints/<key>/default<ext>", never a
@@ -41,7 +37,9 @@ type RestoredCheckpoint struct {
 	// that case, because loadCheckpointFile puts the pre-load height back on a
 	// failed Deserialize (core/checkpoint/manager.go:504-517).
 	Height uint32 `json:"height"`
-	// CountedInMaxHeight is false for cp_txPool, which MaxHeight skips.
+	// CountedInMaxHeight is false for cp_txPool, the one REGISTERED checkpoint
+	// MaxHeight skips. Every entry in the slice is a registered checkpoint, so this
+	// is false for cp_txPool and true for everything else that appears.
 	CountedInMaxHeight bool `json:"counted_in_max_height"`
 	// Err explains an absent or unreadable snapshot.
 	Err string `json:"error,omitempty"`
@@ -53,10 +51,15 @@ type RestoredCheckpoint struct {
 // Why this can be done from four bytes: Manager.Restore loads only the per-key
 // "default" snapshot, and every consensus checkpoint serialises Height as its FIRST
 // field with common.WriteUint32 -- cr/state/checkpoint.go:185 and
-// dpos/state/checkpoint.go:240. MaxHeight then takes the max over all keys except
-// cp_txPool. So the header word of each default file IS the height the gate at
-// main.go:436-449 will compare, and reading it costs four bytes per checkpoint
-// instead of deserialising ~130 MiB of CR and DPoS state.
+// dpos/state/checkpoint.go:240. MaxHeight then takes the max over the REGISTERED
+// checkpoints except cp_txPool. So the header word of each default file IS the
+// height the gate at main.go:436-449 will compare, and reading it costs four bytes
+// per checkpoint instead of deserialising ~130 MiB of CR and DPoS state.
+//
+// Which directories count is checkpoint.IsRegisteredCheckpointKey and
+// checkpoint.CountedInMaxHeight, the same table MaxHeight's own skip rule reads.
+// This walk must not grow a private notion of which names matter: see the comment
+// on the filter in the loop for the failure that caused.
 //
 // LIMIT, stated here and in the rendered report: this reads the header, it does not
 // deserialise the body. A snapshot whose header is intact but whose body is corrupt
@@ -78,9 +81,29 @@ func PredictRestoredCheckpointMaxHeight(dataDir string) (uint32, []RestoredCheck
 		if !e.IsDir() {
 			continue
 		}
+		// Consider only the keys a node actually REGISTERS. Manager.Restore walks
+		// its registered checkpoints and derives each path from that checkpoint's
+		// own Key() (core/checkpoint/manager.go, Restore and
+		// getCheckpointDirectory); it never lists this directory. So a directory
+		// whose name is not a registered key is never opened by a start and cannot
+		// contribute to the height being predicted here.
+		//
+		// This used to be `e.Name() != txPoolCheckpointKey` against a private copy
+		// of the "cp_txPool" literal, which is an exact string compare, so every
+		// other directory was treated as a real checkpoint. An operator who copies
+		// or renames the tx-pool checkpoint to cp_txPool.bak or cp_txPool.old got a
+		// directory that is not equal to "cp_txPool" and was therefore COUNTED --
+		// and cp_txPool's snapshot tracks the chain tip (2,260,593 on mainnet,
+		// above the 2,260,450 rewind target), so the predicted max jumped over the
+		// target. The restart procedure's own backup step produced that directory,
+		// so following the documented procedure made main.go:330 refuse to start a
+		// completely correct node.
+		if !checkpoint.IsRegisteredCheckpointKey(e.Name()) {
+			continue
+		}
 		rc := RestoredCheckpoint{
 			Key:                e.Name(),
-			CountedInMaxHeight: e.Name() != txPoolCheckpointKey,
+			CountedInMaxHeight: checkpoint.CountedInMaxHeight(e.Name()),
 		}
 		path, err := findDefaultCheckpointFile(filepath.Join(root, e.Name()))
 		if err != nil {
