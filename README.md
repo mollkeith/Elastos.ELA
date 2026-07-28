@@ -4,6 +4,14 @@ Elastos ELA
 |:-:|:-:|
 |[![Build Status()](https://github.com/elastos/Elastos.ELA/workflows/Go/badge.svg)](https://github.com/elastos/Elastos.ELA/actions) |[![Code Report()](https://goreportcard.com/badge/github.com/elastos/Elastos.ELA)](https://goreportcard.com/report/github.com/elastos/Elastos.ELA)|
 
+## v1.0.0 is a chain recovery release
+
+If you operate a node, read
+[docs/release-notes/release-notes-1.0.0.md](docs/release-notes/release-notes-1.0.0.md)
+before upgrading. Back up your data directory first, and if you run a block
+producer or CR council node, verify the rewind completed before enabling the
+arbiter.
+
 ## Introduction
 
 ELA is the digital currency solution within the Elastos ecosystem. It is merged mined with Bitcoin which means the existing bitcoin miners are able to merge mine both BTC and ELA at the same time without expending any additional resources or energy while also providing the enormous hashpower that comes with the bitcoin network.
