@@ -680,6 +680,9 @@ func (d *DPOSManager) OnInactiveArbitratorsAccepted(p *payload.InactiveArbitrato
 
 func (d *DPOSManager) clearRevertToDPOSData(p *payload.RevertToDPOS) {
 	d.dispatcher.RevertToDPOSTx = nil
+	// The signer set belongs to the transaction, so it is dropped with it. A
+	// set left behind would reject the same arbiters in the next round.
+	d.dispatcher.revertToDPOSRequests = nil
 	log.Info("clearRevertToDPOSData finished")
 
 }
@@ -688,6 +691,8 @@ func (d *DPOSManager) clearInactiveData(p *payload.InactiveArbitrators) {
 	d.illegalMonitor.AddEvidence(p)
 	d.illegalMonitor.SetInactiveArbitratorsTxHash(p.Hash())
 	d.dispatcher.currentInactiveArbitratorTx = nil
+	// The signer set belongs to the transaction, so it is dropped with it.
+	d.dispatcher.inactiveArbitratorsRequests = nil
 	if d.dispatcher.inactiveCountDown.SetEliminated(p.Hash()) {
 		d.dispatcher.eventAnalyzer.Clear()
 	}

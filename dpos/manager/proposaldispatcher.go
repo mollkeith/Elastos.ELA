@@ -75,6 +75,15 @@ type ProposalDispatcher struct {
 	illegalMonitor *IllegalBehaviorMonitor
 
 	resetViewRequests map[string]struct{} // sponsors
+
+	// revertToDPOSRequests and inactiveArbitratorsRequests hold the distinct
+	// signers already merged into the in-flight RevertToDPOS and
+	// InactiveArbitrators transactions. Completeness is counted from the length
+	// of the program parameter, so without these sets one signer responding
+	// repeatedly makes a transaction count-complete while carrying fewer than
+	// the required distinct signatures, which every peer then rejects.
+	revertToDPOSRequests        map[string]struct{} // signers
+	inactiveArbitratorsRequests map[string]struct{} // signers
 }
 
 func (p *ProposalDispatcher) RequestAbnormalRecovering() {
@@ -224,6 +233,7 @@ func (p *ProposalDispatcher) CleanProposals(changeView bool) {
 	if !changeView {
 		p.inactiveCountDown.Reset(0)
 		p.currentInactiveArbitratorTx = nil
+		p.inactiveArbitratorsRequests = nil
 		p.signedTxs = map[common.Uint256]interface{}{}
 		p.pendingProposals = make(map[common.Uint256]*payload.DPOSProposal)
 		p.precociousProposals = make(map[common.Uint256]*ProposalWithID)
@@ -257,6 +267,7 @@ func (p *ProposalDispatcher) ResetByCurrentView() {
 
 	p.inactiveCountDown.Reset(p.cfg.Consensus.GetViewOffset() + 1)
 	p.currentInactiveArbitratorTx = nil
+	p.inactiveArbitratorsRequests = nil
 	p.signedTxs = map[common.Uint256]interface{}{}
 	p.pendingProposals = make(map[common.Uint256]*payload.DPOSProposal)
 	p.precociousProposals = make(map[common.Uint256]*ProposalWithID)
@@ -628,6 +639,39 @@ func (p *ProposalDispatcher) checkInactivePayloadContent(
 	return nil
 }
 
+// registerDistinctSigner records signer in signers if it is neither already
+// recorded nor absent from the multisig redeem script, and reports whether the
+// caller may append the co-signature to the program parameter. It must run
+// only after the signature verifies, so a forged message cannot claim a
+// signer's slot and lock out the real one. The script, not the live arbiter
+// set, is the membership authority: the live set can rotate after the script
+// was compiled, and a signature by a key outside the script can never satisfy
+// it, only inflate the parameter toward an invalid completion.
+func registerDistinctSigner(signers map[string]struct{}, code []byte,
+	signer []byte, tag string) bool {
+
+	signerKey := common.BytesToHexString(signer)
+	if _, ok := signers[signerKey]; ok {
+		log.Warn(tag, " duplicate signer, ignoring: ", signerKey)
+		return false
+	}
+	scriptKeys, err := crypto.ParseMultisigScript(code)
+	if err != nil {
+		log.Warn(tag, " parse redeem script error, details: ", err)
+		return false
+	}
+	for _, k := range scriptKeys {
+		// Script entries carry a one-byte length prefix ahead of the encoded
+		// public key.
+		if bytes.Equal(k[1:], signer) {
+			signers[signerKey] = struct{}{}
+			return true
+		}
+	}
+	log.Warn(tag, " signer not in redeem script, ignoring: ", signerKey)
+	return false
+}
+
 func (p *ProposalDispatcher) OnResponseRevertToDPOSTxReceived(
 	txHash *common.Uint256, signer []byte, sign []byte) {
 
@@ -635,6 +679,10 @@ func (p *ProposalDispatcher) OnResponseRevertToDPOSTxReceived(
 	if p.RevertToDPOSTx == nil ||
 		!p.RevertToDPOSTx.Hash().IsEqual(*txHash) {
 		return
+	}
+
+	if p.revertToDPOSRequests == nil {
+		p.revertToDPOSRequests = make(map[string]struct{})
 	}
 
 	data := new(bytes.Buffer)
@@ -656,15 +704,19 @@ func (p *ProposalDispatcher) OnResponseRevertToDPOSTxReceived(
 	}
 
 	pro := p.RevertToDPOSTx.Programs()[0]
+	if !registerDistinctSigner(p.revertToDPOSRequests, pro.Code, signer,
+		"### RevertToDPoS OnResponseRevertToDPOSTxReceived ") {
+		return
+	}
 	buf := new(bytes.Buffer)
 	buf.Write(pro.Parameter)
 	buf.WriteByte(byte(len(sign)))
 	buf.Write(sign)
 	pro.Parameter = buf.Bytes()
 
-	log.Info("### RevertToDPoS OnResponseRevertToDPOSTxReceived  current count:", len(pro.Parameter)/crypto.SignatureScriptLength)
+	log.Info("### RevertToDPoS OnResponseRevertToDPOSTxReceived  current count:", len(p.revertToDPOSRequests))
 
-	p.tryEnterDPOSState(len(pro.Parameter) / crypto.SignatureScriptLength)
+	p.tryEnterDPOSState(len(p.revertToDPOSRequests))
 }
 
 func (p *ProposalDispatcher) OnResponseResetViewReceived(msg *dmsg.ResetView) {
@@ -714,6 +766,10 @@ func (p *ProposalDispatcher) OnResponseInactiveArbitratorsReceived(
 		return
 	}
 
+	if p.inactiveArbitratorsRequests == nil {
+		p.inactiveArbitratorsRequests = make(map[string]struct{})
+	}
+
 	data := new(bytes.Buffer)
 	if err := p.currentInactiveArbitratorTx.SerializeUnsigned(
 		data); err != nil {
@@ -736,13 +792,17 @@ func (p *ProposalDispatcher) OnResponseInactiveArbitratorsReceived(
 	}
 
 	pro := p.currentInactiveArbitratorTx.Programs()[0]
+	if !registerDistinctSigner(p.inactiveArbitratorsRequests, pro.Code, signer,
+		"[OnResponseInactiveArbitratorsReceived]") {
+		return
+	}
 	buf := new(bytes.Buffer)
 	buf.Write(pro.Parameter)
 	buf.WriteByte(byte(len(sign)))
 	buf.Write(sign)
 	pro.Parameter = buf.Bytes()
 
-	p.tryEnterEmergencyState(len(pro.Parameter) / crypto.SignatureScriptLength)
+	p.tryEnterEmergencyState(len(p.inactiveArbitratorsRequests))
 }
 
 func (p *ProposalDispatcher) tryEnterDPOSState(signCount int) bool {
@@ -978,6 +1038,12 @@ func (p *ProposalDispatcher) CreateRevertToDPOS(RevertToPOWBlockHeight uint32) (
 	})
 
 	p.RevertToDPOSTx = tx
+	// The parameter above already carries this node's own signature, so the
+	// signer set starts holding this node and a response echoing it back cannot
+	// be counted a second time.
+	p.revertToDPOSRequests = map[string]struct{}{
+		common.BytesToHexString(p.cfg.Manager.GetPublicKey()): {},
+	}
 	return tx, nil
 }
 
@@ -1038,6 +1104,12 @@ func (p *ProposalDispatcher) CreateInactiveArbitrators() (
 	})
 
 	p.currentInactiveArbitratorTx = tx
+	// The parameter above already carries this node's own signature, so the
+	// signer set starts holding this node and a response echoing it back cannot
+	// be counted a second time.
+	p.inactiveArbitratorsRequests = map[string]struct{}{
+		common.BytesToHexString(p.cfg.Manager.GetPublicKey()): {},
+	}
 	return tx, nil
 }
 

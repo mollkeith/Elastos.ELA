@@ -59,6 +59,12 @@ func (c *ViewChangesCountDown) IsTimeOut() bool {
 		return false
 	}
 
-	return c.consensus.GetViewOffset()-c.startViewOffset >=
-		uint32(c.arbitrators.GetArbitersCount())*c.timeoutRefactor
+	// startViewOffset can legitimately exceed the current view offset: Reset is
+	// seeded with GetViewOffset()+1 so the countdown arms at the next view
+	// change, and the consensus zeroes the view offset (SetReady, SetRunning)
+	// without resetting this countdown. The comparison is done in uint64 so
+	// neither that inversion nor the threshold product can wrap and report a
+	// timeout that never elapsed.
+	threshold := uint64(c.arbitrators.GetArbitersCount()) * uint64(c.timeoutRefactor)
+	return uint64(c.consensus.GetViewOffset()) >= uint64(c.startViewOffset)+threshold
 }
