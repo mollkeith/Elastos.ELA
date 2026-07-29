@@ -241,12 +241,14 @@ func (b *BlockChain) ClearForcedRollbackMarker() error {
 }
 
 // forcedRollbackProgressSteps is how many progress lines a full rewind emits. The
-// real mainnet rewind is 144 blocks over a 25GB store, plus one stored side block
-// at 2,260,595 that was never on the main chain and is removed by the residue
-// sweep rather than the rewind. MEASURED: best-state-height 2,260,594,
-// live-above 144, main-chain-above 144, stored-above 145. The shipped code logged
-// every 100th height, i.e. about two lines for the whole operation -- the shape
-// that invites an operator to assume the node has hung and press Ctrl-C.
+// real mainnet rewind is 144 or 145 blocks over a 25GB store, depending on the
+// node: not every node accepted 2,260,595 onto its main chain. Two nodes measured
+// 2026-07-28 and 2026-07-29 reported main-chain-above 145 and 144 respectively,
+// the second holding 2,260,595 as a stored side block that the residue sweep
+// removes instead. Both are correct; the rewind counts what the node actually
+// has. The shipped code logged every 100th height, i.e. about two lines for the
+// whole operation -- the shape that invites an operator to assume the node has
+// hung and press Ctrl-C.
 const forcedRollbackProgressSteps = 20
 
 // blockRollbackPhase describes how much of one block's rewind is already durable,
