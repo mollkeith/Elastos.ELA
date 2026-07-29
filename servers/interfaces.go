@@ -875,8 +875,6 @@ func GetUsedVoteRight(voteType outputpayload.VoteType, stakeProgramHash *common.
 			}
 		}
 	case outputpayload.DposV2:
-		addr, _ := stakeProgramHash.ToAddress()
-		fmt.Println("addr", addr)
 		usedDposVote = state.UsedDposV2Votes[*stakeProgramHash]
 	default:
 		return 0, errors.New("unsupport vote type")
@@ -1022,6 +1020,12 @@ func DiscreteMining(param Params) map[string]interface{} {
 	count, ok := param.Uint("count")
 	if !ok {
 		return ResponsePack(InvalidParams, "")
+	}
+	// F-163: count is unvalidated wire input, and zero used to mine a block
+	// anyway. Reject it here too so the caller gets a parameter error rather
+	// than an execution error.
+	if count == 0 {
+		return ResponsePack(InvalidParams, "count must be greater than 0")
 	}
 
 	ret := make([]string, 0)

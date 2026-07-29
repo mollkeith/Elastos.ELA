@@ -114,6 +114,41 @@ func (d *degradation) Reset() {
 	d.mtx.Unlock()
 }
 
+// specialTxDegradationState is the degradation bookkeeping captured and restored
+// around a block's special transactions (F-093/F-094). inactiveTxs in particular
+// lives outside utils.History, so no RollbackTo has ever been able to un-mark a
+// payload processed by a block that then failed to connect.
+type specialTxDegradationState struct {
+	state             degradationState
+	understaffedSince uint32
+	inactivateHeight  uint32
+	inactiveTxs       map[common.Uint256]interface{}
+}
+
+// captureForSpecialTx snapshots the degradation bookkeeping. Read-only.
+func (d *degradation) captureForSpecialTx() specialTxDegradationState {
+	d.mtx.Lock()
+	defer d.mtx.Unlock()
+
+	return specialTxDegradationState{
+		state:             d.state,
+		understaffedSince: d.understaffedSince,
+		inactivateHeight:  d.inactivateHeight,
+		inactiveTxs:       copyInactiveTxs(d.inactiveTxs),
+	}
+}
+
+// restoreForSpecialTx puts back a snapshot taken by captureForSpecialTx.
+func (d *degradation) restoreForSpecialTx(s specialTxDegradationState) {
+	d.mtx.Lock()
+	defer d.mtx.Unlock()
+
+	d.state = s.state
+	d.understaffedSince = s.understaffedSince
+	d.inactivateHeight = s.inactivateHeight
+	d.inactiveTxs = copyInactiveTxs(s.inactiveTxs)
+}
+
 func (d *degradation) AddInactivePayload(p *payload.InactiveArbitrators) bool {
 	hash := p.Hash()
 	d.mtx.Lock()

@@ -248,6 +248,12 @@ func Equal(e1 *PublicKey, e2 *PublicKey) bool {
 
 func CheckMultiSigSignatures(program program.Program, data []byte) error {
 	code := program.Code
+	// F-133: guard before indexing code[0]/code[len-2] so a <2-byte code cannot panic;
+	// the semantic length/format check stays with ParseMultisigScript below (unchanged
+	// error path for all len>=2 codes). Crash-harden only.
+	if len(code) < 2 {
+		return errors.New("invalid multi sign script code, length not enough")
+	}
 	// Get N parameter
 	n := int(code[len(code)-2]) - PUSH1 + 1
 	// Get M parameter
@@ -276,17 +282,47 @@ func VerifyMultisigSignatures(m, n int, publicKeys [][]byte, signatures, data []
 		return errors.New("invalid signatures, too many signatures")
 	}
 
+	// F-198: the matching loop below is O(len(signatures)/65 * n) and it used to
+	// re-decompress every public key AND re-hash the whole unsigned transaction on
+	// every single (signature, public key) pair -- roughly 31k P-256 point
+	// decompressions plus 31k full-transaction SHA-256 passes for one max-size
+	// program, all of it reachable from a P2P-relayed transaction before any fee is
+	// paid.  Both quantities are loop invariants, so hoist them.
+	//
+	// The digest is hoisted outright: Verify(pub, data, sig) is by construction
+	// VerifyDigest(pub, sha256(data), sig) -- same length check, same r/s parse,
+	// same ecdsa.Verify -- and the loop only ever tests err == nil, so the result is
+	// bit-for-bit the same decision.
+	//
+	// The point decompression is memoised LAZILY, on purpose, and must stay lazy:
+	// parsePublicKeys does NOT check that a key decodes, so a program can carry an
+	// undecodable key that the current loop never reaches (it breaks out of the
+	// inner loop as soon as a signature matches an earlier key) and therefore never
+	// rejects.  Decoding every key up-front would turn such a program from valid
+	// into invalid -- an ACCEPTANCE CHANGE, which is not allowed here.  Decoding at
+	// exactly the point the original loop would have decoded, and caching the
+	// deterministic result, keeps the decode order, the first-failure point and the
+	// returned error identical.  This fix is a pure work reduction: no sigop cap is
+	// added, because a cap WOULD change acceptance.
+	digest := sha256.Sum256(data)
+	decoded := make([]*PublicKey, len(publicKeys))
+
 	var verified = make(map[common.Uint256]struct{})
 	for i := 0; i < len(signatures); i += SignatureScriptLength {
 		// Remove length byte
 		sign := signatures[i : i+SignatureScriptLength][1:]
 		// Match public key with signature
-		for _, publicKey := range publicKeys {
-			pubKey, err := DecodePoint(publicKey[1:])
-			if err != nil {
-				return err
+		for j, publicKey := range publicKeys {
+			pubKey := decoded[j]
+			if pubKey == nil {
+				var err error
+				pubKey, err = DecodePoint(publicKey[1:])
+				if err != nil {
+					return err
+				}
+				decoded[j] = pubKey
 			}
-			err = Verify(*pubKey, data, sign)
+			err := VerifyDigest(*pubKey, digest[:], sign)
 			if err == nil {
 				hash := sha256.Sum256(publicKey)
 				if _, ok := verified[hash]; ok {

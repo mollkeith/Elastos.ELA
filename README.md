@@ -2,7 +2,15 @@ Elastos ELA
 ===========
 |Actions CI|Go Report Card|
 |:-:|:-:|
-|[![Build Status()](https://github.com/elastos/Elastos.ELA/workflows/Go/badge.svg?branch=release_v0.4.3)](https://github.com/elastos/Elastos.ELA/actions?query=branch:release_v0.4.3) |[![Code Report()](https://goreportcard.com/badge/github.com/elastos/Elastos.ELA)](https://goreportcard.com/report/github.com/elastos/Elastos.ELA)|
+|[![Build Status()](https://github.com/elastos/Elastos.ELA/workflows/Go/badge.svg)](https://github.com/elastos/Elastos.ELA/actions) |[![Code Report()](https://goreportcard.com/badge/github.com/elastos/Elastos.ELA)](https://goreportcard.com/report/github.com/elastos/Elastos.ELA)|
+
+## v1.0.0 is a chain recovery release
+
+If you operate a node, read
+[docs/release-notes/release-notes-1.0.0.md](docs/release-notes/release-notes-1.0.0.md)
+before upgrading. Back up your data directory first, and if you run a block
+producer or CR council node, verify the rewind completed before enabling the
+arbiter.
 
 ## Introduction
 
@@ -52,8 +60,8 @@ $ sudo apt-get install -y git
 Install Go distribution.
 
 ```bash
-$ curl -O https://golang.org/dl/go1.13.15.linux-amd64.tar.gz
-$ tar -xvf go1.13.15.linux-amd64.tar.gz
+$ curl -O https://golang.org/dl/go1.20.14.linux-amd64.tar.gz
+$ tar -xvf go1.20.14.linux-amd64.tar.gz
 $ sudo chown -R root:root ./go
 $ sudo mv go /usr/local
 $ export GOPATH=$HOME/go

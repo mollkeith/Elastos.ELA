@@ -286,6 +286,20 @@ func strCRManagementPublicKey(tx interfaces.Transaction) (interface{}, error) {
 	return common.BytesToHexString(p.NodePublicKey), nil
 }
 
+// strCRManagementPublicKeys returns the claimed DPoS node public key as a ONE-element
+// array, so CRCouncilMemberClaimNode can join slotDPoSOwnerNodePublicKeys -- the strArray
+// slot that already unions a producer's owner and node keys. Returning an array rather
+// than reusing strCRManagementPublicKey is required by the slot's keyType (strArray), not
+// a stylistic choice.
+func strCRManagementPublicKeys(tx interfaces.Transaction) (interface{}, error) {
+	p, ok := tx.Payload().(*payload.CRCouncilMemberClaimNode)
+	if !ok {
+		return nil, fmt.Errorf(
+			"cr dpos management payload cast failed, tx:%s", tx.Hash())
+	}
+	return []string{common.BytesToHexString(p.NodePublicKey)}, nil
+}
+
 func strCRManagementDID(tx interfaces.Transaction) (interface{}, error) {
 	p, ok := tx.Payload().(*payload.CRCouncilMemberClaimNode)
 	if !ok {
@@ -562,7 +576,13 @@ func hashArraySidechainTransactionHashes(
 			array = append(array, v)
 		}
 		return array, nil
-	} else if tx.PayloadVersion() == payload.WithdrawFromSideChainVersionV1 {
+	} else if tx.PayloadVersion() == payload.WithdrawFromSideChainVersionV1 ||
+		tx.PayloadVersion() == payload.WithdrawFromSideChainVersionV2 {
+		// V2 also carries the sidechain hash in the OTWithdrawFromSideChain output
+		// payloads (Signers live in the tx payload), so this mempool conflict slot must
+		// read outputs for V2 too. Reading payload.SideChainTransactionHashes for V2
+		// finds it empty and registers no hash, which lets two V2 withdraws for one burn
+		// both enter the pool.
 		array := make([]common.Uint256, 0)
 		for _, output := range tx.Outputs() {
 			if output.Type != common2.OTWithdrawFromSideChain {

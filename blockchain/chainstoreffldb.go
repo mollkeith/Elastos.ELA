@@ -217,7 +217,21 @@ func (c *ChainStoreFFLDB) RollbackBlock(b *Block, node *BlockNode,
 
 	err = c.db.Update(func(dbTx database.Tx) error {
 		// Update best block state.
-		err := dbPutBestState(dbTx, state, node.WorkSum)
+		//
+		// The BestState built above describes the parent (newBestState(prevNode, ...)),
+		// because rolling `node` back makes prevNode the new tip. The work sum stored
+		// alongside it must therefore be the parent's as well; passing node.WorkSum
+		// would persist a self-inconsistent best-chain record whose hash and height are
+		// the parent's but whose accumulated work is the discarded child's.
+		//
+		// Ungated and acceptance-neutral: nothing reads this work sum back for any
+		// decision. Its only deserializer is the legacy migrateBlockIndex
+		// (blockchain/upgrade.go:88-93), which uses state.hash alone; initChainState
+		// (blockchain/chainio.go:430) only tests the key for existence; and every live
+		// BlockNode.WorkSum is recomputed from header.Bits (blockchain/blockindex.go:103)
+		// and re-accumulated in LoadBlockNode. No block or transaction acceptance
+		// decision consults the persisted value.
+		err := dbPutBestState(dbTx, state, prevNode.WorkSum)
 		if err != nil {
 			return err
 		}
@@ -308,6 +322,57 @@ func (c *ChainStoreFFLDB) GetBlock(hash Uint256) (*DposBlock, error) {
 	c.mtx.Unlock()
 
 	return b, nil
+}
+
+// FlushCache forwards to the underlying database, so a caller holding an
+// IFFLDBChainStore can make buffered writes durable. See database.DB.FlushCache
+// for exactly what that does and does not guarantee.
+//
+// Note that it says nothing about the in-RAM block LRU below, which is a separate
+// cache and is dropped by EvictBlockCache.
+func (c *ChainStoreFFLDB) FlushCache() error {
+	return c.db.FlushCache()
+}
+
+// EvictBlockCache drops a hash from the in-RAM block LRU (blocksCache /
+// blockHashesCache). GetBlock populates this small cache on every fetch, so a block
+// purged from the persistent store (DBRemoveBlockFromStore) must also be evicted
+// here -- otherwise an in-process serve could still return the purged block from
+// cache until the node restarts.
+func (c *ChainStoreFFLDB) EvictBlockCache(hash Uint256) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.blocksCache == nil {
+		return
+	}
+	if _, ok := c.blocksCache[hash]; !ok {
+		return
+	}
+	delete(c.blocksCache, hash)
+	for i, h := range c.blockHashesCache {
+		if h.IsEqual(hash) {
+			c.blockHashesCache = append(c.blockHashesCache[:i],
+				c.blockHashesCache[i+1:]...)
+			break
+		}
+	}
+}
+
+// DeleteBlockFromStore purges a block's by-hash location entry from the raw block
+// store (ffldb-blockidx) and evicts it from the RAM cache, so the store returns
+// ErrBlockNotFound and can no longer deserialize or serve the block by hash. The
+// flat-file bytes are intentionally left orphaned/unfetchable (see
+// DBRemoveBlockFromStore). This is the offline-cleaner entry point; the forced
+// rollback path performs the same delete inline because it already holds an Update
+// transaction for the surrounding index removals.
+func (c *ChainStoreFFLDB) DeleteBlockFromStore(hash Uint256) error {
+	if err := c.db.Update(func(dbTx database.Tx) error {
+		return DBRemoveBlockFromStore(dbTx, &hash)
+	}); err != nil {
+		return err
+	}
+	c.EvictBlockCache(hash)
+	return nil
 }
 
 func (c *ChainStoreFFLDB) GetHeader(hash Uint256) (*common.Header, error) {

@@ -6,8 +6,10 @@
 package config
 
 import (
+	"fmt"
 	"math"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -29,6 +31,67 @@ const (
 	// DisabledCrossChainUTXORestrictionHeight keeps the emergency policy
 	// inactive on networks that have not adopted a coordinated activation.
 	DisabledCrossChainUTXORestrictionHeight uint32 = math.MaxUint32
+	// MainNetStrictMoneyRangeHeight is the coordinated mainnet activation
+	// height for strict monetary validation (per-amount and aggregate money
+	// range plus checked Fixed64 arithmetic). Set to ForcedRollbackHeight+1:
+	// the forced rollback removes the exploit block at 2260451, and strict
+	// validation binds from the first re-mined block so the resumed chain is
+	// protected immediately. Blocks at or below 2260450 are legitimate history
+	// and continue to validate under the preserved legacy arithmetic.
+	MainNetStrictMoneyRangeHeight uint32 = 2260451
+	// DisabledStrictMoneyRangeHeight keeps strict monetary validation inactive
+	// on networks that have not adopted a coordinated activation.
+	DisabledStrictMoneyRangeHeight uint32 = math.MaxUint32
+	// MainNetRevisedDPoSRewardHeight is the activation height for the revised
+	// DPoS reward math (F-011/086 ELA-only arbiter-reward basis; F-212 empty-
+	// arbiter-slot reward no longer double-counted). Per the core engineers
+	// (Q-B6) these reward-rule changes must NOT reuse the incident-recovery gate
+	// (StrictMoneyRangeHeight=2260451) — they take a fresh future activation
+	// height (> the frozen tip 2260595). MaxUint32 = dormant.
+	// Set (2026-07-22) to 2265000 — a coordinated post-recovery activation height:
+	// > the frozen tip 2260595 (a fresh height per Q-B6, NOT the incident gate), with a
+	// ~4405-block (~6-day at 120s) buffer above the tip so the rolled-back fleet fully
+	// converges before the reward-rule change binds. Realized F-212 exposure in the
+	// interim is a PROVEN ZERO (full mainnet scan), so the buffer costs nothing. MUST be
+	// identical on every node. ENGINEERS: confirm/adjust this single coordinated value.
+	MainNetRevisedDPoSRewardHeight uint32 = 2265000
+	// MainNetForcedRollbackHeight is the height the chain is rewound TO on first
+	// start of a patched node. The block at Height+1 is the value-overflow
+	// transaction's block; rewinding to 2260450 removes it and everything after.
+	MainNetForcedRollbackHeight uint32 = 2260450
+	// MainNetForcedRollbackTrigger is the hash of the block at
+	// MainNetForcedRollbackHeight+1. The rollback fires ONLY if the local chain
+	// actually contains this block, which makes the operation idempotent, a no-op
+	// for fresh nodes, and impossible to mis-target.
+	MainNetForcedRollbackTrigger = "e1a11e04942a7513f0256dbf3605080490800fd845f8e261deffcec68c2ea9af"
+	// DisabledForcedRollbackHeight leaves forced rollback inactive.
+	DisabledForcedRollbackHeight uint32 = math.MaxUint32
+	// MainNetSchnorrStartHeight is the coordinated mainnet activation height of
+	// the aggregate-Schnorr WithdrawFromSideChain payload (V2). math.MaxUint32 =
+	// DISABLED, which is the value mainnet has always shipped and the value the
+	// F-185 two-sided gate depends on: checkSchnorrWithdrawFromSidechain builds the
+	// group key as a PLAIN SUM of the signers' NodePublicKeys, with no MuSig H(L)
+	// coefficients and no proof-of-possession on NodePublicKey (F-189), so a single
+	// arbiter with a rogue key could forge a full-threshold cross-chain withdraw.
+	// A full read-only census of the frozen mainnet chain (2,260,597 blocks) found
+	// ZERO V2 withdrawals, so nothing on mainnet has ever used the feature.
+	MainNetSchnorrStartHeight uint32 = math.MaxUint32
+	// MainNetNormalSchnorrStartHeight is the LIVE mainnet activation height for
+	// single-key Schnorr program codes in ordinary transactions
+	// (transactionchecker.go CheckAttributeProgram). Long past on mainnet.
+	MainNetNormalSchnorrStartHeight uint32 = 1405000
+	// MainNetProducerSchnorrStartHeight is the mainnet producer-Schnorr activation
+	// height. math.MaxUint32 = DISABLED; the F-026/F-175 dormant-gate rejections in
+	// registerproducer / updateproducer / cancelproducer hang off exactly this value.
+	MainNetProducerSchnorrStartHeight uint32 = math.MaxUint32
+	// MainNetCRSchnorrStartHeight is the mainnet CR-Schnorr activation height.
+	// math.MaxUint32 = DISABLED; the F-046 dormant-gate rejections in registercr /
+	// updatecr hang off exactly this value.
+	MainNetCRSchnorrStartHeight uint32 = math.MaxUint32
+	// MainNetVotesSchnorrStartHeight is the mainnet votes-Schnorr activation height.
+	// math.MaxUint32 = DISABLED; exchangevotes.go rejects the Schnorr votes path
+	// below it.
+	MainNetVotesSchnorrStartHeight uint32 = math.MaxUint32
 	// ExploitIntermediateFrozenAddress is the mainchain intermediate address
 	// that received funds from the CrossChain UTXO exploit.
 	ExploitIntermediateFrozenAddress = "EfduuvdDcAgif8njgXNJUfsBumQf9yYP72"
@@ -147,6 +210,36 @@ var (
 		0xf1, 0x44, 0x5f, 0xb2, 0x11, 0x9c, 0xe6,
 	}
 )
+
+// IsMainNetFoundationProgramHash reports whether h is the mainnet foundation identity.
+// Used to detect the REAL mainnet chain by IDENTITY (not the ActiveNet label) so the
+// incident-gate refuse-to-start guard (F-043) fires on a mislabelled mainnet node but
+// never on a private/forked net, which uses a different foundation.
+func IsMainNetFoundationProgramHash(h *common.Uint168) bool {
+	return h != nil && h.IsEqual(*mainNetFoundationProgramHash)
+}
+
+// IsMainNetActiveNet reports whether an ActiveNet label selects the mainnet
+// parameter set.
+//
+// It exists so that code OUTSIDE this package can answer "will this node have the
+// coordinated mainnet forced-rollback trigger pinned on it whatever the operator
+// supplies?" without copying the label set. The forced rollback's own error text has
+// to answer exactly that: on mainnet the pin re-installs the trigger, so telling the
+// operator to unset --forcedrollbacktrigger is telling them to do something that does
+// not work, while on every other net that remedy is real.
+//
+// The label set is the one the enforce* pins in common/config/settings switch on, and
+// the OPS2 suite asserts the agreement against the PRODUCTION pin rather than against
+// a copy of the list, so the two cannot drift apart silently.
+func IsMainNetActiveNet(activeNet string) bool {
+	switch strings.ToLower(strings.TrimSpace(activeNet)) {
+	case "", "mainnet", "main":
+		return true
+	default:
+		return false
+	}
+}
 
 func SetParameters(configuration *Configuration) {
 	Parameters = configuration
@@ -282,6 +375,10 @@ func GetDefaultParams() *Configuration {
 		SmallCrossTransferThreshold:     100000000,
 		ReturnDepositCoinFee:            100,
 		CrossChainUTXOFreezeHeight:      MainNetCrossChainUTXOFreezeHeight,
+		StrictMoneyRangeHeight:          MainNetStrictMoneyRangeHeight,
+		RevisedDPoSRewardHeight:         MainNetRevisedDPoSRewardHeight,
+		ForcedRollbackHeight:            MainNetForcedRollbackHeight,
+		ForcedRollbackTrigger:           MainNetForcedRollbackTrigger,
 		CrossChainUTXORestrictionHeight: MainNetCrossChainUTXORestrictionHeight,
 		FrozenAddresses:                 MainNetFrozenAddresses(),
 		NewCrossChainStartHeight:        1032840,
@@ -291,11 +388,11 @@ func GetDefaultParams() *Configuration {
 		DPoSV2EffectiveVotes:            80000 * 100000000,
 		DPoSV2StartHeight:               1405000, //1405000+262800=1667800
 		StakePoolProgramHash:            StakePoolProgramHash,
-		SchnorrStartHeight:              math.MaxUint32,
-		NormalSchnorrStartHeight:        1405000,
-		ProducerSchnorrStartHeight:      math.MaxUint32,
-		CRSchnorrStartHeight:            math.MaxUint32,
-		VotesSchnorrStartHeight:         math.MaxUint32,
+		SchnorrStartHeight:              MainNetSchnorrStartHeight,
+		NormalSchnorrStartHeight:        MainNetNormalSchnorrStartHeight,
+		ProducerSchnorrStartHeight:      MainNetProducerSchnorrStartHeight,
+		CRSchnorrStartHeight:            MainNetCRSchnorrStartHeight,
+		VotesSchnorrStartHeight:         MainNetVotesSchnorrStartHeight,
 		CrossChainMonitorStartHeight:    math.MaxUint32,
 		CrossChainMonitorInterval:       100,
 		SupportMultiCodeHeight:          math.MaxUint32, // todo complete me
@@ -412,6 +509,10 @@ func (p *Configuration) TestNet() *Configuration {
 	p.SmallCrossTransferThreshold = 100000000
 	p.ReturnDepositCoinFee = 100
 	p.CrossChainUTXOFreezeHeight = DisabledCrossChainUTXORestrictionHeight
+	p.StrictMoneyRangeHeight = DisabledStrictMoneyRangeHeight
+	p.RevisedDPoSRewardHeight = DisabledStrictMoneyRangeHeight
+	p.ForcedRollbackHeight = DisabledForcedRollbackHeight
+	p.ForcedRollbackTrigger = ""
 	p.CrossChainUTXORestrictionHeight = DisabledCrossChainUTXORestrictionHeight
 	p.FrozenAddresses = nil
 	p.NewCrossChainStartHeight = 807000
@@ -545,6 +646,10 @@ func (p *Configuration) RegNet() *Configuration {
 	p.SmallCrossTransferThreshold = 100000000
 	p.ReturnDepositCoinFee = 100
 	p.CrossChainUTXOFreezeHeight = DisabledCrossChainUTXORestrictionHeight
+	p.StrictMoneyRangeHeight = DisabledStrictMoneyRangeHeight
+	p.RevisedDPoSRewardHeight = DisabledStrictMoneyRangeHeight
+	p.ForcedRollbackHeight = DisabledForcedRollbackHeight
+	p.ForcedRollbackTrigger = ""
 	p.CrossChainUTXORestrictionHeight = DisabledCrossChainUTXORestrictionHeight
 	p.FrozenAddresses = nil
 	p.NewCrossChainStartHeight = 730000
@@ -587,25 +692,36 @@ func (p *Configuration) RegNet() *Configuration {
 
 // Configuration defines the configurable parameters to run a ELA node.
 type Configuration struct {
-	Conf          string `screw:"--conf" usage:"set the config file path"`
-	ActiveNet     string `json:"ActiveNet"`
-	Password      string `screw:"short;--password" usage:"password for keystore"`
-	DataDir       string `screw:"short;--datadir" usage:"block data and logs storage path default: elastos"`
-	HttpInfoPort  uint16 `screw:"--infoport" usage:"port for the http info server"`
-	HttpInfoStart bool   `json:"HttpInfoStart"`
-	HttpRestPort  int    `screw:"--restport" usage:"port for the http restful server"`
-	HttpRestStart bool   `json:"HttpRestStart"`
-	HttpWsPort    int    `screw:"--wsport" usage:"port for the http web socket server"`
-	HttpWsStart   bool   `json:"HttpWsStart"`
-	HttpJsonPort  int    `screw:"--rpcport" usage:"port for the http json rpc port server"`
-	ProfilePort   uint32 `screw:"--profileport" usage:"port for the http profile port rpc server"`
-	ProfileHost   string `screw:"--profilehost" usage:"port for the http profile rpc host server"`
-	DisableDNS    bool   `screw:"--disabledns" usage:"disable DNS for node"`
-	EnableRPC     bool   `screw:"--enablerpc" usage:"enable RPC for node"`
-	MaxLogsSize   int64  `json:"MaxLogsSize"`
-	MaxPerLogSize int64  `json:"MaxPerLogSize"`
-	RestCertPath  string `json:"RestCertPath"`
-	RestKeyPath   string `json:"RestKeyPath"`
+	Conf      string `screw:"--conf" usage:"set the config file path"`
+	ActiveNet string `json:"ActiveNet"`
+	// ArmIncidentGates lets a NON-MAINNET (rehearsal) chain opt in to the
+	// coordinated incident gates -- StrictMoneyRangeHeight, the CrossChain-UTXO
+	// freeze/restriction heights and the forced-rollback trigger -- which are
+	// otherwise pinned to Disabled for every non-mainnet net. Without this, every
+	// gated fix (F-015, F-212, the same-block mirrors, ...) is INERT on testnet and
+	// a green testnet run proves nothing. It is REFUSED on mainnet: the mainnet branch
+	// of enforceCrossChainUTXORestrictionHeights / enforceStrictMoneyAndRollbackHeights
+	// pins the real values unconditionally, and enforceMainnetIncidentGatesArmed makes
+	// a node that carries the mainnet foundation identity refuse to start while this
+	// flag is set -- so it can only ever ARM a rehearsal chain, never weaken mainnet.
+	ArmIncidentGates bool   `json:"ArmIncidentGates"`
+	Password         string `screw:"short;--password" usage:"password for keystore"`
+	DataDir          string `screw:"short;--datadir" usage:"block data and logs storage path default: elastos"`
+	HttpInfoPort     uint16 `screw:"--infoport" usage:"port for the http info server"`
+	HttpInfoStart    bool   `json:"HttpInfoStart"`
+	HttpRestPort     int    `screw:"--restport" usage:"port for the http restful server"`
+	HttpRestStart    bool   `json:"HttpRestStart"`
+	HttpWsPort       int    `screw:"--wsport" usage:"port for the http web socket server"`
+	HttpWsStart      bool   `json:"HttpWsStart"`
+	HttpJsonPort     int    `screw:"--rpcport" usage:"port for the http json rpc port server"`
+	ProfilePort      uint32 `screw:"--profileport" usage:"port for the http profile port rpc server"`
+	ProfileHost      string `screw:"--profilehost" usage:"port for the http profile rpc host server"`
+	DisableDNS       bool   `screw:"--disabledns" usage:"disable DNS for node"`
+	EnableRPC        bool   `screw:"--enablerpc" usage:"enable RPC for node"`
+	MaxLogsSize      int64  `json:"MaxLogsSize"`
+	MaxPerLogSize    int64  `json:"MaxPerLogSize"`
+	RestCertPath     string `json:"RestCertPath"`
+	RestKeyPath      string `json:"RestKeyPath"`
 	// GenesisBlock defines the first block of the chain.
 	GenesisBlock *types.Block
 
@@ -693,6 +809,25 @@ type Configuration struct {
 	// every CrossChain UTXO spend is rejected. Its mainnet value is enforced
 	// after config-file and command-line parsing.
 	CrossChainUTXOFreezeHeight uint32
+
+	// StrictMoneyRangeHeight defines the height from which strict monetary
+	// validation (checked arithmetic + money range) is enforced.
+	StrictMoneyRangeHeight uint32 `screw:"--strictmoneyrangeheight" usage:"defines the height from which strict monetary validation is enforced"`
+
+	// RevisedDPoSRewardHeight defines the height from which the revised DPoS
+	// reward math applies (F-011/086 ELA-only arbiter basis; F-212 empty-slot
+	// reward not double-counted). Separate from StrictMoneyRangeHeight per the
+	// core engineers (Q-B6) — a fresh future activation height, not the incident
+	// gate.
+	RevisedDPoSRewardHeight uint32 `screw:"--reviseddposrewardheight" usage:"defines the height from which the revised DPoS reward math is enforced"`
+
+	// ForcedRollbackHeight is the height a patched node rewinds TO on startup,
+	// but only when ForcedRollbackTrigger matches the block above it.
+	ForcedRollbackHeight uint32 `screw:"--forcedrollbackheight" usage:"height a patched node rewinds to on startup, armed only by forcedrollbacktrigger"`
+
+	// ForcedRollbackTrigger is the hex hash of the block at
+	// ForcedRollbackHeight+1 that arms the rollback.
+	ForcedRollbackTrigger string `screw:"--forcedrollbacktrigger" usage:"hex hash of the block at forcedrollbackheight+1 that arms the forced rollback"`
 	// CrossChainUTXORestrictionHeight defines the mainnet height at which only
 	// authorized bridge transactions may spend CrossChain UTXOs. Its mainnet
 	// value is enforced after config-file and command-line parsing.
@@ -940,8 +1075,16 @@ func (p *Configuration) InstantBlock() *Configuration {
 
 func (p *Configuration) Sterilize() *Configuration {
 	if p.FoundationAddress != "" {
-		p.FoundationProgramHash, _ = common.Uint168FromAddress(
+		var err error
+		p.FoundationProgramHash, err = common.Uint168FromAddress(
 			p.FoundationAddress)
+		// F-043 prereq: FoundationProgramHash is dereferenced below for the genesis
+		// block, so a malformed address must fail HERE with a clear message rather
+		// than nil-deref far away. A node cannot run without a valid foundation
+		// address, so this misconfiguration is fatal.
+		if err != nil {
+			panic(fmt.Sprintf("config: invalid FoundationAddress %q: %v", p.FoundationAddress, err))
+		}
 	}
 	if p.DestroyELAAddress != "" {
 		p.DestroyELAProgramHash, _ = common.Uint168FromAddress(

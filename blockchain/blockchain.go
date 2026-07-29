@@ -33,17 +33,59 @@ import (
 	"github.com/elastos/Elastos.ELA/database"
 	"github.com/elastos/Elastos.ELA/dpos/p2p/peer"
 	"github.com/elastos/Elastos.ELA/dpos/state"
+	"github.com/elastos/Elastos.ELA/elanet/pact"
 	"github.com/elastos/Elastos.ELA/events"
 	"github.com/elastos/Elastos.ELA/p2p/msg"
 	"github.com/elastos/Elastos.ELA/utils"
 )
 
 const (
-	maxOrphanBlocks    = 10000
+	// maxOrphanBlocks bounds the chain's orphan pool by cardinality.
+	//
+	// A count cap on its own does not bound memory. A block may be
+	// pact.MaxBlockContextSize+pact.MaxBlockHeaderSize = 9,000,000 bytes, so a cap of
+	// 10,000 permits about 85 GiB of attacker-supplied blocks, admitted past a single
+	// free gate (CheckBlockSanity, whose work check is against PowLimit) with no ban
+	// score charged anywhere on the path. Retention is about 1.0003x the wire bytes
+	// delivered, so a 16 GiB node dies at roughly 1,800 maximum-size orphans; the byte
+	// ceiling below is the bound that matters.
+	//
+	// 1024 is far beyond any honest reorg depth or any legitimate burst of blocks whose
+	// parent is momentarily missing. The average retained mainnet block is about 11 KiB,
+	// so the byte ceiling below holds roughly 23,000 of them and this count cap is what
+	// binds on honest traffic.
+	maxOrphanBlocks = 1024
+
+	// maxOrphanBlockBytes bounds the chain's orphan pool by bytes, which is the
+	// dimension that actually kills the process. 256 MiB is about 28x the largest
+	// single block the protocol permits, so no honest orphan is ever rejected for
+	// want of room, while the worst case an unauthenticated peer can pin is a fixed,
+	// survivable quantity.
+	//
+	// Ungated, on the same reasoning as the mempool pool bounds
+	// (mempool/blockpool.go:22-41): this is retention policy, not block acceptance.
+	// Refusing to retain an orphan cannot change which blocks are valid, since an
+	// orphan has by definition not been accepted and CheckBlockContext has never run
+	// on it, and a genuinely connectable block that is dropped is simply re-requested
+	// on the next announcement.
+	maxOrphanBlockBytes = 256 * 1024 * 1024
+
 	minMemoryNodes     = 20160
 	maxBlockLocators   = 500
 	medianTimeBlocks   = 11
 	maxHistoryCapacity = 720
+)
+
+// orphanCountCeiling and orphanByteCeiling are the ceilings AddOrphanBlock
+// actually enforces. They are vars rather than consts for one reason only: the
+// orphan-pool regression test lowers them so that eviction can be driven through
+// the real processBlock without moving hundreds of MiB of blocks through a unit
+// test. Nothing in production assigns them, and
+// TestNX02CeilingsDefaultToTheProductionConstants asserts the defaults, so a
+// silent weakening of the policy fails the suite.
+var (
+	orphanCountCeiling = uint64(maxOrphanBlocks)
+	orphanByteCeiling  = uint64(maxOrphanBlockBytes)
 )
 
 var (
@@ -80,6 +122,9 @@ type BlockChain struct {
 	prevOrphans    map[Uint256][]*OrphanBlock
 	oldestOrphan   *OrphanBlock
 	orphanConfirms map[Uint256]*payload.Confirm
+	// orphanBytes is the running serialized size of every block held in
+	// b.orphans. Maintained under orphanLock alongside the map itself.
+	orphanBytes uint64
 
 	blockCache     map[Uint256]*Block
 	confirmCache   map[Uint256]*payload.Confirm
@@ -276,22 +321,187 @@ func (b *BlockChain) MigrateOldDB(
 	return err
 }
 
-// InitCheckpoint go through all blocks since the genesis block
-// to initialize all checkpoint.
+// restoreCheckpoints loads every checkpoint from its file and re-initializes the
+// in-memory state from it.
+//
+// #4 (R2): CkpManager.Restore -> ICheckPoint.OnInit ->
+// Arbiters.RecoverFromCheckPoints REPLACES the whole arbiter set, the degradation
+// state, both History objects and the pending special-tx savepoint -- and it swaps
+// State.History under a.mtx while a concurrent gossip bracket uses it under s.mtx.
+// main.go starts the DPoS arbitrator (main.go:286) BEFORE it calls InitCheckpoint
+// (main.go:328), so such a bracket can already be running on another goroutine:
+// serialize the restore against it. Nothing below re-acquires specialTxMtx.
+func (b *BlockChain) restoreCheckpoints() error {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	return b.CkpManager.Restore()
+}
+
+// resetCheckpoints throws away all in-memory checkpoint state and rebuilds it from
+// the genesis defaults. Only reorganizeChain's recoverFromDefault branch uses it.
+//
+// #4 (R2): dpos/state CheckPoint.OnReset rebuilds the Arbiters wholesale
+// (initArbitrators -> initFromArbitrators -> RecoverFromCheckPoints), so it is its
+// own special-tx bracket and must not interleave with a gossip emergency bracket.
+// It is reached from reorganizeChain under b.mutex with specialTxMtx free (the
+// detach-loop rollback released it), so there is no re-acquisition and the
+// [b.mutex ->] specialTxMtx order is preserved.
+func (b *BlockChain) resetCheckpoints() {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	// Return value discarded exactly as the pristine call site discarded it.
+	b.CkpManager.OnReset()
+}
+
+// discardStaleCheckpoints is the special-tx BOUNDARY for
+// CkpManager.DiscardStaleCheckpoints, which reaches ICheckPoint.OnReset and
+// therefore rebuilds the Arbiters wholesale exactly as resetCheckpoints does. Same
+// lock, same [b.mutex ->] specialTxMtx order, and nothing inside re-acquires it.
+func (b *BlockChain) discardStaleCheckpoints(bestHeight uint32) error {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	return b.CkpManager.DiscardStaleCheckpoints(bestHeight)
+}
+
+// replayCheckpointBlock replays ONE retained-history block into the checkpoints.
+//
+// #4 (R2): this is a special-tx BRACKET -- PreProcessSpecialTx marks the savepoint
+// and applies the emergency ForceChange, CkpManager.OnBlockSaved then mutates the
+// very same Arbiters state (dpos/state/checkpoint.go OnBlockSaved ->
+// Arbiters.ProcessBlock -> State.ProcessBlock under s.mtx + IncreaseChainHeight
+// under a.mtx), and only then is the savepoint committed or undone. N-001 shipped
+// this serialization for connectBlock and for the four DPoS-gossip sites but NOT
+// for the init/recover replay, which is reachable from main.go:328 (startup, with
+// the arbitrator already started at main.go:286) and from reorganizeChain's
+// recoverFromDefault branch. Unserialized, a gossip ProcessSpecialTxPayload
+// (forceChange reads the producer maps under a.mtx only) races State.ProcessBlock
+// (writes them under s.mtx only) -- a genuine cross-mutex data race -- and can also
+// mark/commit its own savepoint inside this open bracket.
+//
+// The lock is taken at the BOUNDARY and released here; nothing inside re-acquires
+// it (RollbackTo / RollbackSeekTo deliberately do not self-acquire), so there is no
+// self-deadlock. Lock order is [b.mutex ->] specialTxMtx -> {a.mtx, s.mtx,
+// CkpManager.mtx, IndexLock} -- reorganizeChain reaches this under b.mutex, the
+// startup caller reaches it with no chain lock held, and nothing takes b.mutex
+// while holding specialTxMtx, so the order cannot invert.
+//
+// Pure runtime locking: no decision, no ordering and no stored byte changes, so
+// below-gate replay stays identical and the change is UNGATED.
+func (b *BlockChain) replayCheckpointBlock(block *DposBlock) error {
+	arbiters := DefaultLedger.Arbitrators
+	arbiters.LockSpecialTx()
+	defer arbiters.UnlockSpecialTx()
+
+	if err := PreProcessSpecialTx(block.Block); err != nil {
+		// The replay aborts here, so the emergency ForceChange this block's
+		// special tx just applied must not survive.
+		arbiters.UndoPendingSpecialTx()
+		return err
+	}
+
+	b.CkpManager.OnBlockSaved(block, nil,
+		b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, true)
+	// The block is replayed from the retained main chain, so its
+	// special-tx effect is committed exactly as it historically was.
+	arbiters.CommitPendingSpecialTx()
+	return nil
+}
+
+// saveBlockCheckpoints is the post-connect checkpoint-save boundary used by the
+// reorg attach loop and by processBlock's linear-extend branch.
+//
+// #4 (R2): CkpManager.OnBlockSaved reaches dpos/state/checkpoint.go OnBlockSaved ->
+// Arbiters.ProcessBlock, which mutates exactly the state a concurrent gossip
+// emergency bracket mutates (producer maps, arbiter set, DutyIndex, History,
+// Snapshots) under a DIFFERENT mutex, so the two must be serialized. connectBlock
+// released specialTxMtx in its deferred commit/undo before returning, and
+// connectBestChain likewise, so this site never re-acquires a lock it already
+// holds.
+func (b *BlockChain) saveBlockCheckpoints(block *DposBlock) {
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer DefaultLedger.Arbitrators.UnlockSpecialTx()
+
+	b.CkpManager.OnBlockSaved(block, nil,
+		b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, false)
+}
+
+// InitCheckpoint goes through all blocks since the genesis block to initialize all
+// checkpoints: it restores the checkpoints from disk and replays the retained chain
+// forward into them. STARTUP entry point: it keeps a restored checkpoint exactly as
+// found, which is what the forced-rollback safety net in main.go then inspects
+// through CkpManager.MaxHeight().
 func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
-	barStart func(total uint32), increase func()) (err error) {
+	barStart func(total uint32), increase func()) error {
+	return b.initCheckpoint(interrupt, barStart, increase, false)
+}
+
+// InitCheckpointAfterDeepReset is the reorg deep-reset entry point. It is identical
+// to InitCheckpoint except that a restored checkpoint sitting above the post-detach
+// best height is discarded and rebuilt rather than trusted; see
+// Manager.DiscardStaleCheckpoints. The distinction matters: only the reorg branch
+// can restore a snapshot written on a branch the node just abandoned, and
+// blanket-discarding at startup would silently convert main.go's forced-rollback
+// refusal into a multi-hour full replay.
+func (b *BlockChain) InitCheckpointAfterDeepReset() error {
+	return b.initCheckpoint(nil, nil, nil, true)
+}
+
+// ErrCheckpointInitInterrupted reports that the operator interrupted the
+// checkpoint restore-and-replay before it finished.
+//
+// It exists because the alternative is reporting success. Returning the shared
+// `err` variable on the interrupt branch reports whatever it happens to hold,
+// which is nil: on that branch the replay goroutine has by definition not
+// finished. On the ffldb harness InitCheckpoint then returns nil having replayed
+// 0 of 9 blocks, and the goroutine replays all 9 after the caller has been told
+// the initialisation succeeded. main.go treats a nil return as "derived state is
+// rebuilt" and carries on into the forced-rollback baseline assertion, which
+// reads CkpManager.MaxHeight() while that goroutine is still mutating it, and
+// then starts the P2P server. The DPoS arbiter network is worse: it is started
+// above this call (main.go, in the `if acc != nil` block, because the success
+// path below publishes ETDirectPeersChanged synchronously and that subscriber
+// needs a running dpos/p2p server), so the node is already in the arbiter mesh,
+// and a silent nil here leaves it there running on half-derived DPoS and CR
+// state. Reading `err` on that branch is also a data race on a variable the
+// replay goroutine is concurrently writing.
+var ErrCheckpointInitInterrupted = errors.New(
+	"checkpoint initialisation interrupted before the derived-state replay finished")
+
+func (b *BlockChain) initCheckpoint(interrupt <-chan struct{},
+	barStart func(total uint32), increase func(), discardStale bool) (err error) {
 	bestHeight := b.GetHeight()
 	log.Info("current block height ->", bestHeight)
 	arbiters := DefaultLedger.Arbitrators
-	done := make(chan struct{})
+	// BUFFERED, and carrying the outcome rather than sharing a variable with the
+	// caller. The shipped channel was unbuffered and the goroutine's last statement
+	// was a send on it, so on the interrupt branch -- where nobody ever receives --
+	// the replay goroutine parked on that send for the lifetime of the process,
+	// holding everything it had reached through.
+	done := make(chan error, 1)
 	go func() {
+		var err error
 		// Notify initialize process start.
 		startHeight := uint32(0)
 
-		if err = b.CkpManager.Restore(); err != nil {
-			log.Warn(err)
-			err = nil
+		if e := b.restoreCheckpoints(); e != nil {
+			log.Warn(e)
 		}
+
+		// The restore above just wrote the on-disk default snapshots into the live
+		// checkpoints, height included. On the deep-reset path that file may belong to
+		// the branch this reorg is abandoning, and nothing ever lowers a checkpoint
+		// height, so a checkpoint left above bestHeight would make both the replay below
+		// and the caller's attach loop no-ops for it.
+		if discardStale {
+			if e := b.discardStaleCheckpoints(bestHeight); e != nil {
+				done <- e
+				return
+			}
+		}
+
 		safeHeight := b.CkpManager.SafeHeight()
 		if startHeight < safeHeight {
 			startHeight = safeHeight + 1
@@ -303,6 +513,16 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 		}
 
 		for i := startHeight; i <= bestHeight; i++ {
+			// Stop AT A BLOCK BOUNDARY when the operator interrupts, so the replay
+			// does not keep rebuilding derived state behind a caller that has already
+			// been told the initialisation did not complete.
+			select {
+			case <-interrupt:
+				done <- ErrCheckpointInitInterrupted
+				return
+			default:
+			}
+
 			hash, e := b.GetBlockHash(i)
 			if e != nil {
 				err = e
@@ -323,13 +543,10 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 				}
 			}
 
-			if e = PreProcessSpecialTx(block.Block); e != nil {
+			if e = b.replayCheckpointBlock(block); e != nil {
 				err = e
 				break
 			}
-
-			b.CkpManager.OnBlockSaved(block, nil,
-				b.state.ConsensusAlgorithm == state.POW, b.state.RevertToPOWBlockHeight, true)
 
 			// Notify process increase.
 			if increase != nil {
@@ -337,10 +554,28 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 			}
 		}
 
-		done <- struct{}{}
+		done <- err
 	}()
 	select {
-	case <-done:
+	case e := <-done:
+		if e != nil {
+			// The replay stopped itself on the interrupt. Nothing below may run: the
+			// arbiter set has not been rebuilt, so starting it and announcing its
+			// peers would put a node with half-derived DPoS state into the mesh.
+			//
+			// That reasoning is not specific to the interrupt. It applies to EVERY
+			// failure of the replay, and the interrupt sentinel used to be the only
+			// error that returned here: any other failure fell through, called
+			// arbiters.Start() and published ETDirectPeersChanged, joining the mesh
+			// with exactly the half-derived state this branch exists to keep out.
+			// The error was assigned to `err` and surfaced later, by which point the
+			// arbiters were already running and the peers already announced.
+			//
+			// On restart day this is the difference between a node that refuses to
+			// start and a node that takes an on-duty arbiter seat while disagreeing
+			// with the fleet about who may produce.
+			return e
+		}
 		arbiters.Start()
 
 		currentArbiters := arbiters.GetCurrentNeedConnectArbiters()
@@ -354,6 +589,11 @@ func (b *BlockChain) InitCheckpoint(interrupt <-chan struct{},
 				CRPeers:      crArbiters})
 
 	case <-interrupt:
+		// NOT `return err`. The replay goroutine is still running and still writing
+		// that variable; reading it here is both a data race and, because it is
+		// almost always still nil, a report of SUCCESS for an initialisation that
+		// did not happen.
+		return ErrCheckpointInitInterrupted
 	}
 	return err
 }
@@ -638,13 +878,37 @@ func CalculateTxsFee(block *Block) {
 			log.Error("get transaction Reference failed")
 			return
 		}
+		// Height-gated to stay bit-identical to unpatched nodes (and to the
+		// acceptance-path getTransactionFee) BELOW StrictMoneyRangeHeight: this value
+		// feeds tx.Fee() -> DPoS reward derivation, so it must match the network
+		// exactly on historical/reindexed blocks. At/above the gate use checked
+		// accumulation (an overflowing tx cannot be accepted there anyway).
 		var outputValue Fixed64
 		var inputValue Fixed64
-		for _, output := range tx.Outputs() {
-			outputValue += output.Value
-		}
-		for _, output := range references {
-			inputValue += output.Value
+		if block.Height >= DefaultLedger.Blockchain.chainParams.StrictMoneyRangeHeight {
+			var feeAccErr error
+			for _, output := range tx.Outputs() {
+				if outputValue, feeAccErr = AddFixed64(outputValue, output.Value); feeAccErr != nil {
+					break
+				}
+			}
+			for _, output := range references {
+				if feeAccErr != nil {
+					break
+				}
+				inputValue, feeAccErr = AddFixed64(inputValue, output.Value)
+			}
+			if feeAccErr != nil {
+				log.Errorf("CalculateTxsFee: value overflow computing fee for tx %s (post-validation, unexpected); skipping fee annotation", tx.Hash())
+				continue
+			}
+		} else {
+			for _, output := range tx.Outputs() {
+				outputValue += output.Value
+			}
+			for _, output := range references {
+				inputValue += output.Value
+			}
 		}
 		// set Fee and FeePerKB if check has passed
 		tx.SetFee(inputValue - outputValue)
@@ -822,10 +1086,17 @@ func (b *BlockChain) ProcessIllegalBlock(payload *payload.DPOSIllegalBlocks) {
 		log.Info("received inactive tx when synchronizing")
 		return
 	}
+	// #4: hold specialTxMtx across the whole gossip bracket so it cannot interleave
+	// with a concurrent block-connect or reorg-detach bracket.
+	DefaultLedger.Arbitrators.LockSpecialTx()
 	if err := DefaultLedger.Arbitrators.ProcessSpecialTxPayload(payload,
 		b.BestChain.Height); err != nil {
 		log.Error("process illegal block error: ", err)
 	}
+	// The gossip path is not bracketed by a block connect, so its emergency
+	// change is permanent.
+	DefaultLedger.Arbitrators.CommitPendingSpecialTx()
+	DefaultLedger.Arbitrators.UnlockSpecialTx()
 }
 
 func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators) {
@@ -834,18 +1105,38 @@ func (b *BlockChain) ProcessInactiveArbiter(payload *payload.InactiveArbitrators
 		log.Info("received inactive tx when synchronizing")
 		return
 	}
+	// #4: hold specialTxMtx across the whole gossip bracket so it cannot interleave
+	// with a concurrent block-connect or reorg-detach bracket.
+	DefaultLedger.Arbitrators.LockSpecialTx()
 	if err := DefaultLedger.Arbitrators.ProcessSpecialTxPayload(payload,
 		b.BestChain.Height); err != nil {
 		log.Error("process illegal block error: ", err)
 	}
+	// The gossip path is not bracketed by a block connect, so its emergency
+	// change is permanent.
+	DefaultLedger.Arbitrators.CommitPendingSpecialTx()
+	DefaultLedger.Arbitrators.UnlockSpecialTx()
 }
 
 type OrphanBlock struct {
 	Block      *Block
 	Expiration time.Time
+	// size is the serialized size of Block, captured once at insert so that the
+	// running total in BlockChain.orphanBytes is credited and debited with the
+	// identical value even if Block were ever mutated.
+	size uint64
 }
 
 func (b *BlockChain) ProcessOrphans(hash *Uint256) error {
+	// The 1-hour expiry stamped in AddOrphanBlock is enforced by the sweep at the top
+	// of AddOrphanBlock itself, which alone would mean that once an attacker stops
+	// sending, the orphans it has pinned are retained for the life of the process:
+	// the pool would not self-heal. ProcessOrphans runs on every successful block
+	// connect (processBlock, after maybeAcceptBlock), so sweeping here releases
+	// expired orphans at the chain's own cadence without introducing a background
+	// goroutine or any new lifecycle to manage.
+	b.SweepExpiredOrphans()
+
 	processHashes := make([]*Uint256, 0, 10)
 	processHashes = append(processHashes, hash)
 	for len(processHashes) > 0 {
@@ -881,9 +1172,34 @@ func (b *BlockChain) RemoveOrphanBlock(orphan *OrphanBlock) {
 	b.orphanLock.Lock()
 	defer b.orphanLock.Unlock()
 
+	b.removeOrphanBlockLocked(orphan)
+}
+
+// removeOrphanBlockLocked drops an orphan from every index and debits its bytes
+// from the running total. The caller must hold b.orphanLock for writing.
+func (b *BlockChain) removeOrphanBlockLocked(orphan *OrphanBlock) {
+	if orphan == nil {
+		return
+	}
+
 	orphanHash := orphan.Block.Hash()
+	// An eviction that silently removes nothing is how a count cap gets exceeded.
+	// Only debit bytes for the entry that is actually in the map, and compare by
+	// identity so a stale pointer can never evict its replacement.
+	if cur, exists := b.orphans[orphanHash]; !exists || cur != orphan {
+		if b.oldestOrphan == orphan {
+			b.oldestOrphan = nil
+		}
+		return
+	}
+
 	delete(b.orphans, orphanHash)
 	delete(b.orphanConfirms, orphanHash)
+	if b.orphanBytes >= orphan.size {
+		b.orphanBytes -= orphan.size
+	} else {
+		b.orphanBytes = 0
+	}
 
 	prevHash := &orphan.Block.Header.Previous
 	orphans := b.prevOrphans[*prevHash]
@@ -907,25 +1223,82 @@ func (b *BlockChain) RemoveOrphanBlock(orphan *OrphanBlock) {
 	}
 }
 
-func (b *BlockChain) AddOrphanBlock(block *Block) {
-	for _, oBlock := range b.orphans {
-		if time.Now().After(oBlock.Expiration) {
-			b.RemoveOrphanBlock(oBlock)
-			continue
-		}
+// SweepExpiredOrphans drops every orphan whose 1-hour expiry has passed. It is
+// safe to call at any time and takes no argument, so it can be driven from the
+// block-connect path as well as from the insert path. Driving it only from
+// AddOrphanBlock would pin a pool filled by an attacker who then went quiet for
+// the life of the process.
+func (b *BlockChain) SweepExpiredOrphans() {
+	b.orphanLock.Lock()
+	defer b.orphanLock.Unlock()
 
-		if b.oldestOrphan == nil || oBlock.Expiration.Before(b.oldestOrphan.Expiration) {
-			b.oldestOrphan = oBlock
+	b.expireOrphansLocked()
+}
+
+// expireOrphansLocked removes expired orphans. Caller must hold b.orphanLock for
+// writing. Deleting from a map while ranging over it in the same goroutine is
+// well defined in Go.
+func (b *BlockChain) expireOrphansLocked() {
+	now := time.Now()
+	for _, oBlock := range b.orphans {
+		if now.After(oBlock.Expiration) {
+			b.removeOrphanBlockLocked(oBlock)
 		}
 	}
+}
 
-	if len(b.orphans)+1 > maxOrphanBlocks {
-		b.RemoveOrphanBlock(b.oldestOrphan)
-		b.oldestOrphan = nil
+// oldestOrphanLocked returns the orphan with the earliest expiration, which is
+// also the earliest inserted (every orphan is stamped now+1h at insert). Caller
+// must hold b.orphanLock for writing.
+func (b *BlockChain) oldestOrphanLocked() *OrphanBlock {
+	var oldest *OrphanBlock
+	for _, oBlock := range b.orphans {
+		if oldest == nil || oBlock.Expiration.Before(oldest.Expiration) {
+			oldest = oBlock
+		}
+	}
+	b.oldestOrphan = oldest
+	return oldest
+}
+
+// makeOrphanRoomLocked expires stale orphans and then evicts oldest-first until
+// the pool can take another `incoming` bytes while staying under BOTH the count
+// ceiling and the byte ceiling. Caller must hold b.orphanLock for writing.
+func (b *BlockChain) makeOrphanRoomLocked(incoming uint64) {
+	b.expireOrphansLocked()
+
+	for len(b.orphans) > 0 &&
+		(uint64(len(b.orphans))+1 > orphanCountCeiling ||
+			b.orphanBytes+incoming > orphanByteCeiling) {
+		oldest := b.oldestOrphanLocked()
+		if oldest == nil {
+			break
+		}
+		b.removeOrphanBlockLocked(oldest)
+	}
+}
+
+func (b *BlockChain) AddOrphanBlock(block *Block) {
+	// Serialize outside the lock. CheckBlockSanity has already called GetSize on
+	// this block before processBlock reached us, so this costs no new order of
+	// work on the admission path.
+	size := block.GetSize()
+	if size < 0 {
+		// A block that will not serialize cannot be sized; charge it the
+		// protocol maximum rather than accounting it as free.
+		size = int(pact.MaxBlockContextSize + pact.MaxBlockHeaderSize)
 	}
 
 	b.orphanLock.Lock()
 	defer b.orphanLock.Unlock()
+
+	hash := block.Hash()
+	if _, exists := b.orphans[hash]; exists {
+		// Already retained; re-inserting would double-count its bytes.
+		return
+	}
+
+	b.makeOrphanRoomLocked(uint64(size))
 
 	// Insert the block into the orphan map with an expiration time
 	// 1 hour from now.
@@ -933,20 +1306,50 @@ func (b *BlockChain) AddOrphanBlock(block *Block) {
 	oBlock := &OrphanBlock{
 		Block:      block,
 		Expiration: expiration,
+		size:       uint64(size),
 	}
-	b.orphans[block.Hash()] = oBlock
+	b.orphans[hash] = oBlock
+	b.orphanBytes += uint64(size)
 
 	// Add to previous hash lookup index for faster dependency lookups.
 	prevHash := &block.Header.Previous
 	b.prevOrphans[*prevHash] = append(b.prevOrphans[*prevHash], oBlock)
 
+	// The newest orphan is never the oldest; force a recompute on the next
+	// eviction rather than carrying a stale pointer across calls.
+	b.oldestOrphan = nil
+
 	return
+}
+
+// OrphanPoolStats reports the current occupancy of the chain's orphan pool
+// (count, bytes) together with the ceilings it is held under.
+func (b *BlockChain) OrphanPoolStats() (count int, bytes uint64, maxCount uint64, maxBytes uint64) {
+	b.orphanLock.RLock()
+	defer b.orphanLock.RUnlock()
+
+	return len(b.orphans), b.orphanBytes, orphanCountCeiling, orphanByteCeiling
 }
 
 func (b *BlockChain) AddOrphanConfirm(confirm *payload.Confirm) {
 	b.orphanLock.Lock()
+	defer b.orphanLock.Unlock()
+
+	// orphanConfirms is only ever drained by removeOrphanBlockLocked, which is keyed
+	// by an orphan's hash, so a confirm whose block is not, or is no longer, in the
+	// pool would be pinned for the life of the process on the same unauthenticated
+	// path. The sole production caller (mempool/blockpool.go:251) reaches here
+	// immediately after ProcessBlock reported isOrphan, so in the normal case the
+	// block is present; the race it loses is the one where the byte ceiling evicted
+	// the block in between, and in that case the confirm is useless anyway, because
+	// ProcessOrphans only ever looks a confirm up for an orphan it is holding.
+	// Binding admission to membership makes this map bounded by the pool by
+	// construction.
+	if _, exists := b.orphans[confirm.Proposal.BlockHash]; !exists {
+		return
+	}
+
 	b.orphanConfirms[confirm.Proposal.BlockHash] = confirm
-	b.orphanLock.Unlock()
 }
 
 func (b *BlockChain) GetOrphanConfirm(hash *Uint256) (*payload.Confirm, bool) {
@@ -1368,8 +1771,15 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		// roll back state about the last block before disconnect
 		if !recoverFromDefault &&
 			block.Height-1 >= b.chainParams.VoteStartHeight {
+			// #4: serialize this standalone reorg-detach rollback -- which reaches
+			// Arbiters.RollbackTo -> undoPendingSpecialTx -- against any concurrent
+			// gossip emergency bracket. It runs under b.mutex and is NOT nested in a
+			// connectBlock bracket (detach precedes the attach/connectBlock loop), and
+			// RollbackTo does not re-acquire specialTxMtx, so there is no deadlock.
+			DefaultLedger.Arbitrators.LockSpecialTx()
 			err = b.CkpManager.OnRollbackTo(
 				block.Height-1, b.state.ConsensusAlgorithm == state.POW)
+			DefaultLedger.Arbitrators.UnlockSpecialTx()
 			if err != nil {
 				return err
 			}
@@ -1384,8 +1794,19 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	// recover check point from genesis block
 	if recoverFromDefault {
 		//reset all mem state data
-		b.CkpManager.OnReset()
-		b.InitCheckpoint(nil, nil, nil)
+		// #4 (R2): resetCheckpoints holds the bracket lock; the replay that follows
+		// re-acquires it ONCE PER REPLAYED BLOCK inside replayCheckpointBlock -- the
+		// same per-block granularity connectBlock already uses -- so the lock is
+		// released before InitCheckpoint and there is no self-deadlock.
+		b.resetCheckpoints()
+		// Discard any restored checkpoint that is ahead of the post-detach chain instead
+		// of freezing derived state on it, and propagate the rebuild error: a failed
+		// derived-state rebuild must fail the reorg rather than let it continue with
+		// unknown DPoS/CR state.
+		if err := b.InitCheckpointAfterDeepReset(); err != nil {
+			log.Error("[reorganizeChain] deep-reset checkpoint rebuild failed: ", err)
+			return err
+		}
 	}
 
 	// Connect the new best chain blocks.
@@ -1401,12 +1822,11 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		}
 
 		// update state after connected block
-		b.CkpManager.OnBlockSaved(&DposBlock{
+		b.saveBlockCheckpoints(&DposBlock{
 			Block:       block,
 			HaveConfirm: confirm != nil,
 			Confirm:     confirm,
-		}, nil, b.state.ConsensusAlgorithm == state.POW,
-			b.state.RevertToPOWBlockHeight, false)
+		})
 		DefaultLedger.Arbitrators.DumpInfo(block.Height)
 		delete(b.blockCache, *n.Hash)
 		delete(b.confirmCache, *n.Hash)
@@ -1478,7 +1898,127 @@ func (b *BlockChain) disconnectBlock(node *BlockNode, block *Block, confirm *pay
 
 // connectBlock handles connecting the passed node/block to the end of the main
 // (best) chain.
+//
+// The ETBlockConnected notification is delivered here, outside the special-tx
+// bracket that connectBlockBracketed opens and closes. events.Notify runs every
+// registered subscriber while holding the process-wide events.mtx, so notifying
+// while specialTxMtx is held creates a specialTxMtx -> events.mtx edge on every
+// connected block; paired with a subscriber that blocks on specialTxMtx that is an
+// AB-BA deadlock that wedges both block connect and the whole event bus. The
+// bracket is not shortened by one instruction of state work: everything that must
+// stay atomic (mark -> mutate -> commit/undo) is inside connectBlockBracketed, and
+// its deferred commit/undo has already run by the time this function resumes. No
+// subscriber of ETBlockConnected reads the special-tx savepoint (they clean the
+// tx/block pools and push to websocket clients), so committing before the broadcast
+// rather than after is observationally identical.
 func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payload.Confirm) error {
+	if err := b.connectBlockBracketed(node, block, confirm); err != nil {
+		return err
+	}
+
+	// Notify the caller that the block was connected to the main chain.
+	// The caller would typically want to react with actions such as
+	// updating wallets.
+	events.Notify(events.ETBlockConnected, block)
+
+	return nil
+}
+
+// connectBlockBracketed is connectBlock's body: every step that must run inside the
+// special-tx bracket, and nothing else.
+func (b *BlockChain) connectBlockBracketed(node *BlockNode, block *Block, confirm *payload.Confirm) (err error) {
+	var revertToPOW bool
+	for _, tx := range block.Transactions {
+		if tx.IsRevertToPOW() {
+			revertToPOW = true
+			break
+		}
+	}
+
+	// confirmValidated is the single expression that decides whether a peer-supplied
+	// Confirm is membership/quorum-checked (checkBlockWithConfirmation -> ConfirmContextCheck)
+	// before it is persisted and served. It is computed once here and consumed twice: by
+	// the refusal immediately below and by the check itself further down, so the two
+	// can never drift apart.
+	confirmValidated := confirm != nil &&
+		block.Height >= b.chainParams.CRCOnlyDPOSHeight && !revertToPOW &&
+		b.state.ConsensusAlgorithm != state.POW
+
+	// On the legs where confirmValidated is false, a Confirm that arrives with the
+	// block would otherwise be stored and served without any membership or quorum check.
+	// ConfirmSanityCheck (mempool/blockpool.go:192) is pure self-signature, so a wholly
+	// fresh keypair satisfies it at 0, 1 or 25 votes, and ConfirmContextCheck, the only
+	// membership/quorum check on the block path, is reached from exactly one call site
+	// (checkBlockWithConfirmation) behind this same predicate. The Confirm is outside
+	// Block.Hash(), so an attacker needs no hashpower and no keys: he takes an honest
+	// block off the wire, staples any Confirm to it and serves it to peers that have not
+	// stored that block yet. connectBlockBracketed then persists it (dbStoreBlock below,
+	// SaveBlock after it) and Arbiters.ProcessBlock reads confirm.Proposal.Sponsor out of
+	// it. One block later the RecordSponsor rule in CheckBlockContext (live since
+	// RecordSponsorStartHeight) splits on Confirm presence: poisoned nodes then either
+	// halt, because no valid successor exists, or partition.
+	//
+	// PoW-mode and revertToPOW blocks legitimately carry no confirm, which is the
+	// confirm-exempt rescue-block design, so refusing the block is the faithful reading of
+	// the exemption: exempt from requiring a confirm is not licence to accept an unchecked
+	// one. Refusing is safe for liveness: the node is not marked bad, since the block node
+	// is only added to the index after a successful connect and nothing sets
+	// statusValidateFailed, so the honest confirm-less copy of the very same block is
+	// still accepted afterwards.
+	//
+	// No block on the retained chain carries a confirm on any of the three legs. The
+	// lowest confirm anywhere is at height 343400, above CRCOnlyDPOSHeight; none of the 30
+	// RevertToPOW-carrying blocks has one; and the four maximal no-confirm runs above
+	// CRCOnlyDPOSHeight ([1184559..1184571], [1405191..1405965], [1407423..1407542],
+	// [2128711..2129101], 1299 blocks) cover every height at which the dpos state was PoW.
+	// In all 46 RevertToDPOS cases the block at DPOSWorkHeight, the last block validated
+	// while ConsensusAlgorithm is still PoW because State.ProcessBlock flips it only after
+	// that block is connected (saveBlockCheckpoints runs after connectBestChain), carries
+	// no confirm, and the first confirm-carrying block is DPOSWorkHeight+1, validated in
+	// DPoS mode. So this rule rejects nothing the real chain produced, and in particular
+	// it does not fire at the PoW to DPoS transition the recovery fork has to cross.
+	//
+	// Gated at StrictMoneyRangeHeight, the existing coordinated activation, so no third
+	// gate. Below the gate the legs stay open for replay-safety, which leaves a residual
+	// exposure: a malicious sync peer can still poison a node replaying the historical PoW
+	// windows, all of which sit below height 2129102.
+	if confirm != nil && !confirmValidated &&
+		block.Height >= b.chainParams.StrictMoneyRangeHeight {
+		return fmt.Errorf("block %s at height %d carries a confirm on an acceptance "+
+			"leg that performs no membership or quorum check (revertToPOW=%v, "+
+			"consensus is POW=%v): refusing the block", block.Hash(), block.Height,
+			revertToPOW, b.state.ConsensusAlgorithm == state.POW)
+	}
+
+	// PreProcessSpecialTx applies the emergency ForceChange (arbiter rotation,
+	// forceChanged flag, processed-payload marker, snapshot frame) before the block is
+	// context-checked, confirm-checked and stored, and it commits that change at
+	// block.Height-1. History.RollbackTo is strictly-greater-than, so the rollback
+	// performed on failure (checkBlockWithConfirmation -> OnRollbackTo(H-1)) cannot
+	// reverse it: the node would stay rotated onto an arbiter set the network had
+	// rejected, and the payload hash would stay marked processed so the same special tx
+	// could never force-change again on the surviving chain. Bracket the whole connect:
+	// commit on success, undo on every failure exit.
+	//
+	// Fail-path only: a block that connects takes the commit branch, which is the
+	// unmodified behaviour. Every block in the retained history connects, so replay is
+	// bit-identical and this needs no height gate.
+	//
+	// specialTxMtx is held across the whole bracket (mark in PreProcessSpecialTx ->
+	// commit/undo in the defer), so no concurrent DPoS-gossip emergency can mark or
+	// commit its own savepoint into this open bracket. The confirm-failure path below
+	// reaches Arbiters.RollbackTo (checkBlockWithConfirmation -> OnRollbackTo), which
+	// intentionally does not re-acquire specialTxMtx, so there is no self-deadlock.
+	// Released at the very end of the deferred commit/undo.
+	DefaultLedger.Arbitrators.LockSpecialTx()
+	defer func() {
+		if err != nil {
+			DefaultLedger.Arbitrators.UndoPendingSpecialTx()
+		} else {
+			DefaultLedger.Arbitrators.CommitPendingSpecialTx()
+		}
+		DefaultLedger.Arbitrators.UnlockSpecialTx()
+	}()
 	if err := PreProcessSpecialTx(block); err != nil {
 		return err
 	}
@@ -1488,16 +2028,7 @@ func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payloa
 		log.Error("PowCheckBlockContext error!", err)
 		return err
 	}
-	var revertToPOW bool
-	for _, tx := range block.Transactions {
-		if tx.IsRevertToPOW() {
-			revertToPOW = true
-			break
-		}
-	}
-
-	if block.Height >= b.chainParams.CRCOnlyDPOSHeight && !revertToPOW &&
-		b.state.ConsensusAlgorithm != state.POW && confirm != nil {
+	if confirmValidated {
 		if err := checkBlockWithConfirmation(block, confirm,
 			b.CkpManager, b.state.ConsensusAlgorithm == state.POW); err != nil {
 			return fmt.Errorf("block confirmation validate failed: %s", err)
@@ -1518,7 +2049,7 @@ func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payloa
 	// expensive connection logic.  It also has some other nice properties
 	// such as making blocks that never become part of the main chain or
 	// blocks that fail to connect available for further analysis.
-	err := b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
+	err = b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
 		return dbStoreBlock(dbTx, &DposBlock{
 			Block:       block,
 			HaveConfirm: confirm != nil,
@@ -1550,11 +2081,9 @@ func (b *BlockChain) connectBlock(node *BlockNode, block *Block, confirm *payloa
 	b.BestChain = node
 	b.MedianTimePast = medianTime
 
-	// Notify the caller that the block was connected to the main chain.
-	// The caller would typically want to react with actions such as
-	// updating wallets.
-	events.Notify(events.ETBlockConnected, block)
-
+	// G1: ETBlockConnected is NOT notified here -- connectBlock notifies it after
+	// this function returns, i.e. after the deferred commit/undo registered at the
+	// top has released specialTxMtx.
 	return nil
 }
 
@@ -1637,12 +2166,11 @@ func (b *BlockChain) maybeAcceptBlock(block *Block, confirm *payload.Confirm) (b
 	}
 
 	if inMainChain && !reorganized {
-		b.CkpManager.OnBlockSaved(&DposBlock{
+		b.saveBlockCheckpoints(&DposBlock{
 			Block:       block,
 			HaveConfirm: confirm != nil,
 			Confirm:     confirm,
-		}, nil, b.state.ConsensusAlgorithm == state.POW,
-			b.state.RevertToPOWBlockHeight, false)
+		})
 		DefaultLedger.Arbitrators.DumpInfo(block.Height)
 	}
 
@@ -1836,6 +2364,32 @@ func (b *BlockChain) ReorganizeChain2(block *Block) error {
 // 3. error
 func (b *BlockChain) processBlock(block *Block, confirm *payload.Confirm) (bool, bool, error) {
 	blockHash := block.Hash()
+
+	// The forced-rollback trigger block is refused permanently, before anything else
+	// touches it. See the file header on ForcedRollbackArmed for why the trigger is parsed
+	// in reversed byte order: the config value is written in display order so an operator
+	// can check it against a block explorer, and using the non-reversed parse silently
+	// disarms the comparison.
+	//
+	// This must come before the exists check, the orphan map and CheckBlockSanity, because
+	// the damage is done by retaining the block, not by connecting it. connectBestChain's
+	// side-chain arm caches it unvalidated and returns (false,false,nil), which
+	// mempool/blockpool.go reads as "not main chain, not orphan" and answers by calling
+	// CheckConfirmedBlockOnFork. That builds DPOSIllegalBlocks from both confirms, and
+	// dpos/state punishes the intersection of their signers, which for two confirms of one
+	// height is the entire arbiter set. Below the 25-of-36 threshold the chain halts.
+	//
+	// Ungated, and it needs no gate: it only ever rejects, it names a single hash above the
+	// rollback target, and a node that already holds the block still arms the rewind from
+	// the stored index rather than through this path.
+	if trigger := b.chainParams.ForcedRollbackTrigger; trigger != "" {
+		if triggerHash, err := Uint256FromReversedHexString(trigger); err == nil {
+			if blockHash.IsEqual(*triggerHash) {
+				return false, false, fmt.Errorf("block %s is the forced-rollback trigger "+
+					"and is permanently rejected", blockHash)
+			}
+		}
+	}
 
 	log.Debugf("[ProcessBLock] height = %d, hash = %x", block.Header.Height, blockHash.Bytes())
 

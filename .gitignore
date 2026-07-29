@@ -17,7 +17,6 @@
 elastos*/
 /bin
 /tmp
-/go.sum
 keystore
 goheader
 *.out
@@ -26,3 +25,10 @@ benchmark/process/run-to-height
 ela
 ela-cli
 ela-dns
+
+# checkpoint dir created by pow package tests
+cp_txPool/
+
+# macOS AppleDouble resource forks
+._*
+.DS_Store

@@ -447,7 +447,17 @@ func (b *BlockChain) initChainState() error {
 		//	return initialized, nil
 		//}
 		//return initialized, errors.New("initChainState failed")
-		return nil
+		//
+		// The database carries the authoritative chainstate record but not the v2 block
+		// index, so there is nothing left to rebuild the block index, the tip or
+		// BestChain from. Returning nil here starts the node with an empty index at a
+		// non-genesis height, no tip and a nil BestChain, silently, while reporting
+		// success. The migration that would close the gap is disabled just above (the
+		// commented-out lines show failure was the intended outcome), so until it is
+		// restored the only honest result is to refuse to start.
+		return fmt.Errorf("initChainState: chain state is initialized but block "+
+			"index bucket %q is missing; the block database needs re-indexing",
+			blockIndexBucketName)
 	}
 
 	// Attempt to load the chain state from the database.
@@ -573,14 +583,29 @@ func DBStoreBlockNode(dbTx database.Tx, header *common2.Header,
 	return blockIndexBucket.Put(key, value)
 }
 
-// DBRemoveBlockNode stores the block header to the block index bucket.
-// This overwrites the current entry if there exists one.
+// DBRemoveBlockNode removes a block's row from the block index bucket.
 func DBRemoveBlockNode(dbTx database.Tx, header *common2.Header) error {
 	// Write block header data to block index bucket.
 	blockHash := header.Hash()
+	return dbRemoveBlockNodeKey(dbTx, &blockHash, header.Height)
+}
+
+// dbRemoveBlockNodeKey removes a block-index row addressed by hash and height
+// directly, without needing the block body.
+//
+// The forced rollback needs this because it now removes a block's header row LAST,
+// after the raw by-hash store entry is already gone (see RollbackOneBlock), so the
+// header can no longer be re-fetched at that point. It is exactly equivalent:
+// blockIndexKey is built from nothing but the hash and the height, and a BlockNode
+// carries both -- node.Hash is the header hash it was loaded with, node.Height its
+// header height.
+func dbRemoveBlockNodeKey(dbTx database.Tx, blockHash *common.Uint256,
+	height uint32) error {
 	blockIndexBucket := dbTx.Metadata().Bucket(blockIndexBucketName)
-	key := blockIndexKey(&blockHash, header.Height)
-	return blockIndexBucket.Delete(key)
+	if blockIndexBucket == nil {
+		return fmt.Errorf("remove block node: bucket %q missing", blockIndexBucketName)
+	}
+	return blockIndexBucket.Delete(blockIndexKey(blockHash, height))
 }
 
 // blockIndexKey generates the binary key for an entry in the block index
@@ -642,4 +667,32 @@ func DBRemoveBlockIndex(dbTx database.Tx, hash *common.Uint256, height uint32) e
 	byteOrder.PutUint32(serializedHeight[:], height)
 	heightIndex := meta.Bucket(heightIndexBucketName)
 	return heightIndex.Delete(serializedHeight[:])
+}
+
+// blockLocIndexBucketName is the ffldb driver's internal by-hash block-location
+// index (driver bucket-ID 0x00000001). It is the single PERSISTENT chokepoint that
+// every by-hash serve path reads: FetchBlock/HasBlock -> GetBlock/IsBlockInStore,
+// RPC getblock, and P2P getdata (InvTypeBlock / InvTypeConfirmedBlock). It is named
+// here -- matching database/ffldb.blockIdxBucketName -- so this package references
+// the driver-internal name in exactly ONE place; precedent: upgrade.go
+// migrateBlockIndex hardcodes the same literal.
+var blockLocIndexBucketName = []byte("ffldb-blockidx")
+
+// DBRemoveBlockFromStore removes a block's raw-store LOCATION entry from the ffldb
+// by-hash block index, so the store returns ErrBlockNotFound for the hash and can no
+// longer deserialize or serve the block by hash. It parallels DBRemoveBlockNode (the
+// block-header index) and DBRemoveBlockIndex (the main-chain height indexes) but
+// targets the raw block STORE, which those two deliberately leave behind -- see the
+// IFFLDBChainStore.IsBlockInStore contract: "rollback will not remove from file DB".
+//
+// The flat-file (.fdb) bytes are intentionally NOT touched: once this index key is
+// gone the bytes are unreferenced and unfetchable. Rewriting/compacting the flat
+// files to reclaim them would risk the RETAINED blocks and is not required for a
+// rolled-back node to stop serving the discarded ones.
+func DBRemoveBlockFromStore(dbTx database.Tx, hash *common.Uint256) error {
+	idx := dbTx.Metadata().Bucket(blockLocIndexBucketName)
+	if idx == nil {
+		return fmt.Errorf("purge block store: bucket %q missing", blockLocIndexBucketName)
+	}
+	return idx.Delete(hash[:])
 }

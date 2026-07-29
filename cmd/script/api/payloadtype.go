@@ -2016,11 +2016,9 @@ func newSecretaryGeneralProposal(L *lua.LState) int {
 	client, err := checkClient(L, 7)
 
 	fmt.Println("ownerPublicKeyStr", ownerPublicKeyStr)
-	fmt.Println("ownerPrivateKeyStr", ownerPrivateKeyStr)
 	fmt.Println("proposalType", proposalType)
 	fmt.Println("draftDataStr", draftDataStr)
 	fmt.Println("secretaryGeneralPublicKeyStr", secretaryGeneralPublicKeyStr)
-	fmt.Println("secretaryGeneralPrivateKeyStr", secretaryGeneralPrivateKeyStr)
 
 	secretaryGeneralPublicKey, _ := common.HexStringToBytes(secretaryGeneralPublicKeyStr)
 	ownPublicKey, _ := common.HexStringToBytes(ownerPublicKeyStr)
@@ -2039,7 +2037,7 @@ func newSecretaryGeneralProposal(L *lua.LState) int {
 	CRCouncilMembercode := account.RedeemScript
 	CRCouncilMemberDID, _ := getDIDFromCode(CRCouncilMembercode)
 
-	fmt.Printf("account %+v\n", account)
+	fmt.Println("account address", account.Address)
 
 	crcProposal := &payload.CRCProposal{
 		ProposalType:              payload.CRCProposalType(proposalType),
@@ -2285,10 +2283,8 @@ func newCRChangeProposalOwner(L *lua.LState) int {
 	fmt.Println("recipient", recipientStr)
 	fmt.Println("targetHashStr", targetHashStr)
 	fmt.Println("ownerPublicKeyStr", ownerPublicKeyStr)
-	fmt.Println("ownerPrivateStr", ownerPrivateKeyStr)
 	fmt.Println("newOwnerPublicKeyStr", newOwnerPublicKeyStr)
-	fmt.Println("newOwnerPrivateKeyStr", newOwnerPrivateKeyStr)
-	fmt.Printf("account %+v\n", account)
+	fmt.Println("account address", account.Address)
 	fmt.Println("-----newCRChangeProposalOwner------")
 
 	crcProposal := &payload.CRCProposal{
@@ -3196,9 +3192,8 @@ func newCRCouncilMemberClaimNode(L *lua.LState) int {
 
 	fmt.Println("-----newCRCouncilMemberClainNode------")
 	fmt.Println("crManagementPublicKeyStr", crManagementPublicKeyStr)
-	fmt.Println("crDPOSPrivateKeyStr", crDPOSPrivateKeyStr)
 	fmt.Println("crCommitteeDIDStr", crCommitteeDIDStr)
-	fmt.Printf("account: \n %+v\n", account)
+	fmt.Println("account address", account.Address)
 	fmt.Println("-----newCRCouncilMemberClainNode------")
 
 	crCouncilMemberClaimNode := &payload.CRCouncilMemberClaimNode{

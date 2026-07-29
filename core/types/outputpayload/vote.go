@@ -114,6 +114,10 @@ func (vc *VoteContent) Serialize(w io.Writer, version byte) error {
 	return nil
 }
 
+// MaxVoteCandidatesPerContent bounds the per-content candidate slice at decode
+// time (DoS ceiling, not a consensus rule; MaxVoteProducersPerTransaction is 36).
+const MaxVoteCandidatesPerContent = 1024
+
 func (vc *VoteContent) Deserialize(r io.Reader, version byte) error {
 	voteType, err := common.ReadBytes(r, 1)
 	if err != nil {
@@ -125,10 +129,20 @@ func (vc *VoteContent) Deserialize(r io.Reader, version byte) error {
 	if err != nil {
 		return err
 	}
+	// Decode-DoS guard: candidatesCount is attacker-controlled from an untrusted
+	// p2p transaction. Bound it before the append loop.
+	if candidatesCount > MaxVoteCandidatesPerContent {
+		return errors.New("vote content candidate count exceeds maximum")
+	}
 
 	for i := uint64(0); i < candidatesCount; i++ {
 		var cv CandidateVotes
-		if cv.Deserialize(r, version); err != nil {
+		// NOTE: this MUST bind and test the Deserialize error. The previous form
+		// `if cv.Deserialize(r, version); err != nil` discarded the return and
+		// re-tested the (nil) err from ReadVarUint above, so a truncated body never
+		// broke the loop -- it appended a zero value on every one of up to 2^64
+		// iterations until the node exhausted memory.
+		if err := cv.Deserialize(r, version); err != nil {
 			return err
 		}
 		vc.CandidateVotes = append(vc.CandidateVotes, cv)
@@ -236,6 +250,21 @@ func (o *VoteOutput) Validate() error {
 			}
 			candidateMap[c] = struct{}{}
 
+			// NOTE: the absolute money-range bound on cv.Votes deliberately does NOT
+			// live here, for exactly the reason CrossChainOutput.Validate() records:
+			// Validate() carries no block height, so an unconditional bound is applied
+			// to RETAINED history as well as to new blocks. Rule 2 requires every block
+			// at or below the forced-rollback target to keep the verdict the released
+			// v0.9.9.6 gave it, and an ungated acceptance change here can only ever
+			// move a verdict from accept to reject. That defect already shipped once in
+			// this codebase, as an ungated money bound that rejected real block
+			// 2,208,265.
+			//
+			// The bound IS applied, height-gated at StrictMoneyRangeHeight, by the
+			// callers that know the height:
+			//   - TransferAssetTransaction.CheckTransactionOutput (vote outputs)
+			//   - VotingTransaction.CheckTransactionPayload       (Voting payloads)
+			// so every block the restarted chain produces is still fully bounded.
 			if o.Version >= VoteProducerAndCRVersion && cv.Votes <= 0 {
 				return errors.New("invalid candidate votes")
 			}

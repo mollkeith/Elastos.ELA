@@ -26,14 +26,10 @@ var (
 		"0393e823c2087ed30871cbea9fa5121fa932550821e9f3b17acef0e581971efab0",
 		"0382c9e7f11c01d3bde067d006dc2e7b2378499b543a790454d5603e338911ca29",
 	}
-	arbitratorsPrivateKeys = []string{
-		"e372ca1032257bb4be1ac99c4861ec542fd55c25c37f5f58ba8b177850b3fdeb",
-		"e6deed7e23406e2dce7b01e85bcb33872a47b6200ca983fcf0540dff284923b0",
-		"4441968d02a5df4dbc08ca11da2acc86c980e5fe9ff250450a80fd7421d2b0f1",
-		"0b14a04e203301809feccc61dbf4e745203a3263d29a4b4091aaa138ba5fb26d",
-		"0c11ebca60af2a09ac13dd84fd29c03b99cd086a08a69a9e5b87255fd9cf2eee",
-		"ad44a6d5a5d1f7cafa2fa82c719108e9814ff5c71078e1cafa9f734343a2f806",
-	}
+	// NOTE (F-159): the matching private keys are deliberately NOT compiled
+	// in. They live in an external fixture file and are read at run time by
+	// arbitratorPrivateKey() in fixturekeys.go, so no signing key material
+	// ships inside the distributed ela-cli binary.
 )
 
 func RegisterArbitratorsType(L *lua.LState) {

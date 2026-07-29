@@ -154,6 +154,18 @@ func isNextArbitratorsSameV1(nextTurnDPOSInfo *payload.NextTurnDPOSInfo,
 		return false
 	}
 
+	// Crash-harden: the CRC loop below indexes CRPublicKeys[i] while ranging over
+	// nextCRCArbitrators, but only the DPoS leg is length-checked above. A shorter
+	// attacker-supplied CRPublicKeys slice would index out of range and panic. Reject
+	// the out-of-bounds (shorter) case only, so every input that did not panic keeps
+	// its accept/reject outcome. This is ungated and byte-identical below gate 1: a
+	// panic is never an accepted block, so no historically-accepted block reaches this
+	// branch.
+	if len(nextTurnDPOSInfo.CRPublicKeys) < len(nextCRCArbitrators) {
+		log.Warn("[isNextArbitratorsSameV1] CRPublicKeys len ", len(nextTurnDPOSInfo.CRPublicKeys))
+		return false
+	}
+
 	for i, v := range nextArbitrators {
 		if bytes.Equal(v.NodePublicKey, nextTurnDPOSInfo.DPOSPublicKeys[i]) ||
 			(bytes.Equal([]byte{}, nextTurnDPOSInfo.DPOSPublicKeys[i]) &&

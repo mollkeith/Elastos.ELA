@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/core/contract"
@@ -54,13 +55,52 @@ func GetConfirmedPassword() ([]byte, error) {
 	return first, nil
 }
 
+// DefaultProfileHost is the interface StartPProf binds when no ProfileHost is
+// configured. Loopback, deliberately: exposing the profiler off-box must be an
+// explicit operator decision, not the default.
+const DefaultProfileHost = "127.0.0.1"
+
+// ProfileListenAddr resolves the address StartPProf listens on.
+//
+// FV-23: StartPProf used to build its listen address as net.JoinHostPort("", port)
+// -- ALL interfaces -- and passed the configured host only to viewer.WithLinkAddr,
+// which is the address rendered into the page's own links. ProfileHost therefore
+// looked exactly like a bind restriction (its config usage string calls it a "host
+// server"), was accepted without complaint, and had no effect whatsoever on what the
+// socket bound to. That is worse than a plain hardcoded 0.0.0.0, because it
+// manufactures false confidence.
+//
+// What is behind that socket is the COMPLETE net/http/pprof surface: statsview
+// imports net/http/pprof and registers /debug/pprof/ (goroutine, heap, allocs,
+// block, mutex, threadcreate), /cmdline, /symbol, /profile and /trace on its mux,
+// with no authentication, no TLS and no origin check. So an unauthenticated remote
+// gets the process command line and full goroutine stack dumps (peer topology and
+// internal state), plus /profile and /trace, each of which pins the runtime for its
+// sampling window and may be requested concurrently without limit -- a remote CPU
+// and latency lever on a node that may be one of 36 consensus participants.
+//
+// NOT claimed: pprof does not dump raw process memory, so this is not a path to an
+// arbiter's decrypted signing key. Heap/alloc profiles are aggregated stack and size
+// data; goroutine dumps are stack traces.
+//
+// Exported so the resolved address can be logged by the caller (main.go) without
+// this package taking a dependency on the logger.
+func ProfileListenAddr(port uint32, host string) string {
+	bindHost := strings.TrimSpace(host)
+	if bindHost == "" {
+		bindHost = DefaultProfileHost
+	}
+	return net.JoinHostPort(bindHost, strconv.FormatUint(uint64(port), 10))
+}
+
 func StartPProf(port uint32, host string) {
-	listenAddr := net.JoinHostPort("", strconv.FormatUint(
-		uint64(port), 10))
+	listenAddr := ProfileListenAddr(port, host)
 	viewer.SetConfiguration(viewer.WithMaxPoints(100),
 		viewer.WithInterval(3e5),
 		viewer.WithAddr(listenAddr),
-		viewer.WithLinkAddr(host))
+		// Keep the rendered links pointing at the address actually bound, so the
+		// page still works when the operator has restricted the bind.
+		viewer.WithLinkAddr(listenAddr))
 	mgr := statsview.New()
 	mgr.Start()
 }

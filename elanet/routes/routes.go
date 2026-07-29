@@ -429,8 +429,21 @@ func (r *Routes) handleDonePeer(s *state, p *peer.Peer) {
 	delete(s.peerCache, p)
 
 	// Clear cached information.
-	for pid := range c.requested {
-		delete(c.requested, pid)
+	//
+	// F-148: handleInv records an in-flight DAddr hash in BOTH c.requested and
+	// the GLOBAL s.requested, but this teardown used to drain only the per-peer
+	// map -- which is already unreachable garbage once s.peerCache[p] is dropped
+	// -- leaking one global entry for every disconnect that happened with a
+	// request outstanding.  handleInv skips any hash already present in
+	// s.requested, so each leaked entry permanently suppressed re-requesting that
+	// DPoS address from ANY peer for the lifetime of the process.  A hash is only
+	// ever inserted when s.requested has no entry for it, so exactly one peer can
+	// hold a given hash in flight and dropping the departing peer's hashes from
+	// the global map is the precise undo.  Network-layer address routing only --
+	// no block or transaction acceptance decision is involved.
+	for hash := range c.requested {
+		delete(c.requested, hash)
+		delete(s.requested, hash)
 	}
 }
 

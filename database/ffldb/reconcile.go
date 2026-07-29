@@ -89,12 +89,25 @@ func reconcileDB(pdb *db, create bool) (database.DB, error) {
 	if wc.curFileNum > curFileNum || (wc.curFileNum == curFileNum &&
 		wc.curOffset > curOffset) {
 
-		log.Info("Detected unclean shutdown - Repairing...")
-		log.Debugf("Metadata claims file %d, offset %d. Block data is "+
-			"at file %d, offset %d", curFileNum, curOffset,
-			wc.curFileNum, wc.curOffset)
-		pdb.store.handleRollback(curFileNum, curOffset)
-		log.Infof("Database sync complete")
+		if pdb.readOnly {
+			// handleRollback TRUNCATES and DELETES flat block files. That is
+			// the correct repair for a read-write open and an unacceptable
+			// side effect of merely LOOKING at a store, so record it and
+			// leave the bytes alone. The caller reports it: an operator whose
+			// node is about to perform this repair should be told before the
+			// node does it, not after.
+			pdb.pendingRepair = &UncleanShutdownRepair{
+				MetaFileNum: curFileNum, MetaOffset: curOffset,
+				DiskFileNum: wc.curFileNum, DiskOffset: wc.curOffset,
+			}
+		} else {
+			log.Info("Detected unclean shutdown - Repairing...")
+			log.Debugf("Metadata claims file %d, offset %d. Block data is "+
+				"at file %d, offset %d", curFileNum, curOffset,
+				wc.curFileNum, wc.curOffset)
+			pdb.store.handleRollback(curFileNum, curOffset)
+			log.Infof("Database sync complete")
+		}
 	}
 
 	// When the write cursor position found by scanning the block files on

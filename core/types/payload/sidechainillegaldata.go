@@ -7,6 +7,7 @@ package payload
 
 import (
 	"bytes"
+	"errors"
 	"io"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -14,6 +15,11 @@ import (
 )
 
 const SidechainIllegalDataVersion byte = 0x00
+
+// MaxSidechainIllegalSigns bounds the signature slice at decode time (DoS ceiling).
+// Real sidechain-illegal signer sets are dozens; 1024 is far above any
+// legitimate value while preventing an unbounded make() OOM from a crafted varint.
+const MaxSidechainIllegalSigns = 1024
 
 type SidechainIllegalEvidence struct {
 	DataHash common.Uint256
@@ -150,6 +156,11 @@ func (s *SidechainIllegalData) Deserialize(r io.Reader, version byte) error {
 	var signLen uint64
 	if signLen, err = common.ReadVarUint(r, 0); err != nil {
 		return err
+	}
+	// Cap the count before allocating: a crafted varint gives an unbounded make() and a
+	// remote OOM or `makeslice: len out of range` before any signature byte is read.
+	if signLen > MaxSidechainIllegalSigns {
+		return errors.New("sidechain illegal signLen exceeds maximum")
 	}
 	s.Signs = make([][]byte, signLen)
 	for i := 0; i < int(signLen); i++ {

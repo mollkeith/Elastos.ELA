@@ -48,6 +48,13 @@ type TxReceivingInfo struct {
 // append transaction to txnpool when check ok, and broadcast the transaction.
 // 1.check  2.check with ledger(db) 3.check with pool
 func (mp *TxPool) AppendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
+	// Defensive: the global event bus delivers ETAppendTxToTxPool asynchronously
+	// (dpos/state notifyNextTurnDPOSInfoTx -> go events.Notify -> netsync handler). A
+	// SyncManager with an unwired/torn-down pool (test harness, shutdown race) must not
+	// crash the process on a nil receiver; production always wires the pool.
+	if mp == nil {
+		return nil
+	}
 	mp.Lock()
 	defer mp.Unlock()
 	err := mp.appendToTxPool(tx)
@@ -108,6 +115,21 @@ func (mp *TxPool) appendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
 		return elaerr.Simple(elaerr.ErrBlockIneffectiveCoinbase, nil)
 	}
 
+	// Block assembly skips unfinalized transactions (pow.GenerateBlock) and block
+	// validation rejects any block carrying one (CheckBlockContext), but nothing
+	// else checks finality on the way into the pool, so a future-LockTime
+	// transaction would be admitted, relayed, and re-relayed by the outdated-tx
+	// timer while occupying pool capacity it could never spend. Admission policy
+	// only: a transaction that fails this test cannot be part of a valid block at
+	// this height anyway, so no block acceptance decision changes. The height used
+	// is the one every other caller uses.
+	if !blockchain.IsFinalizedTransaction(tx, bestHeight+1) {
+		log.Warnf("[TxPool] tx %s is not finalized, lock time %d, height %d",
+			tx.Hash(), tx.LockTime(), bestHeight+1)
+		return elaerr.SimpleWithMessage(elaerr.ErrTxValidation, nil,
+			"transaction is not finalized")
+	}
+
 	if err := chain.CheckTransactionSanity(bestHeight+1, tx); err != nil {
 		log.Warn("[TxPool CheckTransactionSanity] failed", tx.Hash())
 		return err
@@ -125,8 +147,15 @@ func (mp *TxPool) appendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
 		return err
 	}
 
+	// Rejecting on OverSize alone returns before txFees.AddTx can run, which makes
+	// the fee-ordered eviction path inside AddTx unreachable and lets a low-fee
+	// squatter sit undisplaceable. Ask the fee-ordered list the question it can
+	// actually answer: can this tx be admitted, evicting only the entries paying
+	// strictly less? This must stay here, after CheckTransactionContext, because
+	// that is what sets the fee (blockchain.CheckTransactionFee -> tx.SetFee);
+	// asked any earlier, every relayed tx would price itself at zero.
 	size := tx.GetSize()
-	if mp.txFees.OverSize(uint64(size)) {
+	if !mp.txFees.CanAccept(uint64(size), float64(tx.Fee())/float64(size)) {
 		log.Warn("TxPool check transactions size failed", tx.Hash())
 		return elaerr.Simple(elaerr.ErrTxPoolOverCapacity, nil)
 	}
@@ -146,7 +175,15 @@ func (mp *TxPool) appendToTxPool(tx interfaces.Transaction) elaerr.ELAError {
 		tx.IsSmallTransfer(mp.chainParams.SmallCrossTransferThreshold) {
 		err := blockchain.DefaultLedger.Store.SaveSmallCrossTransferTx(tx)
 		if err != nil {
-			log.Warnf("failed to save small cross chain transaction %s", tx.Hash())
+			log.Warnf("failed to save small cross chain transaction %s: %s",
+				tx.Hash(), err)
+			// This arm rejects the transaction, so it must leave the pool with
+			// it. SaveSmallCrossTransferTx once swallowed leveldb errors and
+			// always returned nil, but the bucket cap makes this reachable, and
+			// a transaction the caller was told was rejected must not stay in
+			// txnList, txFees and the conflict slots. Mirrors the
+			// doAddTransaction arm just above.
+			mp.doRemoveTransaction(tx)
 			return elaerr.Simple(elaerr.ErrTxValidation, nil)
 		}
 		mp.crossChainHeightList[tx.Hash()] = bestHeight
@@ -308,7 +345,14 @@ func (mp *TxPool) cleanTransactions(blockTxs []interfaces.Transaction) {
 			}
 		}
 
-		if err := mp.removeTx(blockTx); err != nil {
+		// A transaction with no inputs (every zero-input special tx) matches
+		// nothing in the loop above, so clearing its conflict slots alone would
+		// strand the transaction itself in txnList, txFees and txReceivingInfo.
+		// Anything that just appeared in a block must leave the pool outright.
+		if _, ok := mp.txnList[blockTx.Hash()]; ok {
+			mp.doRemoveTransaction(blockTx)
+			deleteCount++
+		} else if err := mp.removeTx(blockTx); err != nil {
 			log.Warnf("remove tx %s when delete", blockTx.Hash())
 		}
 
@@ -608,6 +652,7 @@ func (mp *TxPool) doRemoveTransaction(tx interfaces.Transaction) {
 		}
 		if _, ok := mp.crossChainHeightList[hash]; ok {
 			delete(mp.crossChainHeightList, hash)
+			mp.cleanSmallCrossTransferRecord(hash)
 		}
 		if _, ok := mp.txReceivingInfo[hash]; ok {
 			delete(mp.txReceivingInfo, hash)
@@ -628,8 +673,43 @@ func (mp *TxPool) onPopBack(hash Uint256) {
 		return
 	}
 	delete(mp.txnList, hash)
+	// doRemoveTransaction clears these two maps and this eviction path must do
+	// the same, or every fee-ordered eviction leaks one crossChainHeightList and
+	// one txReceivingInfo entry. Eviction is reachable, so the leak is live.
+	if _, ok := mp.crossChainHeightList[hash]; ok {
+		delete(mp.crossChainHeightList, hash)
+		mp.cleanSmallCrossTransferRecord(hash)
+	}
+	delete(mp.txReceivingInfo, hash)
 	mp.dealDelProposalTx(tx)
+}
 
+// cleanSmallCrossTransferRecord drops the PERSISTENT small-cross-transfer
+// record written on admission, for a transaction that is leaving the pool
+// without having been mined.
+//
+// SaveSmallCrossTransferTx writes a leveldb record on mempool admission, and
+// CleanSmallCrossTransferTx is called from the block path (cleanTransactionList).
+// Conflict eviction (doRemoveTransaction, reached from cleanTransactions),
+// fee-ordered eviction (onPopBack) and the post-reorg re-check
+// (checkAndCleanAllTransactions, which funnels into doRemoveTransaction) must
+// reach this function too: clearing only the in-memory twin leaves a permanent
+// record behind for every transaction that is admitted and then evicted without
+// being mined. Nothing prunes such a record, node start re-injects all of it, and
+// every arbiter re-downloads and re-parses the whole bucket once per second. The
+// in-memory maps are cleared on the same eviction paths; this is the persistent
+// twin of that cleanup.
+//
+// The caller must already have established that a record exists, by finding the
+// transaction in crossChainHeightList, which is written in the same branch that
+// writes the leveldb record, so it is an exact predicate and costs ordinary
+// transactions nothing.
+func (mp *TxPool) cleanSmallCrossTransferRecord(hash Uint256) {
+	if err := blockchain.DefaultLedger.Store.
+		CleanSmallCrossTransferTx(hash); err != nil {
+		log.Warnf("failed to clean small cross chain transaction %s: %s",
+			hash, err)
+	}
 }
 
 func NewTxPool(params *config.Configuration, ckpManager *checkpoint.Manager) *TxPool {

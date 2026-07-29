@@ -463,6 +463,22 @@ type DB interface {
 	// user-supplied function will result in a panic.
 	Update(fn func(tx Tx) error) error
 
+	// FlushCache pushes every write this database is still holding in memory out
+	// to the persistent store, so that what a subsequent read reports is what a
+	// restarted process would find.
+	//
+	// It exists because an implementation is free to buffer committed writes:
+	// ffldb keeps them in an in-memory dbCache and pushes them to leveldb only
+	// when the cache exceeds its size threshold or its flush interval elapses
+	// (20 MiB / 300 s, both hardcoded). Reads go THROUGH that cache, so a caller
+	// cannot tell a persisted write from a buffered one by reading it back. Any
+	// caller that must be able to state "this is on disk" -- a one-shot consensus
+	// rewind asserting it is finished, for instance -- has to ask for it.
+	//
+	// It must not be called from inside a transaction opened on the same
+	// database: implementations may take the write lock.
+	FlushCache() error
+
 	// Close cleanly shuts down the database and syncs all data.  It will
 	// block until all database transactions have been finalized (rolled
 	// back or committed).

@@ -101,9 +101,8 @@ func (p *pipe) flow(manager *addrmgr.AddrManager, from net.Conn, to net.Conn, co
 			return err
 		}
 
-		// Read payload
-		payload := make([]byte, hdr.Length)
-		_, err := io.ReadFull(from, payload[:])
+		// Read payload (F-136: bounded before allocating -- see readPayload).
+		payload, err := readPayload(from, &hdr)
 		if err != nil {
 			return err
 		}

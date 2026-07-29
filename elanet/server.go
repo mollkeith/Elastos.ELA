@@ -45,6 +45,19 @@ const (
 
 	// maxNonNodePeers defines the maximum count of accepting non-node peers.
 	maxNonNodePeers = 100
+
+	// maxHonestBlockLocators is the largest block locator an honest peer is
+	// expected to send.  BlockLocatorFromHash produces a locator that grows
+	// logarithmically with the chain height and GetOrphanBlockLocator
+	// produces two entries, so anything beyond this is a peer inflating our
+	// locator walk on purpose (F-214).
+	maxHonestBlockLocators = 64
+
+	// filterLoadBanScore is the decaying ban score charged for a filterload
+	// message.  It is small enough that an SPV client reloading its filter is
+	// never affected and large enough that a filterload loop reaches the ban
+	// threshold quickly (F-214).
+	filterLoadBanScore = 5
 )
 
 // naFilter defines a network address filter for the main chain NetServer, for now
@@ -293,6 +306,14 @@ func (sp *ServerPeer) OnBlock(_ *peer.Peer, msgBlock *msg.Block) {
 // accordingly.  We pass the message down to blockmanager which will call
 // QueueMessage with any appropriate responses.
 func (sp *ServerPeer) OnInv(_ *peer.Peer, inv *msg.Inv) {
+	// F-054: charge the same decaying ban score OnGetData already applies, because
+	// each announced hash can cost us a haveInventory lookup -- and for a
+	// confirmed-block announcement that used to mean a full flat-file block read.
+	// The score is 0 for every announcement an honest peer sends: a getblocks
+	// answer carries at most pact.MaxBlocksPerMsg (500) entries and relay invs are
+	// far smaller, while 500*99/MaxInvPerMsg truncates to 0.
+	sp.AddBanScore(0, uint32(len(inv.InvList))*99/msg.MaxInvPerMsg, "inv")
+
 	if len(inv.InvList) > 0 {
 		sp.server.SyncManager.QueueInv(inv, sp.Peer)
 		sp.server.Routes.QueueInv(sp.Peer, inv)
@@ -407,6 +428,18 @@ func (sp *ServerPeer) OnGetBlocks(_ *peer.Peer, m *msg.GetBlocks) {
 	// over with the genesis block if unknown block locators are provided.
 	//
 	// This mirrors the behavior in the reference implementation.
+	// F-214: meter oversized block locators before doing the work.
+	// locateStartBlock walks every locator hash, so the cost of serving a
+	// getblocks grows with the locator length.  Honest locators are tiny (see
+	// maxHonestBlockLocators) and are never charged; a peer sending the
+	// protocol maximum of 500 hashes to maximise our walk is scored close to
+	// the ban threshold.  No rate based score is used because peers doing a
+	// legitimate initial block download send getblocks at a high rate.
+	if n := len(m.Locator); n > maxHonestBlockLocators {
+		sp.AddBanScore(0, uint32(n-maxHonestBlockLocators)*99/
+			(msg.MaxBlockLocatorsPerMsg-maxHonestBlockLocators), m.CMD())
+	}
+
 	chain := sp.server.chain
 	hashList := chain.LocateBlocks(m.Locator, &m.HashStop, pact.MaxBlocksPerMsg)
 
@@ -514,6 +547,10 @@ func (sp *ServerPeer) OnFilterLoad(_ *peer.Peer, filterLoad *msg.FilterLoad) {
 	if !sp.enforceTxFilterFlag(filterLoad.CMD()) {
 		return
 	}
+
+	// F-214: charge a small decaying score so a filterload loop cannot spin
+	// filter loading for free.
+	sp.AddBanScore(0, filterLoadBanScore, filterLoad.CMD())
 
 	sp.SetDisableRelayTx(false)
 

@@ -17,6 +17,7 @@ import (
 	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	"github.com/elastos/Elastos.ELA/crypto"
+	"github.com/elastos/Elastos.ELA/dpos/state"
 )
 
 func ConfirmSanityCheck(confirm *payload.Confirm) error {
@@ -46,7 +47,8 @@ func ConfirmSanityCheck(confirm *payload.Confirm) error {
 	return nil
 }
 
-func IllegalConfirmContextCheck(confirm *payload.Confirm) error {
+func IllegalConfirmContextCheck(confirm *payload.Confirm, blockHeight uint32,
+	strictActive bool) error {
 	signers := make(map[string]struct{})
 	for _, vote := range confirm.Votes {
 		if !vote.Accept {
@@ -55,6 +57,88 @@ func IllegalConfirmContextCheck(confirm *payload.Confirm) error {
 		signers[common.BytesToHexString(vote.Signer)] = struct{}{}
 	}
 
+	// At and above StrictMoneyRangeHeight, validate the confirm sponsor and every vote
+	// signer against the DPoS arbiter set on duty at the evidenced height, which is the
+	// correct voter universe and matches sibling illegal-proposal and illegal-vote
+	// evidence (which use ProposalContextCheckByHeight / VoteContextCheckByHeight). The
+	// legacy GetAllProducersPublicKey universe below admits signatures from any producer
+	// that ever registered, not just the round's arbiters, so off-duty producers could be
+	// counted toward the majority to fabricate evidence. Below the gate the legacy
+	// universe is kept so historical evidence replays byte-identically.
+	//
+	// Fixing the voter universe alone leaves the threshold wrong, which makes the
+	// function read sound while it is not. Two defects follow from that, and both are
+	// closed here:
+	//
+	//  (1) Taking the majority count from GetArbitersMajorityCount(), that is 2/3 of
+	//      len(a.CurrentArbitrators), measures the committee on duty now, while
+	//      membership is checked against the committee at the evidenced height. Count
+	//      and universe would be drawn from two different committees.
+	//  (2) GetSnapshot returns a slice of frames (SnapshotByHeight appends on a force
+	//      change, so one election key can hold a pre- and a post-force-change frame),
+	//      and ProposalContextCheckByHeight / VoteContextCheckByHeight each accept a
+	//      match in any frame, independently per signer. Nothing then binds the sponsor
+	//      and the N votes to one coherent historical committee, so the admissible
+	//      signer universe is the union of two committees while the bar is 2/3 of one,
+	//      and a signer set that never simultaneously existed as a majority of any real
+	//      committee could clear it.
+	//
+	// So one key frame is selected and used for both the count and the membership: the
+	// sponsor and every vote signer must belong to the same frame, and the accepting
+	// signer count must exceed 2/3 of that frame's size. Accept if any single frame
+	// satisfies the whole conjunction. An empty ring fails closed, as it already did via
+	// the by-height checks, but is rejected explicitly rather than incidentally.
+	//
+	// Applied to the strictActive branch only, so the legacy branch below and its
+	// current-committee majority check are untouched for below-gate replay. No
+	// IllegalBlockEvidence transaction exists anywhere in the retained chain, so
+	// re-thresholding rejects no real history.
+	if strictActive {
+		frames := DefaultLedger.Arbitrators.GetSnapshot(blockHeight)
+		if len(frames) == 0 {
+			return errors.New("[IllegalConfirmContextCheck] no arbiter snapshot " +
+				"retained for the evidenced height")
+		}
+		var lastErr error
+		for _, frame := range frames {
+			members := make(map[string]struct{}, len(frame.CurrentArbitrators))
+			for _, a := range frame.CurrentArbitrators {
+				members[common.BytesToHexString(a.GetNodePublicKey())] = struct{}{}
+			}
+			if _, ok := members[common.BytesToHexString(
+				confirm.Proposal.Sponsor)]; !ok {
+				lastErr = errors.New("[IllegalConfirmContextCheck] confirm contain " +
+					"invalid proposal: current arbitrators verify error")
+				continue
+			}
+			var badVote bool
+			for _, vote := range confirm.Votes {
+				if _, ok := members[common.BytesToHexString(vote.Signer)]; !ok {
+					badVote = true
+					break
+				}
+			}
+			if badVote {
+				lastErr = errors.New("[IllegalConfirmContextCheck] confirm contain " +
+					"invalid vote: current arbitrators verify error")
+				continue
+			}
+			// The threshold is 2/3 of THIS frame, computed exactly as
+			// Arbiters.GetArbitersMajorityCount does for the current committee.
+			threshold := int(float64(len(frame.CurrentArbitrators)) *
+				state.MajoritySignRatioNumerator / state.MajoritySignRatioDenominator)
+			if len(signers) <= threshold {
+				lastErr = errors.New("[IllegalConfirmContextCheck] signers less than " +
+					"majority count")
+				continue
+			}
+			return nil
+		}
+		return lastErr
+	}
+
+	// Legacy (below-gate) path: unchanged, including its current-committee majority
+	// count, so retained history replays byte-identically.
 	if len(signers) <= DefaultLedger.Arbitrators.GetArbitersMajorityCount() {
 		return errors.New("[IllegalConfirmContextCheck] signers less than " +
 			"majority count")
@@ -128,10 +212,17 @@ func PreProcessSpecialTx(block *Block) error {
 	for _, tx := range block.Transactions {
 		switch tx.TxType() {
 		case common2.InactiveArbitrators:
-			if err := CheckInactiveArbitrators(tx); err != nil {
+			// Gate on the block height, not the current tip, so replaying a below-gate
+			// historical special tx during InitCheckpoint or fresh-from-genesis sync
+			// stays structure-only and replay-safe.
+			if err := CheckInactiveArbitrators(tx, block.Height); err != nil {
 				return err
 			}
-			if err := checkTransactionSignature(tx, map[*common2.Input]common2.Output{}); err != nil {
+			// InactiveArbitrators programs are arbiter-multisig, never Standard, Deposit or
+			// CrossChain, so the gated guards on those branches do not apply here; pass the
+			// block height and the real gate for a faithful, uniform signature.
+			if err := checkTransactionSignature(tx, map[*common2.Input]common2.Output{},
+				block.Height, DefaultLedger.Blockchain.chainParams.StrictMoneyRangeHeight); err != nil {
 				return err
 			}
 

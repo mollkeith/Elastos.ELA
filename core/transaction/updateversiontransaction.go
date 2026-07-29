@@ -99,7 +99,8 @@ func (t *UpdateVersionTransaction) SpecialContextCheck() (elaerr.ELAError, bool)
 		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid update version height")), true
 	}
 
-	if err := checkCRCArbitratorsSignatures(t.Programs()[0]); err != nil {
+	if err := checkCRCArbitratorsSignatures(t, t.parameters.BlockHeight,
+		t.parameters.Config.StrictMoneyRangeHeight); err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
 	}
 

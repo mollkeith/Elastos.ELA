@@ -45,6 +45,32 @@ func (t *UpdateProducerTransaction) HeightVersionCheck() error {
 				t.TxType().Name(), t.PayloadVersion()))
 		}
 	}
+	// Reject unknown UpdateProducer payload versions at/above the
+	// coordinated-upgrade gate. SpecialContextCheck only authenticates versions up to
+	// ProducerInfoMultiVersion (0x03); a v>=4 payload falls through with no owner
+	// proof and then overwrites the producer info, so a nickname or NodePublicKey
+	// re-key is an identity takeover, permissionless and on a live chain. Below the
+	// gate is left byte-identical for replay-safety (mirrors RegisterProducer's
+	// default-deny).
+	if blockHeight >= chainParams.StrictMoneyRangeHeight &&
+		t.PayloadVersion() > payload.ProducerInfoMultiVersion {
+		return errors.New(fmt.Sprintf("unsupported %s transaction payload version %d",
+			t.TxType().Name(), t.PayloadVersion()))
+	}
+	// RegisterProducer rejects ProducerInfoSchnorrVersion below
+	// ProducerSchnorrStartHeight (dormant on mainnet, MaxUint32), but UpdateProducer
+	// enforces no such gate of its own: the Schnorr producer version reaches this path
+	// bounded only by the general NormalSchnorrStartHeight (1405000) from
+	// CheckAttributeProgram, so the dormant Schnorr producer re-key path leaks in via the
+	// update route. Mirror the register gate. Activated only at/above the
+	// coordinated-upgrade gate (StrictMoneyRangeHeight) so retained below-gate history
+	// replays byte-identically. Reuses gate 1; no third gate is introduced.
+	if blockHeight >= chainParams.StrictMoneyRangeHeight &&
+		t.PayloadVersion() == payload.ProducerInfoSchnorrVersion &&
+		blockHeight < chainParams.ProducerSchnorrStartHeight {
+		return errors.New(fmt.Sprintf("not support %s transaction "+
+			"before ProducerSchnorrStartHeight", t.TxType().Name()))
+	}
 	return nil
 }
 
@@ -105,6 +131,78 @@ func (t *UpdateProducerTransaction) SpecialContextCheck() (elaerr.ELAError, bool
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
 	}
 
+	// NOTE: info.Signature below is verified over
+	// info.SerializeUnsigned(payloadVersion) alone: no network magic, no genesis
+	// hash, no nonce, no binding to the carrying transaction. It is therefore a
+	// context-free bearer credential with an unbounded lifetime. Do not "fix" it by
+	// binding the transaction to OwnerKey: that rule was measured against the real
+	// chain and it breaks consensus (candidate R below).
+	//
+	// Demonstrated against both the production validator and the production DPoS
+	// state machine in core/transaction/f205_test.go, which fails when the
+	// expectation is inverted: any third party can lift a previously published
+	// (payload, signature) pair out of chain history, wrap it in a new transaction
+	// funded and signed by an unrelated key, and roll the producer's record
+	// (NodePublicKey / NickName / Url / Location / NetAddress) back to that stale
+	// state without the owner's consent. Reverting NodePublicKey de-registers the key
+	// the producer is actually signing DPoS messages with (State.updateProducerInfo
+	// deletes the old NodeOwnerKeys entry), so this is a cheap, repeatable liveness
+	// attack against any producer that has ever updated. The same shape applies to
+	// every payload signature of this family (UpdateCR, CancelProducer,
+	// ActivateProducer, ...).
+	//
+	// What does not follow: cross-network replay does not reach input-spending
+	// transactions, because a transaction signature covers the inputs' outpoints and
+	// the mainnet/testnet UTXO sets are disjoint. And replayability of honest pre-fork
+	// transactions across the v0.9.9.7 recovery fork is inherent and intended in a
+	// rollback; the malicious ones are exactly what the StrictMoneyRangeHeight
+	// acceptance change already rejects.
+	//
+	// Why no fix ships here. Three candidate consensus rules, all measured against
+	// the full 2,260,597-block mainnet history:
+	//   R. require a program bound to OwnerKey (what the ProducerInfoSchnorrVersion
+	//      and ProducerInfoMultiVersion branches below already do): would reject 720
+	//      of 961 real UpdateProducer, 254/259 RegisterProducer, 33/117
+	//      CancelProducer and all 902 ActivateProducer (0-input, 0-program).
+	//      Third-party carriage of the credential is the dominant real-world pattern,
+	//      so R is chain-breaking. It is affirmatively dangerous; do not revive it.
+	//   P. reject a signed message already applied to this producer: 71 of 863
+	//      distinct messages were legitimately re-submitted (up to 3x, months apart),
+	//      so P false-rejects honest A/B node failovers.
+	//   C. reject an already-applied (message||signature) credential: 0 measured
+	//      false rejects (961 credentials, 0 duplicates) but ineffective as keyed,
+	//      because crypto.Verify calls ecdsa.Verify with no low-S canonicalisation, so
+	//      (r, n-s) verifies and hashes differently and walks straight past the
+	//      blacklist (demonstrated in f205_test.go). Canonicalising S first is itself
+	//      an ecosystem break: 48.3% of all real mainnet program signatures
+	//      (1,487,608 of 3,077,730) and 22.9% of real producer payload credentials
+	//      are high-S.
+	//   C2. C is defeated by S-malleation only because of how it was keyed. Keying the
+	//      blacklist on (message || r) instead of (message || full signature) is
+	//      immune: the malleation (r,s)->(r,n-s) preserves r, and producing a fresh r
+	//      for the same message requires the private key. Re-measured over the same
+	//      full 2,260,597-block history and across the whole payload-signature class,
+	//      (message||r) has zero duplicates in every family: UpdateProducer 961/0,
+	//      ActivateProducer 902/0, CancelProducer 117/0, UpdateCR 37/0, i.e. the
+	//      same zero false-reject rate as C, over only 2,017 digests in eight years,
+	//      so the "unbounded consensus state" objection does not hold either.
+	//      C2 is therefore an open, un-refuted fix candidate. Unlike D it changes
+	//      nothing about what wallets sign, so the "gate 1 is already below the tip
+	//      so there is no upgrade window" argument does not rule it out. It is not
+	//      free: the digest set must be seeded by recording (not enforcing) below the
+	//      gate so replay of retained history stays byte-identical, and it must be
+	//      carried in the DPoS/CR checkpoints and the History/rollback surface or
+	//      checkpoint-bootstrapped nodes will diverge from full-replay nodes. C2
+	//      stops verbatim credential reuse only; it is not domain separation.
+	// The most complete fix is D: domain-separate the payload signing message
+	// (network magic / genesis hash plus an anti-replay binding). D changes what
+	// every wallet must sign. StrictMoneyRangeHeight is already below the tip, so a
+	// gate there activates on the first block of the recovery fork with no upgrade
+	// window and would brick producer/CR management ecosystem-wide; a third gate is
+	// not permitted. D is therefore an owner-level coordinated-upgrade decision and
+	// must move together with its root-cause siblings (low-S canonicality, node-key
+	// proof-of-possession, and the rest of the payload-signature family), not one at
+	// a time. Residual risk: unfixed at HEAD, exactly as characterised above.
 	if t.PayloadVersion() < payload.ProducerInfoSchnorrVersion {
 		publicKey, err := crypto.DecodePoint(info.OwnerKey)
 		if err != nil {

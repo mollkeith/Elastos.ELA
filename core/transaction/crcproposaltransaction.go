@@ -635,7 +635,24 @@ func (t *CRCProposalTransaction) checkNormalOrELIPProposal(params *TransactionPa
 			return errors.New("invalid amount")
 		}
 		stage++
-		amount += b.Amount
+		// Height-gated overflow guard (mirrors the v0.9.9.7 money-fix design):
+		// below StrictMoneyRangeHeight the legacy wrapping accumulation is
+		// preserved verbatim for replay-safety; at/above it each budget is
+		// money-range bounded and the running sum is checked, so many budgets
+		// cannot wrap past 2^64 into a small positive that slips under the
+		// downstream committee-balance checks.
+		if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+			if !common.MoneyRange(b.Amount) {
+				return errors.New("proposal budget amount out of money range")
+			}
+			newAmount, err := common.AddFixed64(amount, b.Amount)
+			if err != nil || !common.MoneyRange(newAmount) {
+				return errors.New("proposal budgets total out of money range")
+			}
+			amount = newAmount
+		} else {
+			amount += b.Amount
+		}
 	}
 	if imprestPaymentCount > 1 {
 		return errors.New("imprest payment count invalid")

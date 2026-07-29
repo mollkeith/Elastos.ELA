@@ -236,27 +236,35 @@ func (p *Producer) GetExpiredNFTVotes() map[common.Uint168]payload.DetailedVoteI
 }
 
 func (p *Producer) GetTotalDPoSV2VoteRights() float64 {
-	var result float64
+	// Integer accumulation: each VoteRights() is an integer Fixed64, so summing in
+	// Fixed64 is exact and order-independent. A float64 accumulation over a Go map
+	// (randomised iteration order) can diverge between nodes once a total crosses 2^53;
+	// this feeds the arbiter-ranking sort, so that divergence would split the validator
+	// set. Below 2^53 (9007199254740992) integer and float sums of non-negative integers
+	// are bit-identical, so this is behaviour-identical.
+	//
+	// The bound holds on real data: summing every weight ever created for the busiest
+	// candidate on the retained mainnet copy, an over-count of any instantaneous live
+	// total since it also counts votes later superseded by renewal or expiry, gives
+	// 451,388,603,675,534, about 20x below 2^53. Pinned in
+	// core/types/payload/voterights_measured_test.go.
+	var result common.Fixed64
 	for _, sVoteDetail := range p.detailedDPoSV2Votes {
-		var totalN float64
+		var totalN common.Fixed64
 		for _, votes := range sVoteDetail {
-			weightF := math.Log10(float64(votes.Info[0].LockTime-votes.BlockHeight) / 7200 * 10)
-			N := common.Fixed64(float64(votes.Info[0].Votes) * weightF)
-			totalN += float64(N)
+			totalN += votes.VoteRights()
 		}
 		result += totalN
 	}
 
-	return result
+	return float64(result)
 }
 
 func (p *Producer) GetNFTVotesRight(targetReferKey common.Uint256) float64 {
 	for _, sVoteDetail := range p.detailedDPoSV2Votes {
 		for referKey, votes := range sVoteDetail {
 			if referKey.IsEqual(targetReferKey) {
-				weightF := math.Log10(float64(votes.Info[0].LockTime-votes.BlockHeight) / 7200 * 10)
-				N := common.Fixed64(float64(votes.Info[0].Votes) * weightF)
-				return float64(N)
+				return float64(votes.VoteRights())
 			}
 		}
 	}
@@ -900,6 +908,19 @@ func (s *State) GetNFTReferKey(nftID common.Uint256) (common.Uint256, error) {
 	return nftInfo.ReferKey, nil
 }
 
+// GetNFTGenesisBlockHash returns the sidechain genesis block hash recorded for an NFT
+// at CreateNFT (NFTInfo.GenesisBlockHash). Used by the NFTDestroy origin bind.
+func (s *State) GetNFTGenesisBlockHash(nftID common.Uint256) (common.Uint256, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	nftInfo, exist := s.NFTIDInfoHashMap[nftID]
+	if !exist {
+		return common.Uint256{}, errors.New("nft is not exist")
+	}
+
+	return nftInfo.GenesisBlockHash, nil
+}
+
 // GetPendingProducers returns all producers that in pending state.
 func (s *State) GetPendingProducers() []*Producer {
 	s.mtx.RLock()
@@ -1222,7 +1243,11 @@ func (s *State) SpecialTxExists(tx interfaces.Transaction) bool {
 		return false
 	}
 
-	hash := illegalData.Hash()
+	// Illegal-block evidence at or above StrictMoneyRangeHeight is keyed by its logical
+	// block identity (AuxPow-independent) so two AuxPow encodings of one logical block
+	// collapse to a single dedup key; every other special-tx type, and every block below
+	// the gate, keeps the raw payload hash for byte-identical historical replay.
+	hash := payload.SpecialTxDedupKey(illegalData, s.ChainParams.StrictMoneyRangeHeight)
 	s.mtx.RLock()
 	_, ok = s.SpecialTxHashes[hash]
 	s.mtx.RUnlock()
@@ -1622,10 +1647,34 @@ func (s *State) processTransactions(txs []interfaces.Transaction, height uint32)
 			info := i
 			s.History.Append(height, func() {
 				s.UsedDposV2Votes[stakeAddress] -= info.Votes
+				// Once every DPoSV2 vote of a stake address has expired its used-vote
+				// total is back to zero, and the entry is dropped rather than kept:
+				// without this delete UsedDposV2Votes accumulates one permanent entry
+				// per stake address that ever voted, in RAM, in every serialized dpos
+				// keyframe and in every deep copy taken per snapshot. Dropping the
+				// zero entry is behaviour-identical, not a semantic change:
+				// UsedDposV2Votes is a map to Fixed64 and every reader takes the zero
+				// value of a missing key (core/transaction/voting.go,
+				// core/transaction/returnvotes.go, servers/interfaces.go and the
+				// readers in this file); nothing ranges over it or tests key presence.
+				// The same delete-at-zero is the established pattern for this map on
+				// the NFT paths below. The revert closure re-adds via `+=`, which
+				// recreates the key with its pre-block value, so reorg behaviour is
+				// unchanged.
+				if s.UsedDposV2Votes[stakeAddress] == 0 {
+					delete(s.UsedDposV2Votes, stakeAddress)
+				}
 			}, func() {
 				s.UsedDposV2Votes[stakeAddress] += info.Votes
 			})
 			voteRights := producer.GetTotalDPoSV2VoteRights()
+			// Capture the pre-block DposV2EffectedProducers membership so the revert restores
+			// it verbatim instead of re-deriving it from the post-restore vote total. The
+			// forward (accept) closure is untouched, so below-gate replay stays byte-identical;
+			// only the reorg-undo becomes exact. Ungated, in line with the other reorg
+			// revert-symmetry pairs in this file: forward state is unchanged.
+			effectedKey := hex.EncodeToString(producer.OwnerPublicKey())
+			_, wasEffected := s.DposV2EffectedProducers[effectedKey]
 			//if this vote create nft
 			exist, nftID := s.getNFTID(key)
 			s.History.Append(height, func() {
@@ -1657,9 +1706,15 @@ func (s *State) processTransactions(txs []interfaces.Transaction, height uint32)
 				}
 				producer.detailedDPoSV2Votes[stakeAddress][key] = detailVoteInfo
 				producer.dposV2Votes += info.Votes
-				voteRights := producer.GetTotalDPoSV2VoteRights()
-				if voteRights >= float64(s.ChainParams.DPoSV2EffectiveVotes) {
-					s.DposV2EffectedProducers[hex.EncodeToString(producer.OwnerPublicKey())] = producer
+				// Restore the captured pre-block membership verbatim. Re-deriving membership from
+				// GetTotalDPoSV2VoteRights() >= threshold only ever adds, never removes, so a
+				// producer present pre-block with a total below the threshold (reachable via the
+				// forward delete-branch asymmetry above) is silently dropped from
+				// DposV2EffectedProducers on reorg. Restoring the boolean makes the undo exact.
+				if wasEffected {
+					s.DposV2EffectedProducers[effectedKey] = producer
+				} else {
+					delete(s.DposV2EffectedProducers, effectedKey)
 				}
 			})
 		}
@@ -1774,21 +1829,31 @@ func (s *State) processTransaction(tx interfaces.Transaction, height uint32) {
 		common2.IllegalBlockEvidence, common2.IllegalSidechainEvidence:
 		s.processIllegalEvidence(tx.Payload(), height)
 
-		payloadHash, err := tx.GetSpecialTxHash()
-		if err != nil {
-			log.Error(err.Error())
+		illegalData, ok := tx.Payload().(payload.DPOSIllegalData)
+		if !ok {
+			log.Error("special tx payload cast failed")
 			return
 		}
+		// Fold the illegal-block evidence dedup key by the logical block identity
+		// (AuxPow-independent) at or above StrictMoneyRangeHeight; other illegal types and
+		// blocks below the gate keep the raw payload hash, for byte-identical below-gate replay.
+		payloadHash := payload.SpecialTxDedupKey(illegalData,
+			s.ChainParams.StrictMoneyRangeHeight)
 		s.recordSpecialTx(payloadHash, height)
 
 	case common2.InactiveArbitrators:
 		s.processEmergencyInactiveArbitrators(
 			tx.Payload().(*payload.InactiveArbitrators), height)
-		payloadHash, err := tx.GetSpecialTxHash()
-		if err != nil {
-			log.Error(err.Error())
+		illegalData, ok := tx.Payload().(payload.DPOSIllegalData)
+		if !ok {
+			log.Error("special tx payload cast failed")
 			return
 		}
+		// Fold the illegal-block evidence dedup key by the logical block identity
+		// (AuxPow-independent) at or above StrictMoneyRangeHeight; other illegal types and
+		// blocks below the gate keep the raw payload hash, for byte-identical below-gate replay.
+		payloadHash := payload.SpecialTxDedupKey(illegalData,
+			s.ChainParams.StrictMoneyRangeHeight)
 		s.recordSpecialTx(payloadHash, height)
 
 	case common2.ReturnDepositCoin:
@@ -1900,6 +1965,18 @@ func (s *State) registerProducer(tx interfaces.Transaction, height uint32) {
 		depositHash:                  *programHash,
 	}
 
+	// Revert symmetry: capture prior DepositOutputs so the revert restores a
+	// pre-existing entry instead of deleting it. A re-registration reuses the same
+	// deposit outpoint, and an unconditional delete on rollback drops an entry the
+	// pre-block keyframe held, diverging the keyframe on reorg.
+	oriDeposits := make(map[string]common.Fixed64)
+	oriDepositExists := make(map[string]bool)
+	for k := range depositOutputs {
+		if ov, ok := s.DepositOutputs[k]; ok {
+			oriDeposits[k] = ov
+			oriDepositExists[k] = true
+		}
+	}
 	s.History.Append(height, func() {
 		s.Nicknames[nickname] = struct{}{}
 		s.NodeOwnerKeys[nodeKey] = ownerKey
@@ -1914,7 +1991,11 @@ func (s *State) registerProducer(tx interfaces.Transaction, height uint32) {
 		delete(s.PendingProducers, ownerKey)
 		delete(s.ProducerDepositMap, *programHash)
 		for k := range depositOutputs {
-			delete(s.DepositOutputs, k)
+			if oriDepositExists[k] {
+				s.DepositOutputs[k] = oriDeposits[k]
+			} else {
+				delete(s.DepositOutputs, k)
+			}
 		}
 	})
 }
@@ -2251,7 +2332,20 @@ func (s *State) processDeposit(tx interfaces.Transaction, height uint32) {
 			contract.PrefixDeposit {
 			if s.addProducerAssert(output, height) {
 				op := common2.NewOutPoint(tx.Hash(), uint16(i))
-				s.DepositOutputs[op.ReferKey()] = output.Value
+				// History-wrap so the entry reverts on rollback, mirroring the correctly
+				// wrapped registerProducer path and its CR-side sibling. A direct write
+				// here survives a reorg RollbackTo.
+				k, v := op.ReferKey(), output.Value
+				oriV, oriExists := s.DepositOutputs[k]
+				s.History.Append(height, func() {
+					s.DepositOutputs[k] = v
+				}, func() {
+					if oriExists {
+						s.DepositOutputs[k] = oriV
+					} else {
+						delete(s.DepositOutputs, k)
+					}
+				})
 			}
 		}
 	}
@@ -2447,6 +2541,11 @@ func (s *State) returnDeposit(tx interfaces.Transaction, height uint32) {
 			}
 
 			returnAction := func(producer *Producer) {
+				// Capture the true prior state so rollback restores it. The forward action only
+				// transitions Canceled->Returned, so an undo that hard-sets Canceled leaves a
+				// non-Canceled producer, an Inactive one for instance, wrongly Canceled after a
+				// reorg. Reorg revert-symmetry: ungated, forward state unchanged.
+				oriState := producer.state
 				s.History.Append(height, func() {
 					producer.totalAmount -= inputValue
 					if producer.state == Canceled &&
@@ -2456,7 +2555,7 @@ func (s *State) returnDeposit(tx interfaces.Transaction, height uint32) {
 					}
 				}, func() {
 					producer.totalAmount += inputValue
-					producer.state = Canceled
+					producer.state = oriState
 				})
 			}
 
@@ -2687,12 +2786,30 @@ func (s *State) processCreateNFT(tx interfaces.Transaction, height uint32) {
 	nftPayload := tx.Payload().(*payload.CreateNFT)
 	nftID := common.GetNFTID(nftPayload.ReferKey, tx.Hash())
 
-	// record the relationship map between ID and genesis block hash
-	s.NFTIDInfoHashMap[nftID] = payload.NFTInfo{
+	// record the relationship map between ID and genesis block hash.
+	// History-wrap this write so a reorg RollbackTo removes the entry. A direct
+	// (non-History) write leaves a ghost NFT ID after rollback: the vote-rights changes
+	// below are History-wrapped and revert, but the map entry survives, letting a later
+	// expire/destroy inflate DposV2VoteRights and a same-referKey re-create double-mint
+	// (a new tx hash gives a new nftID). This is a standalone top-level closure, and the
+	// write is unconditional today, running even for creates with no matching vote, so
+	// forward committed state is byte-identical. Capture-and-restore, mirroring
+	// processNFTDestroyFromSideChain, keeps it overwrite-safe.
+	oriNFTInfo, hadNFTInfo := s.NFTIDInfoHashMap[nftID]
+	nftInfo := payload.NFTInfo{
 		ReferKey:         nftPayload.ReferKey,
 		GenesisBlockHash: nftPayload.GenesisBlockHash,
 		CreateNFTTxHash:  tx.Hash(),
 	}
+	s.History.Append(height, func() {
+		s.NFTIDInfoHashMap[nftID] = nftInfo
+	}, func() {
+		if hadNFTInfo {
+			s.NFTIDInfoHashMap[nftID] = oriNFTInfo
+		} else {
+			delete(s.NFTIDInfoHashMap, nftID)
+		}
+	})
 
 	producers := s.getDposV2Producers()
 	for _, producer := range producers {
@@ -2799,13 +2916,131 @@ func (s *State) getClaimedCRMemberDPOSPublicKeyMap() map[string]*state.CRMember 
 func (s *State) processEmergencyInactiveArbitrators(
 	inactivePayload *payload.InactiveArbitrators, height uint32) {
 
+	// Capture-and-restore, never compute-the-inverse: the same rule the producer and CR
+	// inactivity sites in this file follow (updateInactiveCountV2,
+	// countArbitratorsInactivityV3).
+	//
+	// Two independent defects live in the pristine pair:
+	//
+	//  (1) Rollback symmetry (fixed ungated, below). CheckInactiveArbitrators admits a
+	//      target that is merely IsDisabledProducer, which includes a producer already
+	//      in InactiveProducers, and revertSettingInactiveProducer is unconditional, so
+	//      undoing the marking of an already-inactive producer sets it Active and
+	//      re-inserts it into ActivityProducers: a reorg promotes a producer into the
+	//      arbiter-eligible set, and debits a penalty that was never credited. Three
+	//      further fields are lost on every revert, including the legitimate
+	//      Active->Inactive->revert path: `selected` is cleared by setInactiveProducer
+	//      and never restored, `activateRequestHeight` is set to MaxUint32 by both
+	//      functions, destroying a pending ActivateProducer request rather than
+	//      restoring it, and `inactiveSince` is reset to 0 instead of to its captured
+	//      original.
+	//
+	//  (2) Apply idempotency (gated, see below). Re-marking an already-inactive
+	//      producer adds EmergencyInactivePenalty a second time and overwrites
+	//      inactiveSince, which is forward derived state. Stated precisely: the mainnet
+	//      default for EmergencyInactivePenalty is 0 (config.go: "there will be no
+	//      penalty in this version"), so today the double charge is zero-valued and the
+	//      live forward difference is the overwritten inactiveSince, which gates how
+	//      long the producer must wait before an ActivateProducer request is accepted.
+	//      The penalty half becomes material the moment that parameter is configured
+	//      non-zero.
+	//
+	// Gate: both halves reuse gate 1 (StrictMoneyRangeHeight); no new height is
+	// introduced. Neither half may be left ungated on the premise that the undo
+	// "executes only on live reorgs, never during linear replay". That premise is false:
+	// History.Append runs the rollback closure of every outstanding tempChange the moment
+	// the next non-zero-height Append arrives (utils/history.go), so the height-0 gossip
+	// preview's undo runs on the ordinary linear-replay path, once per block that follows
+	// a preview. An ungated undo rejects mainnet block 409,957, which the real chain
+	// accepted. See the notes on the two closures below for the rest of the chain.
+	// Retained history holds only 6 InactiveArbitrators transactions in total (heights
+	// 408,476 to 434,811) and none at or above gate 1, so gating both halves makes every
+	// retained block derive byte-identically to the pristine pair, by construction rather
+	// than by argument.
+	//
+	// height == 0 is the height-0 gossip preview (State.ProcessSpecialTxPayload), not a
+	// block height. 0 is below gate 1, so the preview takes the legacy forward and the
+	// legacy undo, which is what mainnet ran. The preview is reversed by the next Append
+	// and re-applied at the real height by processTransactions, so the committed state is
+	// always decided by the branch the real height selects.
 	addEmergencyInactiveArbitrator := func(key string, producer *Producer) {
+		var (
+			oriState                 ProducerState
+			oriPenalty               common.Fixed64
+			oriInactiveSince         uint32
+			oriSelected              bool
+			oriActivateRequestHeight uint32
+			wasInactive              bool
+			hadEmergencyEntry        bool
+			captured                 bool
+		)
 		s.History.Append(height, func() {
-			s.setInactiveProducer(producer, key, height, true)
+			// Captured inside the forward: Append only caches the closures (see the
+			// contract on History.Append), so an enclosing-scope capture would read
+			// pre-block state and a producer named by two payloads in the same block
+			// would restore the wrong origin.
+			//
+			// Capture on the first execution only. History.Commit executes the
+			// tempChanges slice and does not clear it, so a height-0 preview closure is
+			// re-executed once more for every further preview in the same gossip burst.
+			// Re-capturing on those later executions reads the state this closure has
+			// already written and latches wasInactive = true, which then makes the undo
+			// below skip the map restore. The capture must describe the state before the
+			// first application, which is the only state the undo can legitimately
+			// restore. Multi-payload bursts are not hypothetical: mainnet block 408,476
+			// carries four InactiveArbitrators transactions.
+			if !captured {
+				oriState = producer.state
+				oriPenalty = producer.penalty
+				oriInactiveSince = producer.inactiveSince
+				oriSelected = producer.selected
+				oriActivateRequestHeight = producer.activateRequestHeight
+				wasInactive = producer.state == Inactive
+				_, hadEmergencyEntry = s.EmergencyInactiveArbiters[key]
+				captured = true
+			}
+
+			if !wasInactive || height < s.ChainParams.StrictMoneyRangeHeight {
+				s.setInactiveProducer(producer, key, height, true)
+			}
 			s.EmergencyInactiveArbiters[key] = struct{}{}
 		}, func() {
-			s.revertSettingInactiveProducer(producer, key, height, true)
-			delete(s.EmergencyInactiveArbiters, key)
+			// Below gate 1 the undo is the pristine pair, byte-for-byte. The height-0
+			// gossip preview (height 0 < gate 1) and every retained block therefore
+			// reverse exactly as mainnet reversed them.
+			//
+			// The invariant either branch must hold: the undo leaves the producer in the
+			// exact state that existed before the forward was first applied, map
+			// membership included. Restoring the fields while leaving the producer in the
+			// map the forward moved it into is not a restore. Observed when the map
+			// restore was skipped: a producer was left in InactiveProducers, its
+			// inactiveCountingHeight was never reset from 408,443, it was wrongly marked
+			// Inactive at 409,953, and the vote output in mainnet block 409,957 was
+			// rejected. The intermediate step from the skipped map restore to the stale
+			// counting height is not established, so it is not asserted here; the gated
+			// branch below reproduces mainnet whatever that step is.
+			if height < s.ChainParams.StrictMoneyRangeHeight {
+				s.revertSettingInactiveProducer(producer, key, height, true)
+				delete(s.EmergencyInactiveArbiters, key)
+				return
+			}
+			// Only move the producer back between the maps when this payload is what
+			// took it out of ActivityProducers. If it was already Inactive the maps
+			// were never changed, and calling the inverse would PROMOTE it.
+			if !wasInactive {
+				s.revertSettingInactiveProducer(producer, key, height, true)
+			}
+			// Restore every field the pair computed rather than captured. This also
+			// repairs revertSettingInactiveProducer's clamped penalty subtraction and
+			// its unconditional activateRequestHeight = MaxUint32.
+			producer.state = oriState
+			producer.penalty = oriPenalty
+			producer.inactiveSince = oriInactiveSince
+			producer.selected = oriSelected
+			producer.activateRequestHeight = oriActivateRequestHeight
+			if !hadEmergencyEntry {
+				delete(s.EmergencyInactiveArbiters, key)
+			}
 		})
 	}
 
@@ -2838,8 +3073,12 @@ func (s *State) recordSpecialTx(hash common.Uint256, height uint32) {
 
 // removeSpecialTx record hash of a special tx
 func (s *State) RemoveSpecialTx(hash common.Uint256) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
+	// This deletes from SpecialTxHashes, which is a write, so it must hold the exclusive
+	// Lock. Under RLock it races the Lock-held writer (recordSpecialTx via ProcessBlock)
+	// and the RLock readers (SpecialTxExists), giving the Go fatal "concurrent map read
+	// and map write", which calls os.Exit and cannot be recovered.
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 	delete(s.SpecialTxHashes, hash)
 }
 
@@ -2902,7 +3141,7 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 					if common.GetNFTID(referKey, nftInfo.CreateNFTTxHash).IsEqual(nftID) {
 						strNFTStakeAddress, _ := stakeAddress.ToAddress()
 						strOwnerStakeAddress, _ := newOwnerStakeAddress.ToAddress()
-						oriRewardsInfo := s.DPoSV2RewardInfo[strNFTStakeAddress]
+						var creditedRewards common.Fixed64
 						nftAmount := detailVoteInfo.Info[0].Votes
 						originDetailVoteInfo := detailVoteInfo
 						s.History.Append(height, func() {
@@ -2913,7 +3152,19 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 							s.UsedDposV2Votes[newOwnerStakeAddress] += nftAmount
 							//remove nft stake address for future create new nft .
 							delete(producer.detailedDPoSV2Votes[stakeAddress], referKey)
-							s.DPoSV2RewardInfo[strOwnerStakeAddress] += s.DPoSV2RewardInfo[strNFTStakeAddress]
+							// Capture the credited amount inside the forward closure. A pre-Append capture
+							// holds the pre-block value, but this credit is a live lookup, so when a second
+							// same-block NFTDestroy has already folded another NFT's reward into this key the
+							// two differ and the revert under-debits. utils/history.go runs closures at Commit
+							// and rolls back forward, not LIFO, so the pair must be an exact inverse on its
+							// own. Ungated, matching the other rollback-closure pairs in this file: rollback
+							// closures execute only on live reorgs and never during linear replay or
+							// InitCheckpoint re-derive, so retained history at or below 2,260,450 derives
+							// byte-identically. In every non-aliased case the credited amount equals the
+							// pre-block value and the `+=` restore below lands on a key the forward just
+							// deleted, so this is a no-op there too.
+							creditedRewards = s.DPoSV2RewardInfo[strNFTStakeAddress]
+							s.DPoSV2RewardInfo[strOwnerStakeAddress] += creditedRewards
 							delete(s.DPoSV2RewardInfo, strNFTStakeAddress)
 							//detailVoteInfo add to new owner nftDestroyPayload.OwnerStakeAddresses
 							if len(producer.detailedDPoSV2Votes[newOwnerStakeAddress]) == 0 {
@@ -2943,8 +3194,36 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 							producer.detailedDPoSV2Votes[stakeAddress][referKey] = originDetailVoteInfo
 							//remove owner's detailVoteInfo
 							delete(producer.detailedDPoSV2Votes[newOwnerStakeAddress], referKey)
-							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= s.DPoSV2RewardInfo[strNFTStakeAddress]
-							s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
+							// Debit the credited amount, not a live lookup of the key the forward closure
+							// already deleted: that lookup reads 0 and the owner keeps the credited reward, a
+							// claimable-reward misallocation on reorg. The hole is on the DPoSV2RewardInfo key
+							// with distinct NFT ids, which is a different case from a same-NFT-ID collision: an
+							// attacker-chosen OwnerStakeAddresses[i] set to a different entry's NFT stake
+							// address makes the forwards compose. It is arbiter-signed and reorg-only, so
+							// linear InitCheckpoint replay, which runs apply only, and the recovery re-derive
+							// are unaffected.
+							//
+							// The validation-layer guard in nftdestroytransaction.go does not close this on its
+							// own: it is intra-transaction only, building its NFT stake-address set from this
+							// payload's own IDs, so the identical vector splits across two same-block NFTDestroy
+							// transactions (tx1 destroys A naming stake(B), tx2 destroys B) and neither payload
+							// trips it, as an executed test shows. Two things close it together:
+							//   (1) blockchain/blockvalidator.go CheckSameBlockConflicts rejects the split at
+							//       block scope (gate StrictMoneyRangeHeight), the only scope at which the
+							//       composition is visible; and
+							//   (2) this closure pair relies on no pre-block capture at all: creditedRewards is
+							//       measured inside the forward and restored with `+=`, so apply and revert are
+							//       exact inverses under the forward rollback order of utils/history.go even
+							//       when a cross-key change intervenes.
+							// This is a claimable-balance accounting defect: no mint, no supply inflation.
+							// Covered by the dpos/state cross-key and cross-tx tests.
+							s.DPoSV2RewardInfo[strOwnerStakeAddress] -= creditedRewards
+							// `+=`, not `=`, so a cross-key restore composes correctly. Under forward rollback
+							// order the earlier closure's inverse may already have driven this key negative;
+							// assigning would overwrite that intermediate and strand the difference. The key was
+							// deleted by the forward, so in the ordinary case `+=` on an absent key is
+							// byte-identical to an assignment.
+							s.DPoSV2RewardInfo[strNFTStakeAddress] += creditedRewards
 							if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {
 								delete(s.DPoSV2RewardInfo, strOwnerStakeAddress)
 							}
@@ -2967,7 +3246,7 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 				if common.GetNFTID(votesInfo.ReferKey(), nftInfo.CreateNFTTxHash).IsEqual(nftID) {
 					strNFTStakeAddress, _ := stakeAddress.ToAddress()
 					strOwnerStakeAddress, _ := newOwnerStakeAddress.ToAddress()
-					oriRewardsInfo := s.DPoSV2RewardInfo[strNFTStakeAddress]
+					var creditedRewards common.Fixed64
 					nftAmount := votesInfo.Info[0].Votes
 					s.History.Append(height, func() {
 						//process total vote rights
@@ -2976,7 +3255,19 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 						//s.UsedDposV2Votes[newOwnerStakeAddress] += nftAmount
 						//remove nft stake address for future create new nft .
 						delete(producer.expiredNFTVotes, stakeAddress)
-						s.DPoSV2RewardInfo[strOwnerStakeAddress] += s.DPoSV2RewardInfo[strNFTStakeAddress]
+						// Capture the credited amount inside the forward closure. A pre-Append capture
+						// holds the pre-block value, but this credit is a live lookup, so when a second
+						// same-block NFTDestroy has already folded another NFT's reward into this key the
+						// two differ and the revert under-debits. utils/history.go runs closures at Commit
+						// and rolls back forward, not LIFO, so the pair must be an exact inverse on its
+						// own. Ungated, matching the other rollback-closure pairs in this file: rollback
+						// closures execute only on live reorgs and never during linear replay or
+						// InitCheckpoint re-derive, so retained history at or below 2,260,450 derives
+						// byte-identically. In every non-aliased case the credited amount equals the
+						// pre-block value and the `+=` restore below lands on a key the forward just
+						// deleted, so this is a no-op there too.
+						creditedRewards = s.DPoSV2RewardInfo[strNFTStakeAddress]
+						s.DPoSV2RewardInfo[strOwnerStakeAddress] += creditedRewards
 						delete(s.DPoSV2RewardInfo, strNFTStakeAddress)
 						//detailVoteInfo add to new owner nftDestroyPayload.OwnerStakeAddresses
 						//if len(producer.detailedDPoSV2Votes[newOwnerStakeAddress]) == 0 {
@@ -2994,10 +3285,13 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 						if s.DposV2VoteRights[newOwnerStakeAddress] == 0 {
 							delete(s.DposV2VoteRights, newOwnerStakeAddress)
 						}
-						s.UsedDposV2Votes[newOwnerStakeAddress] -= nftAmount
-						if s.UsedDposV2Votes[newOwnerStakeAddress] == 0 {
-							delete(s.UsedDposV2Votes, newOwnerStakeAddress)
-						}
+						// The apply closure intentionally does not touch UsedDposV2Votes for
+						// the expired-NFT reclaim (the migrated votes become castable, not
+						// used), so the revert must be a no-op on it too. A
+						// `s.UsedDposV2Votes[newOwnerStakeAddress] -= nftAmount` here has no
+						// matching apply increment, so on a reorg RollbackTo it deflates or
+						// underflows the new owner's used-vote count, inflating castable
+						// rights. Apply and revert must stay exact inverses.
 						////add detailVoteInfo to  nft stake address
 						//if len(producer.detailedDPoSV2Votes[stakeAddress]) == 0 {
 						//	producer.detailedDPoSV2Votes[stakeAddress] = make(map[common.Uint256]payload.DetailedVoteInfo)
@@ -3005,8 +3299,15 @@ func (s *State) processNFTDestroyFromSideChain(tx interfaces.Transaction, height
 						producer.expiredNFTVotes[stakeAddress] = votesInfo
 						//remove owner's detailVoteInfo
 						//delete(producer.expiredNFTVotes, newOwnerStakeAddress)
-						s.DPoSV2RewardInfo[strOwnerStakeAddress] -= s.DPoSV2RewardInfo[strNFTStakeAddress]
-						s.DPoSV2RewardInfo[strNFTStakeAddress] = oriRewardsInfo
+						// Expired branch, same rule as the active branch: debit the captured
+						// credited amount, not the deleted key's live (0) value.
+						s.DPoSV2RewardInfo[strOwnerStakeAddress] -= creditedRewards
+						// `+=`, not `=`, so a cross-key restore composes correctly. Under forward rollback
+						// order the earlier closure's inverse may already have driven this key negative;
+						// assigning would overwrite that intermediate and strand the difference. The key was
+						// deleted by the forward, so in the ordinary case `+=` on an absent key is
+						// byte-identical to an assignment.
+						s.DPoSV2RewardInfo[strNFTStakeAddress] += creditedRewards
 						if s.DPoSV2RewardInfo[strOwnerStakeAddress] == 0 {
 							delete(s.DPoSV2RewardInfo, strOwnerStakeAddress)
 						}
@@ -3359,22 +3660,32 @@ func (s *State) countArbitratorsInactivityV3(height uint32,
 		ps := s.getAllProducers()
 		for _, p := range ps {
 			cp := p
+			// Capture the pre-reset value so the rollback restores the original
+			// workedInRound, not a hard-coded true. Restoring true for every
+			// producer makes a reorg across a round boundary look as though a
+			// producer that had not worked had worked, and inactiveCountV2 then
+			// diverges. Not height-gated: rollback closures fire only on live
+			// reorgs, never during linear replay, so historical derivation is
+			// unchanged.
+			oriWorked := cp.workedInRound
 			// reset workedInRound value
 			s.History.Append(height, func() {
 				cp.workedInRound = false
 			}, func() {
-				cp.workedInRound = true
+				cp.workedInRound = oriWorked
 			})
 		}
 
 		ms := s.getCurrentCRMembers()
 		for _, m := range ms {
 			cm := m
+			// Restore the captured original (see the producer loop above).
+			oriWorked := cm.WorkedInRound
 			// reset workedInRound value
 			s.History.Append(height, func() {
 				cm.WorkedInRound = false
 			}, func() {
-				cm.WorkedInRound = true
+				cm.WorkedInRound = oriWorked
 			})
 		}
 	}
@@ -3384,7 +3695,35 @@ func (s *State) updateCRMemberInactiveCountV2(lastPosition, needReset, workedInR
 	// if it's the last position and not working in Round then we should add inactiveCountV2++
 	if lastPosition && !needReset && !workedInRound {
 		originInactiveCountV2 := member.InactiveCountV2
+		// The CR twin of the producer inactivity undo. The undo guard must not re-read
+		// member.InactiveCountV2, which the forward zeroes on firing: `>= 3` is then
+		// false in every reachable state and the undo is dead by construction. On the
+		// firing path the count is 0, on the non-firing path it is 1 or 2, a later
+		// history entry cannot raise it (utils.History rollback is strictly LIFO, so
+		// every later undo has already restored its origin), and a count that was
+		// already >= 3 on entry still fires and still zeroes. A reorg across the firing
+		// block then leaves the member stuck MemberInactive, that is, removed from the
+		// CRC arbiter set, with the CR inactivity penalty against its deposit never
+		// reverted.
+		//
+		// Drive the undo off a `fired` flag captured inside the forward, exactly as the
+		// producer sibling does, and restore the captured oriState rather than
+		// hard-coding MemberElected: the caller guarantees Elected today
+		// (countArbitratorsInactivityV3 skips MemberState != MemberElected), but that is
+		// precisely the assumption this file removes elsewhere.
+		//
+		// Gate: none. Rollback closures execute only on live reorgs and never during
+		// linear replay, so retained history at or below gate 1 derives byte-identically.
+		// Same doctrine as the other revert-symmetry pairs in this file.
+		fired := false
+		oriState := member.MemberState
 		s.History.Append(height, func() {
+			fired = false
+			// Captured inside the forward: Append only CACHES the closures, so an
+			// enclosing-scope capture would read pre-block state (see the contract on
+			// History.Append), and a member touched twice in one block would restore
+			// the wrong origin.
+			oriState = member.MemberState
 			member.InactiveCountV2 += 1
 			if member.InactiveCountV2 >= 3 {
 				member.MemberState = state.MemberInactive
@@ -3392,10 +3731,11 @@ func (s *State) updateCRMemberInactiveCountV2(lastPosition, needReset, workedInR
 					s.updateCRInactivePenalty(member.Info.CID, height)
 				}
 				member.InactiveCountV2 = 0
+				fired = true
 			}
 		}, func() {
-			if member.MemberState == state.MemberInactive && member.InactiveCountV2 >= 3 {
-				member.MemberState = state.MemberElected
+			if fired {
+				member.MemberState = oriState
 				if height >= s.ChainParams.CRConfiguration.ChangeCommitteeNewCRHeight {
 					s.revertUpdateCRInactivePenalty(member.Info.CID, height)
 				}
@@ -3416,15 +3756,66 @@ func (s *State) updateInactiveCountV2(lastPosition, needReset, workedInRound boo
 	// if it's the last position and not working in Round then we should add inactiveCountV2++
 	if lastPosition && !needReset && !workedInRound {
 		originInactiveCountV2 := producer.inactiveCountV2
+		// Drive the undo off whether the threshold actually fired, captured in the forward
+		// closure. A guard that re-reads producer.inactiveCountV2, which the forward zeroes
+		// on firing, is always false on rollback, revertSettingInactiveProducer never runs,
+		// and the producer is left stuck Inactive after a reorg across the threshold. Reorg
+		// revert-symmetry, ungated.
+		//
+		// Restoring the producer's state and map membership is not enough.
+		// setInactiveProducer also writes inactiveSince, activateRequestHeight and selected,
+		// and revertSettingInactiveProducer computes their inverse instead of restoring the
+		// captured originals: it hard-sets inactiveSince = 0 and
+		// activateRequestHeight = math.MaxUint32 and never touches `selected` at all. A
+		// reorg across the inactivity threshold therefore
+		//   - destroys a pending ActivateProducer request (activateRequestHeight is what
+		//     processTransactions tests to decide when an inactive producer is put back on
+		//     duty),
+		//   - rewrites inactiveSince, which gates how long the producer must wait, and
+		//   - clears `selected`, which the random-candidate selection in arbitrators.go
+		//     reads.
+		// All three feed the arbiter set, so two nodes that disagree about a reorg disagree
+		// about who may produce. Penalty is captured for the same reason: the forward
+		// charges it only at or above ChangeCommitteeNewCRHeight while the undo subtracts
+		// unconditionally and clamps at zero, so below that height an uncaptured undo
+		// refunds a penalty that was never charged.
+		//
+		// Same pattern as the emergency-inactive site in this file
+		// (processEmergencyInactiveArbitrators): capture-and-restore, never
+		// compute-the-inverse. Captured inside the forward so a producer touched twice in
+		// one block restores its true origin (see the contract on utils.History.Append).
+		//
+		// Gate: none. Only the rollback closure differs from the pristine pair; the
+		// forward/accept path is byte-identical, and rollback closures execute solely on
+		// live reorgs, never during linear replay or checkpoint re-derivation, so retained
+		// history through 2,260,450 keeps its verdict. Same doctrine as the other
+		// revert-symmetry pairs in this file.
+		fired := false
+		var (
+			oriInactiveSince         uint32
+			oriActivateRequestHeight uint32
+			oriSelected              bool
+			oriPenalty               common.Fixed64
+		)
 		s.History.Append(height, func() {
+			fired = false
 			producer.inactiveCountV2 += 1
 			if producer.inactiveCountV2 >= 3 {
+				oriInactiveSince = producer.inactiveSince
+				oriActivateRequestHeight = producer.activateRequestHeight
+				oriSelected = producer.selected
+				oriPenalty = producer.penalty
 				s.setInactiveProducer(producer, key, height, false)
 				producer.inactiveCountV2 = 0
+				fired = true
 			}
 		}, func() {
-			if producer.state == Inactive && producer.inactiveCountV2 >= 3 {
+			if fired {
 				s.revertSettingInactiveProducer(producer, key, height, false)
+				producer.inactiveSince = oriInactiveSince
+				producer.activateRequestHeight = oriActivateRequestHeight
+				producer.selected = oriSelected
+				producer.penalty = oriPenalty
 			}
 			producer.inactiveCountV2 = originInactiveCountV2
 		})
@@ -3750,6 +4141,16 @@ func (s *State) RollbackTo(height uint32) error {
 
 // GetHistory returns a History state instance storing the producers and votes
 // on the historical height.
+//
+// Read this before wiring it to anything. This is not a read-only query: it is the
+// only production reference to History.SeekTo in the tree, and SeekTo mutates the live
+// state by executing the top groups' rollback closures, then leaves the history
+// rewound (seekHeight below height, the groups retained). The caller gets a snapshot;
+// the live producer/vote state stays seeked until the next Commit walks it forward
+// again. RollbackTo does not double-roll those groups (see the re-commit at the top of
+// utils.History.RollbackTo), but the mutation itself remains, so exposing this over RPC
+// would let an unauthenticated query rewind consensus state. It has no production
+// caller today; keep it that way, or make it snapshot-only first.
 func (s *State) GetHistory(height uint32) (*StateKeyFrame, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()

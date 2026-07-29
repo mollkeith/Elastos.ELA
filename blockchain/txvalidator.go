@@ -72,13 +72,53 @@ func (b *BlockChain) CheckTransactionSanity(blockHeight uint32,
 	return txn.SanityCheck(para)
 }
 
-// CheckTransactionContext verifies a transaction with history transaction in ledger
+// CheckTransactionContext verifies a transaction with history transaction in ledger.
+//
+// The parent is taken to be the current best tip. That is correct for the mempool
+// and mining callers, since a transaction admitted now is destined for
+// BestChain+1. The block path must not use it; it calls
+// CheckTransactionContextWithPrev with the parent of the block actually being
+// validated.
 func (b *BlockChain) CheckTransactionContext(blockHeight uint32,
 	tx interfaces.Transaction, proposalsUsedAmount common.Fixed64, timeStamp uint32) (
 	map[*common2.Input]common2.Output, elaerr.ELAError) {
 
+	return b.CheckTransactionContextWithPrev(b.BestChain, blockHeight, tx,
+		proposalsUsedAmount, timeStamp)
+}
+
+// CheckTransactionContextWithPrev is CheckTransactionContext with the parent of the
+// block under validation made explicit.
+//
+// Ungated. RevertToPOWTransaction.SpecialContextCheck decides block acceptance on
+// "how long since the previous block". Reading that from
+// BlockChain.BestChain.Timestamp takes it from the validating node's current tip:
+// for any block arriving on a competing branch BestChain is not that block's
+// ancestor, so the decision is taken against a timestamp from an unrelated chain
+// and two nodes with different tips can reach opposite verdicts on the same block.
+// Binding it to the block's own parent makes the decision a pure function of the
+// block's ancestry.
+//
+// Ungated on evidence, not on assumption: over the retained chain every stored
+// height links to a stored parent (one linear chain, one fork point at 1832750), so
+// during linear replay the tip when block H is validated is its parent; and
+// evaluating the production NoBlock rule against each block's own parent, all 29
+// NoBlock-type RevertToPOW transactions in history still pass, with margins from
+// +12s to +42040s. No retained block changes verdict, so no coordinated activation
+// is needed and no third gate is introduced.
+func (b *BlockChain) CheckTransactionContextWithPrev(prevNode *BlockNode,
+	blockHeight uint32, tx interfaces.Transaction,
+	proposalsUsedAmount common.Fixed64, timeStamp uint32) (
+	map[*common2.Input]common2.Output, elaerr.ELAError) {
+
 	para := functions.GetTransactionParameters(
 		tx, blockHeight, timeStamp, b.chainParams, b, proposalsUsedAmount)
+
+	if prevNode != nil {
+		if pa, ok := para.(interfaces.PrevBlockAware); ok {
+			pa.SetPrevBlockTimestamp(prevNode.Timestamp)
+		}
+	}
 
 	references, contextErr := tx.ContextCheck(para)
 	if contextErr != nil {
@@ -693,7 +733,8 @@ func (b *BlockChain) CheckTransactionFee(tx interfaces.Transaction, references m
 	return nil
 }
 
-func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output) error {
+func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output,
+	blockHeight, strictMoneyHeight uint32) error {
 	programHashes, err := GetTxProgramHashes(tx, references)
 	if (tx.IsCRCProposalWithdrawTx() && tx.PayloadVersion() == payload.CRCProposalWithdrawDefault) ||
 		tx.IsCRAssetsRectifyTx() || tx.IsCRCProposalRealWithdrawTx() || tx.IsNextTurnDPOSInfoTx() {
@@ -709,7 +750,7 @@ func checkTransactionSignature(tx interfaces.Transaction, references map[*common
 	// sort the program hashes of owner and programs of the transaction
 	common.SortProgramHashByCodeHash(programHashes)
 	SortPrograms(tx.Programs())
-	return RunPrograms(buf.Bytes(), programHashes, tx.Programs())
+	return RunPrograms(buf.Bytes(), programHashes, tx.Programs(), blockHeight, strictMoneyHeight)
 }
 
 func CheckAmountPrecise(amount common.Fixed64, precision byte) bool {
@@ -866,8 +907,26 @@ func CheckPayloadSignature(info *payload.CRInfo, payloadVersion byte) error {
 	return CheckCRTransactionSignature(info.Signature, info.Code, signedBuf.Bytes())
 }
 
-func CheckRevertToDPOSTransaction(txn interfaces.Transaction) error {
-	return checkArbitratorsSignatures(txn.Programs()[0])
+// CheckRevertToDPOSTransaction validates a RevertToDPOS transaction that is
+// expected to be COMPLETE: the multisig code must list authorized arbiters and,
+// at or above the gate, the program parameter must carry valid M-of-N signatures
+// over the unsigned digest. blockHeight is the height of the block carrying the
+// transaction.
+func CheckRevertToDPOSTransaction(txn interfaces.Transaction, blockHeight uint32) error {
+	if err := checkArbitratorsMultisigStructure(txn); err != nil {
+		return err
+	}
+	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
+}
+
+// CheckRevertToDPOSTransactionGossip validates a RevertToDPOS transaction
+// received over the DPoS gossip network. Such a transaction carries the
+// sponsor's single signature; collecting the remaining co-signatures is the
+// purpose of the gossip round, so only the multisig code structure is checked
+// here. Full M-of-N verification runs where the transaction is complete, in
+// RevertToDPOSTransaction.SpecialContextCheck on the block connect path.
+func CheckRevertToDPOSTransactionGossip(txn interfaces.Transaction) error {
+	return checkArbitratorsMultisigStructure(txn)
 }
 
 func CheckSidechainIllegalEvidence(p *payload.SidechainIllegalData) error {
@@ -905,7 +964,28 @@ func CheckSidechainIllegalEvidence(p *payload.SidechainIllegalData) error {
 	return nil
 }
 
-func CheckInactiveArbitrators(txn interfaces.Transaction) error {
+// CheckInactiveArbitrators validates an InactiveArbitrators transaction that is
+// expected to be COMPLETE: the payload targets, the multisig code and, at or
+// above the gate, valid M-of-N signatures over the unsigned digest. blockHeight
+// is the height of the block carrying the transaction.
+func CheckInactiveArbitrators(txn interfaces.Transaction, blockHeight uint32) error {
+	if err := checkInactiveArbitratorsStructure(txn); err != nil {
+		return err
+	}
+	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
+}
+
+// CheckInactiveArbitratorsGossip validates an InactiveArbitrators transaction
+// received over the DPoS gossip network. Such a transaction carries the
+// sponsor's single signature; collecting the remaining co-signatures is the
+// purpose of the gossip round, so only the payload targets and the multisig code
+// structure are checked here. Full M-of-N verification runs where the
+// transaction is complete, in PreProcessSpecialTx on the block connect path.
+func CheckInactiveArbitratorsGossip(txn interfaces.Transaction) error {
+	return checkInactiveArbitratorsStructure(txn)
+}
+
+func checkInactiveArbitratorsStructure(txn interfaces.Transaction) error {
 	p, ok := txn.Payload().(*payload.InactiveArbitrators)
 	if !ok {
 		return errors.New("invalid payload")
@@ -926,15 +1006,32 @@ func CheckInactiveArbitrators(txn interfaces.Transaction) error {
 		}
 	}
 
-	if err := checkCRCArbitratorsSignatures(txn.Programs()[0]); err != nil {
+	if err := checkCRCArbitratorsMultisigStructure(txn); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func checkArbitratorsSignatures(program *program.Program) error {
-	code := program.Code
+// checkArbitratorsMultisigStructure checks the shape of the arbiter multisig
+// code only: the M and N parameters against the current arbiter set and the
+// majority ratio, and that every listed public key is an arbiter. It proves the
+// code lists authorized signers, not that anybody signed.
+func checkArbitratorsMultisigStructure(txn interfaces.Transaction) error {
+	// Reachable pre-auth via the DPoS gossip handler (CheckRevertToDPOSTransactionGossip /
+	// CheckInactiveArbitratorsGossip reach here with no SanityCheck and no CheckAttributeProgram),
+	// so an empty Programs() or a code shorter than 2 bytes would panic the receiving CRC
+	// arbiter on the code[len-2] / code[0] index. Guard both. The bound is len(code) < 2, the
+	// pure panic guard, not MinMultiSignCodeLength, which would preempt
+	// ParseMultisigScript's existing error path. Ungated crash-hardening, so below-gate
+	// validation stays byte-identical.
+	if len(txn.Programs()) == 0 {
+		return errors.New("no program in arbiter signature check")
+	}
+	code := txn.Programs()[0].Code
+	if len(code) < 2 {
+		return errors.New("invalid multi sign script code, length not enough")
+	}
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
@@ -966,9 +1063,61 @@ func checkArbitratorsSignatures(program *program.Program) error {
 	return nil
 }
 
-func checkCRCArbitratorsSignatures(program *program.Program) error {
+// arbitratorsMultisigActive reports whether strict multisig signature
+// verification for arbiter special txs (InactiveArbitrators / RevertToDPOS) is
+// active for a tx at the given blockHeight: true at/above StrictMoneyRangeHeight.
+// The gate is keyed on the BLOCK height (not the current tip) so that replaying
+// a below-gate historical block during InitCheckpoint / fresh-from-genesis sync
+// stays structure-only (byte-identical to legacy) — matching the mempool Path A
+// gate on t.parameters.BlockHeight. Nil-safe: unit tests run without a wired
+// DefaultLedger.Blockchain, treated as below-gate (structure-only).
+func arbitratorsMultisigActive(blockHeight uint32) bool {
+	bc := DefaultLedger.Blockchain
+	if bc == nil {
+		return false
+	}
+	return blockHeight >= bc.GetParams().StrictMoneyRangeHeight
+}
 
-	code := program.Code
+// verifyArbitratorsMultisigSignatures verifies that the program Parameter
+// actually carries valid M-of-N arbiter signatures over the tx's unsigned
+// digest. The structure and pubkey checks only prove the code lists authorized
+// arbiters; without this the connect path would apply an emergency ForceChange
+// or RevertToDPOS on an unsigned, permissionlessly-forged special tx. Callable
+// only where the transaction is expected to be COMPLETE, never on the gossip
+// path, where a single sponsor signature is the designed state. Height-gated for
+// replay-safety; the digest matches the honest signer path (tx.SerializeUnsigned).
+func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction, blockHeight uint32) error {
+	if !arbitratorsMultisigActive(blockHeight) {
+		return nil
+	}
+	buf := new(bytes.Buffer)
+	if err := txn.SerializeUnsigned(buf); err != nil {
+		return err
+	}
+	return crypto.CheckMultiSigSignatures(*txn.Programs()[0], buf.Bytes())
+}
+
+// checkCRCArbitratorsMultisigStructure checks the shape of the CRC arbiter
+// multisig code only: the M and N parameters against the CRC arbiter count and
+// the majority ratio, and that every listed public key is a CRC arbiter. It
+// proves the code lists authorized signers, not that anybody signed.
+func checkCRCArbitratorsMultisigStructure(txn interfaces.Transaction) error {
+
+	// Reachable pre-auth via the DPoS gossip handler (CheckRevertToDPOSTransactionGossip /
+	// CheckInactiveArbitratorsGossip reach here with no SanityCheck and no CheckAttributeProgram),
+	// so an empty Programs() or a code shorter than 2 bytes would panic the receiving CRC
+	// arbiter on the code[len-2] / code[0] index. Guard both. The bound is len(code) < 2, the
+	// pure panic guard, not MinMultiSignCodeLength, which would preempt
+	// ParseMultisigScript's existing error path. Ungated crash-hardening, so below-gate
+	// validation stays byte-identical.
+	if len(txn.Programs()) == 0 {
+		return errors.New("no program in arbiter signature check")
+	}
+	code := txn.Programs()[0].Code
+	if len(code) < 2 {
+		return errors.New("invalid multi sign script code, length not enough")
+	}
 	// Get N parameter
 	n := int(code[len(code)-2]) - crypto.PUSH1 + 1
 	// Get M parameter
@@ -1094,7 +1243,7 @@ func CheckDPOSIllegalVotes(d *payload.DPOSIllegalVotes) error {
 	return nil
 }
 
-func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks) error {
+func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks, strictActive bool) error {
 
 	if d.Evidence.BlockHash().IsEqual(d.CompareEvidence.BlockHash()) {
 		return errors.New("blocks can not be same")
@@ -1115,11 +1264,12 @@ func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks) error {
 		}
 
 		if confirm, compareConfirm, err = checkDPOSElaIllegalBlockConfirms(
-			d, header, compareHeader); err != nil {
+			d, header, compareHeader, strictActive); err != nil {
 			return err
 		}
 
-		if err := checkDPOSElaIllegalBlockSigners(d, confirm, compareConfirm); err != nil {
+		if err := checkDPOSElaIllegalBlockSigners(d, confirm, compareConfirm,
+			strictActive); err != nil {
 			return err
 		}
 	} else {
@@ -1131,7 +1281,7 @@ func CheckDPOSIllegalBlocks(d *payload.DPOSIllegalBlocks) error {
 
 func checkDPOSElaIllegalBlockSigners(
 	d *payload.DPOSIllegalBlocks, confirm *payload.Confirm,
-	compareConfirm *payload.Confirm) error {
+	compareConfirm *payload.Confirm, strictActive bool) error {
 
 	signers := d.Evidence.Signers
 	compareSigners := d.CompareEvidence.Signers
@@ -1175,11 +1325,53 @@ func checkDPOSElaIllegalBlockSigners(
 		}
 	}
 
+	// At and above StrictMoneyRangeHeight, bind the evidence Signers to the confirm's
+	// vote-signer set exactly: reject duplicates and require set-equality. Without
+	// this the count-plus-forward-subset checks above admit a padded list, for example
+	// Signers=[A,A,C,D] against votes {A,B,C,D}: same count, still a subset, but not
+	// the real set, which lets the submitter steer processIllegalEvidence's
+	// punished-set intersection and shield a colluding double-signer. Below the gate
+	// the legacy checks are kept so historical evidence replays byte-identically.
+	if strictActive {
+		if err := checkIllegalSignerSetEquality(signers, confirmSigners); err != nil {
+			return err
+		}
+		if err := checkIllegalSignerSetEquality(compareSigners,
+			compareConfirmSigners); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// checkIllegalSignerSetEquality requires the evidence signer slice to be duplicate-free
+// and to cover exactly the confirm's (deduplicated) vote-signer set. Combined with the
+// caller's existing count and forward-subset checks this pins Signers to the real confirm
+// voters.
+func checkIllegalSignerSetEquality(signers [][]byte,
+	confirmSigners map[string]interface{}) error {
+	uniqueSigners := make(map[string]struct{}, len(signers))
+	for _, v := range signers {
+		key := common.BytesToHexString(v)
+		if _, dup := uniqueSigners[key]; dup {
+			return errors.New("duplicate signer within evidence")
+		}
+		uniqueSigners[key] = struct{}{}
+	}
+	if len(uniqueSigners) != len(confirmSigners) {
+		return errors.New("signers set does not equal confirm votes set")
+	}
+	for key := range confirmSigners {
+		if _, ok := uniqueSigners[key]; !ok {
+			return errors.New("signers set does not equal confirm votes set")
+		}
+	}
 	return nil
 }
 
 func checkDPOSElaIllegalBlockConfirms(d *payload.DPOSIllegalBlocks,
-	header *common2.Header, compareHeader *common2.Header) (*payload.Confirm,
+	header *common2.Header, compareHeader *common2.Header, strictActive bool) (*payload.Confirm,
 	*payload.Confirm, error) {
 
 	confirm := &payload.Confirm{}
@@ -1197,17 +1389,49 @@ func checkDPOSElaIllegalBlockConfirms(d *payload.DPOSIllegalBlocks,
 		return nil, nil, err
 	}
 
+	// Run the cheap conjuncts before the expensive ones.
+	//
+	// An IllegalBlockEvidence transaction is zero-input, zero-output, zero-program,
+	// zero-fee and behind no height gate, so any unauthenticated peer can send one.
+	// Running ConfirmSanityCheck first means one crypto.Verify for the proposal plus a
+	// crypto.DecodePoint and crypto.Verify per vote, with no membership test and no
+	// short-circuit, so a payload carrying MaxDPOSProposalVotes = 1024 self-signed
+	// votes from ephemeral keypairs buys about 1025 EC verifications (about 111 ms for
+	// about 135 KB of wire) on the shared blockHandler goroutine before the first
+	// membership check can reject it.
+	//
+	// Acceptance is unchanged. The accept condition is the conjunction of these
+	// predicates; both are pure functions of the same immutable payload, neither
+	// mutates state, and IllegalConfirmContextCheck performs no signature verification
+	// at all (it is snapshot lookups plus a linear scan), so the order leaves the
+	// accepted set byte-identical and changes only which error string a rejected
+	// payload produces. One message differs: a confirm carrying only reject votes
+	// fails with "signers less than majority count" rather than "confirm contains
+	// reject vote", because IllegalConfirmContextCheck skips non-accept votes when
+	// building its signer set.
+	//
+	// Ungated: no acceptance decision changes at any height, so retained history
+	// replays byte-identically. No IllegalBlockEvidence transaction exists anywhere in
+	// the retained chain, so this path has never run on real history.
+	//
+	// The O(1) len(signers) != len(confirm.Votes) test is deliberately left in
+	// checkDPOSElaIllegalBlockSigners rather than hoisted here. It buys nothing on top
+	// of this order, because the membership check below already rejects an
+	// unauthorized payload in O(1) before any signature verification, and hoisting it
+	// changes which error two intermediate stages of
+	// test/unit/txvalidator_specailtx_test.go report, since that test builds the
+	// payload up one conjunct at a time and fills Signers last.
+	if err := IllegalConfirmContextCheck(confirm, d.BlockHeight, strictActive); err != nil {
+		return nil, nil, err
+	}
 	if err := ConfirmSanityCheck(confirm); err != nil {
 		return nil, nil, err
 	}
-	if err := IllegalConfirmContextCheck(confirm); err != nil {
-		return nil, nil, err
-	}
 
-	if err := ConfirmSanityCheck(compareConfirm); err != nil {
+	if err := IllegalConfirmContextCheck(compareConfirm, d.BlockHeight, strictActive); err != nil {
 		return nil, nil, err
 	}
-	if err := IllegalConfirmContextCheck(compareConfirm); err != nil {
+	if err := ConfirmSanityCheck(compareConfirm); err != nil {
 		return nil, nil, err
 	}
 

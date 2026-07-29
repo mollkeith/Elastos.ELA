@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/elastos/Elastos.ELA/auxpow"
@@ -1061,6 +1062,141 @@ func TestTxPool_CleanSubmittedTransactions(t *testing.T) {
 	if err := isTransactionCleaned(txPool, tx2); err != nil {
 		t.Error("should clean transaction: tx2", err)
 	}
+}
+
+// TestF019UnfinalizedTxRejectedAtAdmission proves the mempool now applies the
+// same finality rule block assembly and block validation already apply.
+//
+// Fail-on-pristine: pre-fix nothing called IsFinalizedTransaction on the way
+// into the pool, so a future-LockTime tx was admitted, relayed and re-relayed
+// while occupying pool capacity, and this rejection message never appeared.
+func TestF019UnfinalizedTxRejectedAtAdmission(t *testing.T) {
+	pool := NewTxPool(&config.DefaultParams,
+		checkpoint.NewManager(config.GetDefaultParams()))
+	bestHeight := blockchain.DefaultLedger.Blockchain.GetHeight()
+
+	unfinalized := functions.CreateTransaction(
+		0,
+		common2.TransferAsset,
+		0,
+		&payload.TransferAsset{},
+		[]*common2.Attribute{{Usage: common2.Nonce, Data: randomNonceData()}},
+		[]*common2.Input{{
+			Previous: common2.OutPoint{TxID: common.EmptyHash, Index: 0},
+			Sequence: 0,
+		}},
+		[]*common2.Output{},
+		bestHeight+1000,
+		[]*program.Program{},
+	)
+	assert.False(t, blockchain.IsFinalizedTransaction(unfinalized, bestHeight+1))
+
+	err := pool.AppendToTxPoolWithoutEvent(unfinalized)
+	assert.NotNil(t, err)
+	assert.Equal(t, elaerr.ErrTxValidation, err.Code())
+	assert.True(t, strings.Contains(err.Error(), "not finalized"),
+		"unfinalized tx must be rejected on finality, got: %v", err)
+}
+
+// TestF060EvictionDisplacesSquatterAndLeavesNothing exercises the fee-ordered
+// eviction end to end through the pool's own post-validation path: a paying tx
+// displaces a squatter that has the pool to itself, and the squatter leaves no
+// trace behind.
+//
+// Fail-on-pristine on the F-120 half: pre-fix the eviction removed the squatter
+// from txnList but left its crossChainHeightList and txReceivingInfo entries.
+func TestF060EvictionDisplacesSquatterAndLeavesNothing(t *testing.T) {
+	pool := NewTxPool(&config.DefaultParams,
+		checkpoint.NewManager(config.GetDefaultParams()))
+
+	squatter := newHardeningTx(1)
+	assert.NoError(t, pool.AppendTx(squatter))
+	pool.txnList[squatter.Hash()] = squatter
+	pool.crossChainHeightList[squatter.Hash()] = 1
+	pool.txReceivingInfo[squatter.Hash()] = TxReceivingInfo{Height: 1}
+	// account for the squatter as if it filled the pool on its own
+	pool.txFees.list = []txItem{{
+		Hash:    squatter.Hash(),
+		FeeRate: float64(squatter.Fee()) / float64(squatter.GetSize()),
+		Size:    uint32(pool.txFees.maxSize),
+	}}
+	pool.txFees.totalSize = pool.txFees.maxSize
+
+	rich := newHardeningTx(100000000)
+	assert.NoError(t, pool.doAddTransaction(rich))
+
+	_, squatterLeft := pool.txnList[squatter.Hash()]
+	assert.False(t, squatterLeft, "the paying tx must displace the squatter")
+	_, richAdmitted := pool.txnList[rich.Hash()]
+	assert.True(t, richAdmitted)
+	assert.Len(t, pool.crossChainHeightList, 0)
+	assert.Len(t, pool.txReceivingInfo, 0)
+}
+
+// TestF193ZeroInputTxLeavesPoolWhenItsBlockArrives proves a special tx with no
+// inputs is removed from the pool once it is mined.
+//
+// Fail-on-pristine: pre-fix cleanTransactions only reached doRemoveTransaction
+// through the input-matching loop, which never runs for a zero-input tx, so the
+// transaction stayed stranded in txnList.
+func TestF193ZeroInputTxLeavesPoolWhenItsBlockArrives(t *testing.T) {
+	pool := NewTxPool(&config.DefaultParams,
+		checkpoint.NewManager(config.GetDefaultParams()))
+
+	nodePublicKey := make([]byte, 33)
+	nodePublicKey[0] = 0x02
+	activate := functions.CreateTransaction(
+		0,
+		common2.ActivateProducer,
+		0,
+		&payload.ActivateProducer{
+			NodePublicKey: nodePublicKey,
+			Signature:     make([]byte, 64),
+		},
+		[]*common2.Attribute{{Usage: common2.Nonce, Data: randomNonceData()}},
+		[]*common2.Input{},
+		[]*common2.Output{},
+		0,
+		[]*program.Program{},
+	)
+	assert.Equal(t, 0, len(activate.Inputs()))
+
+	assert.NoError(t, pool.AppendTx(activate))
+	pool.txnList[activate.Hash()] = activate
+	pool.txReceivingInfo[activate.Hash()] = TxReceivingInfo{Height: 1}
+
+	pool.CleanSubmittedTransactions(&types.Block{
+		Header:       common2.Header{Height: 2},
+		Transactions: []interfaces.Transaction{activate},
+	})
+
+	_, stranded := pool.txnList[activate.Hash()]
+	assert.False(t, stranded,
+		"a zero-input tx that was mined must not stay in the pool")
+	assert.Len(t, pool.txReceivingInfo, 0)
+}
+
+// TestF120OnPopBackClearsAuxiliaryMaps proves an eviction leaves nothing behind.
+//
+// Fail-on-pristine: pre-fix onPopBack removed the tx from txnList and the
+// conflict slots only, so crossChainHeightList and txReceivingInfo kept one
+// entry per evicted tx forever.
+func TestF120OnPopBackClearsAuxiliaryMaps(t *testing.T) {
+	pool := NewTxPool(&config.DefaultParams,
+		checkpoint.NewManager(config.GetDefaultParams()))
+
+	tx := newHardeningTx(100)
+	hash := tx.Hash()
+	assert.NoError(t, pool.AppendTx(tx))
+	pool.txnList[hash] = tx
+	pool.crossChainHeightList[hash] = 1
+	pool.txReceivingInfo[hash] = TxReceivingInfo{Height: 1}
+
+	pool.onPopBack(hash)
+
+	assert.Len(t, pool.txnList, 0)
+	assert.Len(t, pool.crossChainHeightList, 0)
+	assert.Len(t, pool.txReceivingInfo, 0)
 }
 
 func TestTxPool_End(t *testing.T) {

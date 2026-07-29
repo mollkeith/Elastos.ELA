@@ -72,7 +72,12 @@ func newDposManager(L *lua.LState) int {
 		DPOSManager: dposManager,
 	}
 
-	priKey, _ := common.HexStringToBytes(arbitratorsPrivateKeys[index])
+	priKeyStr, err := arbitratorPrivateKey(int(index))
+	if err != nil {
+		L.RaiseError("dpos fixture arbiter keys unavailable: %v", err)
+		return 0
+	}
+	priKey, _ := common.HexStringToBytes(priKeyStr)
 	pubKey, _ := crypto.DecodePoint(pub)
 	mockManager.Account = account.New(&account2.Account{
 		PrivateKey: priKey,
