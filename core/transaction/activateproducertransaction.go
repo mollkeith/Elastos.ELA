@@ -96,7 +96,28 @@ func (t *ActivateProducerTransaction) CheckTransactionFee(references map[*common
 	return nil
 }
 
+// checkActivateValueCreation keeps ActivateProducer a no-cost transaction.
+// CheckTransactionFee requires fee==0, but the CR-member path returns end=true
+// which makes ContextCheck skip CheckTransactionFee, the only outputs<=inputs
+// guard. Combined with CheckTransactionOutput allowing outputs above NFTStartHeight,
+// a CR member could mint value outputs from 0 inputs. Above StrictMoneyRangeHeight we
+// re-apply the fee==0 invariant here so no ActivateProducer path can create (or
+// destroy) value. Below the gate: legacy behavior preserved for replay-safety.
+func (t *ActivateProducerTransaction) checkActivateValueCreation() elaerr.ELAError {
+	if t.parameters.BlockHeight < t.parameters.Config.StrictMoneyRangeHeight {
+		return nil
+	}
+	if fee := getTransactionFee(t, t.references); fee != 0 {
+		return elaerr.Simple(elaerr.ErrTxBalance, errors.New(
+			"ActivateProducer must not create or destroy value at or above StrictMoneyRangeHeight"))
+	}
+	return nil
+}
+
 func (t *ActivateProducerTransaction) SpecialContextCheck() (elaerr.ELAError, bool) {
+	if e := t.checkActivateValueCreation(); e != nil {
+		return e, true
+	}
 
 	activateProducer, ok := t.Payload().(*payload.ActivateProducer)
 	if !ok {
@@ -120,7 +141,21 @@ func (t *ActivateProducerTransaction) SpecialContextCheck() (elaerr.ELAError, bo
 			if t.parameters.BlockChain.GetCRCommittee().GetAvailableDepositAmount(crMember.Info.CID) < 0 {
 				return elaerr.Simple(elaerr.ErrTxPayload, errors.New("balance of CR is not enough ")), true
 			}
-			return nil, true
+			// The CR-member activation path returns end=true, which skips
+			// CheckTransactionFee and checkTransactionSignature. Above NFTStartHeight a
+			// CR activate may carry Inputs(), so end=true lets it spend arbitrary UTXOs with
+			// no input-ownership proof: theft, since the fee==0 invariant in
+			// checkActivateValueCreation only prevents net inflation, not equal-value theft.
+			// At/above the coordinated-upgrade gate, fall through so the fee and
+			// input-signature checks run. Below the gate keep end=true for replay-safety (the
+			// producer branch already gates end on NFTStartHeight, but re-gating the CR branch
+			// there would change acceptance for the historical 1405000..2260451 window, so
+			// this gates at StrictMoneyRangeHeight).
+			end := true
+			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+				end = false
+			}
+			return nil, end
 		}
 	}
 

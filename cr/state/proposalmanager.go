@@ -398,7 +398,10 @@ func (p *ProposalManager) dealProposal(proposalState *ProposalState, unusedAmoun
 	case payload.ChangeProposalOwner:
 		proposal := p.getProposal(proposalState.Proposal.TargetProposalHash)
 		originRecipient := proposal.Recipient
-		oriProposalOwner := proposalState.ProposalOwner
+		// Capture the target proposal.ProposalOwner, the object mutated below,
+		// mirroring originRecipient. Capturing proposalState.ProposalOwner instead
+		// takes the change proposal's owner, so a reorg revert restores the wrong owner.
+		oriProposalOwner := proposal.ProposalOwner
 		emptyUint168 := common.Uint168{}
 		p.history.Append(height, func() {
 			proposal.ProposalOwner = proposalState.Proposal.NewOwnerPublicKey

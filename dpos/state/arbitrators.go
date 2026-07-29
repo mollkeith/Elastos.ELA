@@ -7,12 +7,14 @@ package state
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,9 +81,21 @@ type Arbiters struct {
 	getBlockByHeight func(uint32) (*types.Block, error)
 	CkpManager       *checkpoint.Manager
 
-	mtx       sync.Mutex
-	started   bool
-	DutyIndex int
+	mtx sync.Mutex
+	// specialTxMtx serializes the whole emergency special-tx bracket
+	// (markPendingSpecialTx -> mutate ForceChange -> Commit/UndoPendingSpecialTx)
+	// against every other such bracket, so the block-connect goroutine (under
+	// blockchain b.mutex) and the DPoS-gossip goroutines (which take only a.mtx)
+	// can never interleave a mark/commit/undo. It is acquired outside a.mtx by the
+	// bracket boundaries (connectBlock, the InitCheckpoint replay, the gossip
+	// callers and the standalone reorg-detach rollback), and not inside RollbackTo
+	// or RollbackSeekTo: connectBlock's confirm-failure path calls RollbackTo while
+	// already holding specialTxMtx, so re-acquiring there would self-deadlock.
+	// Lock order is [b.mutex ->] specialTxMtx -> a.mtx (a.mtx and b.IndexLock are
+	// the only locks taken while holding it), so there is no inversion.
+	specialTxMtx sync.Mutex
+	started      bool
+	DutyIndex    int
 
 	CurrentReward RewardData
 	NextReward    RewardData
@@ -114,7 +128,28 @@ type Arbiters struct {
 
 	forceChanged bool
 
+	// pendingSpecialTx holds the state captured immediately before the emergency
+	// ForceChange of a block's special transactions was applied. It is non-nil only
+	// between PreProcessSpecialTx and the moment the carrying block is known to have
+	// connected (CommitPendingSpecialTx) or to have failed (UndoPendingSpecialTx).
+	pendingSpecialTx *specialTxSavepoint
+
 	History *utils.History
+}
+
+// specialTxSavepoint captures every piece of Arbiters state that the emergency
+// ForceChange driven by PreProcessSpecialTx mutates, so the whole effect can be
+// reversed when the block that carried the special transaction never connects.
+// The History part covers the arbiter rotation and the forceChanged flag; the rest
+// covers the bookkeeping that lives OUTSIDE History and therefore survives every
+// RollbackTo: degradation.inactiveTxs, illegalBlocksPayloadHashes, and the
+// height-keyed snapshot ring appended by SnapshotByHeight.
+type specialTxSavepoint struct {
+	history        utils.Savepoint
+	degradation    specialTxDegradationState
+	illegalHashes  map[common.Uint256]interface{}
+	snapshotKeys   []uint32
+	snapshotFrames map[uint32]int
 }
 
 func (a *Arbiters) Start() {
@@ -188,6 +223,32 @@ func (a *Arbiters) recoverFromCheckPoints(point *CheckPoint) {
 	a.History = utils.NewHistory(maxHistoryCapacity)
 	a.State.History = utils.NewHistory(maxHistoryCapacity)
 
+	// Reset the height-keyed arbiter snapshot ring alongside History.
+	// recoverFromCheckPoints replaces the whole derived state from a checkpoint, but
+	// the live Arbiters keeps its own Snapshots/SnapshotKeysDesc, so after a deep reset
+	// (reorganizeChain's forkCount >= 720 branch, or an OnRollbackTo below StartHeight)
+	// the ring still carries frames written by the abandoned branch, at exactly the
+	// heights the canonical replay will write again. SnapshotByHeight appends to an
+	// existing key rather than replacing it, and GetSnapshot returns the whole frame
+	// slice, so the two arbiter universes are unioned: ProposalContextCheckByHeight and
+	// VoteContextCheckByHeight (blockchain/confirmvalidator.go), and the
+	// illegal-proposal and illegal-vote transaction validators, then accept a signer
+	// present in any frame at that height, and can mix signers across frames within one
+	// confirm. GetSnapshot is the authoritative voter universe for illegal-confirm
+	// evidence at and above gate 1, which increases rather than decreases reliance on
+	// this ring.
+	//
+	// Both fields are pure in-RAM caches: CheckPoint has no Snapshots field, so
+	// initFromArbitrators can neither transfer nor clear them, and SnapshotByHeight
+	// rebuilds them as the replay proceeds. Nothing is lost.
+	//
+	// Gate: none, same doctrine as the snapshot prune in RollbackTo. The ring is only
+	// ever polluted on the reorg / deep-reset path, and linear replay of retained
+	// history never calls recoverFromCheckPoints with a populated ring (at startup the
+	// map is empty, so the Restore -> OnInit path is a no-op here).
+	a.Snapshots = make(map[uint32][]*CheckPoint)
+	a.SnapshotKeysDesc = make([]uint32, 0)
+
 	a.DutyIndex = point.DutyIndex
 	a.LastArbitrators = point.LastArbitrators
 	a.CurrentArbitrators = point.CurrentArbitrators
@@ -209,6 +270,115 @@ func (a *Arbiters) recoverFromCheckPoints(point *CheckPoint) {
 	a.nextCRCArbitersMap = point.NextCRCArbitersMap
 	a.nextCRCArbiters = point.NextCRCArbiters
 	a.forceChanged = point.ForceChanged
+	// Restore degradation state so a cold restart does not re-run
+	// PreProcessSpecialTx and re-trigger a spurious ForceChange.
+	a.degradation.state = degradationState(point.DegradationState)
+	a.degradation.understaffedSince = point.UnderstaffedSince
+	a.degradation.inactivateHeight = point.InactivateHeight
+	// Copy, never alias the transient CheckPoint map, for consistency with the
+	// newCheckPoint/initFromArbitrators capture discipline; copyInactiveTxs returns
+	// an empty map for a nil (legacy-checkpoint) source.
+	a.degradation.inactiveTxs = copyInactiveTxs(point.InactiveTxs)
+	// A restored checkpoint is a fresh, committed baseline; nothing is pending.
+	a.pendingSpecialTx = nil
+}
+
+// CommitPendingSpecialTx makes the emergency ForceChange applied by
+// ProcessSpecialTxPayload permanent. The block-connect boundary calls it once the
+// block is stored, and the gossip entry points call it immediately: they are not
+// tied to a block, so their effect is permanent.
+func (a *Arbiters) CommitPendingSpecialTx() {
+	a.mtx.Lock()
+	a.pendingSpecialTx = nil
+	a.mtx.Unlock()
+}
+
+// LockSpecialTx / UnlockSpecialTx are held by the bracket boundaries around
+// the whole mark -> mutate -> commit/undo sequence so no two special-tx brackets
+// (block-connect vs DPoS-gossip vs standalone reorg rollback) can interleave.
+// They wrap the a.mtx-guarded savepoint methods, acquired outside a.mtx; they are
+// not taken inside RollbackTo or RollbackSeekTo, whose undoPendingSpecialTx
+// runs either under connectBlock's already-held specialTxMtx or under the reorg
+// caller's, so re-acquiring would self-deadlock.
+func (a *Arbiters) LockSpecialTx()   { a.specialTxMtx.Lock() }
+func (a *Arbiters) UnlockSpecialTx() { a.specialTxMtx.Unlock() }
+
+// UndoPendingSpecialTx reverses the emergency ForceChange applied by
+// ProcessSpecialTxPayload for a block that failed to connect. It is a no-op for the
+// overwhelming majority of blocks, which carry no special transaction at all, and a
+// no-op for every block that connected (its effect was committed).
+func (a *Arbiters) UndoPendingSpecialTx() {
+	a.mtx.Lock()
+	a.undoPendingSpecialTx()
+	a.mtx.Unlock()
+}
+
+// markPendingSpecialTx captures the pre-special-tx state once per block. Multiple
+// InactiveArbitrators payloads in the same block share one savepoint, so all of
+// their ForceChanges are reversed together.
+func (a *Arbiters) markPendingSpecialTx() {
+	a.mtx.Lock()
+	if a.pendingSpecialTx == nil {
+		a.pendingSpecialTx = a.captureSpecialTxSavepoint()
+	}
+	a.mtx.Unlock()
+}
+
+// undoPendingSpecialTx restores the captured pre-special-tx state. Caller holds mtx.
+func (a *Arbiters) undoPendingSpecialTx() {
+	if a.pendingSpecialTx == nil {
+		return
+	}
+	sp := a.pendingSpecialTx
+	a.pendingSpecialTx = nil
+	a.restoreSpecialTxSavepoint(sp)
+}
+
+// captureSpecialTxSavepoint snapshots the mutable state reachable from
+// ProcessSpecialTxPayload. Caller holds mtx. Read-only: the accepted path is
+// byte-identical to the pristine one.
+func (a *Arbiters) captureSpecialTxSavepoint() *specialTxSavepoint {
+	sp := &specialTxSavepoint{
+		history:        a.History.Savepoint(),
+		degradation:    a.degradation.captureForSpecialTx(),
+		illegalHashes:  copyInactiveTxs(a.illegalBlocksPayloadHashes),
+		snapshotKeys:   append([]uint32(nil), a.SnapshotKeysDesc...),
+		snapshotFrames: make(map[uint32]int, len(a.Snapshots)),
+	}
+	for k, v := range a.Snapshots {
+		sp.snapshotFrames[k] = len(v)
+	}
+	return sp
+}
+
+// restoreSpecialTxSavepoint puts back the state captured by
+// captureSpecialTxSavepoint. Caller holds mtx.
+func (a *Arbiters) restoreSpecialTxSavepoint(sp *specialTxSavepoint) {
+	a.History.UndoTo(sp.history)
+	a.degradation.restoreForSpecialTx(sp.degradation)
+	a.illegalBlocksPayloadHashes = copyInactiveTxs(sp.illegalHashes)
+
+	// SnapshotByHeight appends a frame for the force-change height; drop the frames
+	// and keys added after the savepoint. A key the ring evicted meanwhile cannot be
+	// resurrected, so rebuild the key list from what the map still holds: the undo
+	// must not break the SnapshotKeysDesc/Snapshots invariant.
+	for k, frames := range a.Snapshots {
+		n, ok := sp.snapshotFrames[k]
+		if !ok {
+			delete(a.Snapshots, k)
+			continue
+		}
+		if len(frames) > n {
+			a.Snapshots[k] = frames[:n]
+		}
+	}
+	keys := make([]uint32, 0, len(sp.snapshotKeys))
+	for _, k := range sp.snapshotKeys {
+		if _, ok := a.Snapshots[k]; ok {
+			keys = append(keys, k)
+		}
+	}
+	a.SnapshotKeysDesc = keys
 }
 
 func (a *Arbiters) ProcessBlock(block *types.Block, confirm *payload.Confirm) {
@@ -358,6 +528,13 @@ func (a *Arbiters) CheckCustomIDResultsTx(block *types.Block) error {
 
 func (a *Arbiters) ProcessSpecialTxPayload(p interfaces.Payload,
 	height uint32) error {
+	// The emergency ForceChange below is applied by PreProcessSpecialTx before block H
+	// is validated and stored, and it commits at height H-1, so a later failure inside
+	// connectBlock would leave the node rotated onto an arbiter set the network
+	// rejected, with the payload hash marked processed so the same tx can never
+	// force-change again. Capture the pre-state; the block-connect boundary then either
+	// commits it (block connected) or undoes it (block rejected).
+	a.markPendingSpecialTx()
 	switch obj := p.(type) {
 	case *payload.DPOSIllegalBlocks:
 		a.mtx.Lock()
@@ -378,6 +555,16 @@ func (a *Arbiters) ProcessSpecialTxPayload(p interfaces.Payload,
 
 func (a *Arbiters) RollbackSeekTo(height uint32) {
 	a.mtx.Lock()
+	// History.commits is incremented by Commit and decremented only by UndoTo, while
+	// History.RollbackSeekTo pops change groups without decrementing commits. An
+	// outstanding special-tx savepoint (captured at commits=C) that survived a seek
+	// would then let a later UndoTo's `h.commits > sp.commits` loop over-pop groups
+	// that predate the savepoint, double-rolling-back committed state below it. Reverse
+	// and clear any pending emergency change first, exactly as RollbackTo does, so no
+	// savepoint can outlive a seek. No-op on the accepted path
+	// (pendingSpecialTx == nil). Gate: none, this is a reorg/seek-only path, mirroring
+	// the ungated undoPendingSpecialTx in RollbackTo.
+	a.undoPendingSpecialTx()
 	a.History.RollbackSeekTo(height)
 	a.State.RollbackSeekTo(height)
 	a.mtx.Unlock()
@@ -385,9 +572,26 @@ func (a *Arbiters) RollbackSeekTo(height uint32) {
 
 func (a *Arbiters) RollbackTo(height uint32) error {
 	a.mtx.Lock()
+	// A rollback must never leave behind a special-tx effect whose carrying block has
+	// not connected. History.RollbackTo is strictly-greater-than, so the ForceChange
+	// committed at block.Height-1 is invisible to it.
+	a.undoPendingSpecialTx()
 	a.History.RollbackTo(height)
 	a.degradation.RollbackTo(height)
 	err := a.State.RollbackTo(height)
+	// Prune height-keyed arbiter snapshots above the rollback target. SnapshotByHeight
+	// appends rather than replaces on an existing key, so a reorg that left stale snapshots
+	// above height would corrupt later snapshot lookups. Reorg-only path (linear sync never
+	// calls RollbackTo), so committed state replays byte-identically.
+	newDesc := a.SnapshotKeysDesc[:0]
+	for _, k := range a.SnapshotKeysDesc {
+		if k > height {
+			delete(a.Snapshots, k)
+		} else {
+			newDesc = append(newDesc, k)
+		}
+	}
+	a.SnapshotKeysDesc = newDesc
 	a.mtx.Unlock()
 
 	return err
@@ -769,9 +973,7 @@ func (a *Arbiters) getDPoSV2RewardsV2(dposReward common.Fixed64, sponsor []byte,
 			}
 			var totalN float64
 			for _, votes := range sVoteDetail {
-				weightF := math.Log10(float64(votes.Info[0].LockTime-votes.BlockHeight) / 7200 * 10)
-				N := common.Fixed64(float64(votes.Info[0].Votes) * weightF)
-				totalN += float64(N)
+				totalN += float64(votes.VoteRights())
 			}
 			if totalN == 0 {
 				continue
@@ -800,6 +1002,16 @@ func (a *Arbiters) getDPoSV2RewardsV2(dposReward common.Fixed64, sponsor []byte,
 
 	return rewards
 }
+
+// CheckRecordSponsorBinding is deleted here, not merely unwired. It made block validity a
+// function of lastBlock.Confirm.Proposal.Sponsor, a per-node stored value no block hash or
+// signature commits to, which the miner reads raw while that function resolved it through
+// BlockConfirmProposalSponsors, and which honest nodes legitimately disagree about after a
+// DPoS view change. See blockchain/blockvalidator.go CheckBlockContext for the full
+// rationale and for the diagnostic that replaced it. It is deleted rather than left in
+// place because a guard with no production caller reads as armed while enforcing nothing;
+// if a sponsor-binding rule is ever wanted again it must be derived from data the chain
+// commits to, never from the stored confirm.
 
 func (a *Arbiters) accumulateReward(block *types.Block, confirm *payload.Confirm) {
 	if block.Height < a.ChainParams.PublicDPOSHeight {
@@ -997,7 +1209,48 @@ func (a *Arbiters) distributeWithNormalArbitratorsV3(height uint32, reward commo
 		return roundReward, reward, nil
 	}
 	log.Debugf("totalTopProducersReward totalTopProducersReward %f", totalTopProducersReward)
-	rewardPerVote := totalTopProducersReward / float64(totalVotesInRound)
+	// Guard div-by-zero. totalVotesInRound is the snapshot sum of producer.Votes() over the
+	// non-CRC arbiters and candidates (snapshotVotesStates), and NOTHING above forces it
+	// non-zero: the early return rejects only an empty or an all-CRC arbiter set, so a round
+	// whose elected producers all hold zero votes reaches this line. Pristine then divides by
+	// zero and every per-producer reward becomes Fixed64 of a NaN or a +Inf.
+	//
+	// That is not merely a wrong number, it is a consensus split. Go leaves an out-of-range
+	// float-to-int conversion implementation-dependent, and it genuinely differs. Same
+	// source, same inputs, reward 100 ELA and totalVotesInRound 0:
+	//   amd64: floor(0*rpv)=NaN -> -9223372036854775808, floor(v*rpv)=+Inf -> -9223372036854775808
+	//   arm64: floor(0*rpv)=NaN ->                    0, floor(v*rpv)=+Inf ->  9223372036854775807
+	// CheckCoinbaseArbitratorsReward compares these to the coinbase exactly, so an amd64 node
+	// and an arm64 node disagree on the same block. The change<0 backstop in
+	// distributeDPOSReward does not catch the amd64 case: realDPOSReward goes hugely negative,
+	// so change = reward - realDPOSReward goes positive and passes.
+	//
+	// Not height-gated. No new gate is permitted and neither existing gate would work:
+	//  1. distributeDPOSReward is reachable only at heights <= DPoSV2ActiveHeight.
+	//     clearingDPOSReward is called from forceChange only when !isDPoSV2Run, and from the
+	//     normalChange leg only when !isDPoSV2Run or height == DPoSV2ActiveHeight.
+	//     DPoSV2ActiveHeight is a monotone latch, set once and never cleared except by the
+	//     reorg-undo of the entry that set it, and on mainnet it sits far below the retained
+	//     tip. Both permitted gates (StrictMoneyRangeHeight 2260451, RevisedDPoSRewardHeight
+	//     2265000) are ABOVE it, so gating here makes the guard unreachable on mainnet and
+	//     buys nothing at all.
+	//  2. On retained history the guard is inert unless totalVotesInRound was 0 on some block
+	//     at or below 2260450. If it ever was, that block has no single verdict to preserve
+	//     (see the platform difference above), so no gate could restore byte-identity either.
+	//     On every block where the divisor was non-zero this guard changes nothing.
+	// No votes -> no per-vote reward.
+	var rewardPerVote float64
+	// Ungated, and inert on retained history by measurement rather than by argument. Every
+	// coinbase output at or below the rollback target 2,260,450 was inspected on the frozen
+	// copy: 2,260,452 coinbase transactions, 7,630,730 outputs, minimum value 20, maximum
+	// 3,300,000,000,000,000, and no output that is negative, MinInt64, or above MaxELAMoney.
+	// Had this division ever run with a zero divisor the per-producer rewards would have
+	// been Fixed64(+Inf), which on amd64 converts to MinInt64 and lands in the coinbase. No
+	// such output exists, so the divisor was never zero on retained history and the guard
+	// cannot change any retained verdict.
+	if totalVotesInRound > 0 {
+		rewardPerVote = totalTopProducersReward / float64(totalVotesInRound)
+	}
 	realDPOSReward := common.Fixed64(0)
 	for _, arbiter := range a.CurrentArbitrators {
 		ownerHash := arbiter.GetOwnerProgramHash()
@@ -1063,6 +1316,16 @@ func (a *Arbiters) distributeWithNormalArbitratorsV3(height uint32, reward commo
 	// Abnormal CR`s reward need to be destroyed.
 	for i := len(a.CurrentArbitrators); i < arbitersCount; i++ {
 		roundReward[*a.ChainParams.DestroyELAProgramHash] += individualBlockConfirmReward
+		// Also account the destroyed empty-slot reward in realDPOSReward. Otherwise the
+		// caller's `change = reward - realDPOSReward` over-states change by the destroyed
+		// total and re-mints it to the CR and miner legs: the empty-slot reward is emitted
+		// twice, once burned and once spendable. Gated at RevisedDPoSRewardHeight, gate 2,
+		// the fresh future height reward-rule changes take, not the incident gate; below it
+		// the legacy double-count is preserved byte-identically for replay. The empty-slot
+		// reward is deterministic across nodes, so no split.
+		if height >= a.ChainParams.RevisedDPoSRewardHeight {
+			realDPOSReward += individualBlockConfirmReward
+		}
 	}
 	return roundReward, realDPOSReward, nil
 }
@@ -1088,7 +1351,13 @@ func (a *Arbiters) distributeWithNormalArbitratorsV2(height uint32, reward commo
 		roundReward[*a.ChainParams.DestroyELAProgramHash] = reward
 		return roundReward, reward, nil
 	}
-	rewardPerVote := totalTopProducersReward / float64(totalVotesInRound)
+	// Guard div-by-zero, same defect and same reasoning as distributeWithNormalArbitratorsV3
+	// above: the early return rejects only an empty or an all-CRC arbiter set, never a zero
+	// divisor. Ungated for the reason recorded there. No votes -> no per-vote reward.
+	var rewardPerVote float64
+	if totalVotesInRound > 0 {
+		rewardPerVote = totalTopProducersReward / float64(totalVotesInRound)
+	}
 
 	realDPOSReward := common.Fixed64(0)
 	for _, arbiter := range a.CurrentArbitrators {
@@ -1130,6 +1399,16 @@ func (a *Arbiters) distributeWithNormalArbitratorsV2(height uint32, reward commo
 	// Abnormal CR`s reward need to be destroyed.
 	for i := len(a.CurrentArbitrators); i < arbitersCount; i++ {
 		roundReward[*a.ChainParams.DestroyELAProgramHash] += individualBlockConfirmReward
+		// Also account the destroyed empty-slot reward in realDPOSReward. Otherwise the
+		// caller's `change = reward - realDPOSReward` over-states change by the destroyed
+		// total and re-mints it to the CR and miner legs: the empty-slot reward is emitted
+		// twice, once burned and once spendable. Gated at RevisedDPoSRewardHeight, gate 2,
+		// the fresh future height reward-rule changes take, not the incident gate; below it
+		// the legacy double-count is preserved byte-identically for replay. The empty-slot
+		// reward is deterministic across nodes, so no split.
+		if height >= a.ChainParams.RevisedDPoSRewardHeight {
+			realDPOSReward += individualBlockConfirmReward
+		}
 	}
 	return roundReward, realDPOSReward, nil
 }
@@ -1150,7 +1429,13 @@ func (a *Arbiters) distributeWithNormalArbitratorsV1(height uint32, reward commo
 		roundReward[*a.ChainParams.CRConfiguration.CRCProgramHash] = reward
 		return roundReward, reward, nil
 	}
-	rewardPerVote := totalTopProducersReward / float64(totalVotesInRound)
+	// Guard div-by-zero, same defect and same reasoning as distributeWithNormalArbitratorsV3
+	// above: the early return rejects only an empty or an all-CRC arbiter set, never a zero
+	// divisor. Ungated for the reason recorded there. No votes -> no per-vote reward.
+	var rewardPerVote float64
+	if totalVotesInRound > 0 {
+		rewardPerVote = totalTopProducersReward / float64(totalVotesInRound)
+	}
 	realDPOSReward := common.Fixed64(0)
 	for _, arbiter := range a.CurrentArbitrators {
 		ownerHash := arbiter.GetOwnerProgramHash()
@@ -1717,8 +2002,19 @@ func (a *Arbiters) GetOnDutyCrossChainArbitrator() []byte {
 		sort.Slice(crcArbiters, func(i, j int) bool {
 			return bytes.Compare(crcArbiters[i].NodePublicKey, crcArbiters[j].NodePublicKey) < 0
 		})
-		ondutyIndex := int(height-a.ChainParams.CRCOnlyDPOSHeight+1) % len(crcArbiters)
-		arbiter = crcArbiters[ondutyIndex].NodePublicKey
+		// Same defect class as the branch below: modulo by zero panics when the CRC
+		// arbiter set is empty. This branch is live for heights in
+		// [CRCOnlyDPOSHeight-1, CRClaimDPOSNodeStartHeight), which on mainnet is retained
+		// history rather than the current tip, so it runs on every full resync.
+		//
+		// Ungated: it turns a panic into a defined nil return, and a panicking node accepts
+		// nothing, so no retained block's verdict can depend on it.
+		if len(crcArbiters) == 0 {
+			arbiter = nil
+		} else {
+			ondutyIndex := int(height-a.ChainParams.CRCOnlyDPOSHeight+1) % len(crcArbiters)
+			arbiter = crcArbiters[ondutyIndex].NodePublicKey
+		}
 		a.mtx.Unlock()
 	} else if height < a.ChainParams.DPoSConfiguration.DPOSNodeCrossChainHeight {
 		a.mtx.Lock()
@@ -1727,8 +2023,23 @@ func (a *Arbiters) GetOnDutyCrossChainArbitrator() []byte {
 			return bytes.Compare(crcArbiters[i].NodePublicKey,
 				crcArbiters[j].NodePublicKey) < 0
 		})
-		index := a.DutyIndex % len(a.CurrentCRCArbitersMap)
-		if crcArbiters[index].IsNormal {
+		// Modulo by zero panics. CurrentCRCArbitersMap is never allocated by
+		// initArbitrators, and this is the live mainnet branch: mainnet sets
+		// DPOSNodeCrossChainHeight = math.MaxUint32, so the enclosing
+		// `height < DPOSNodeCrossChainHeight` holds at every real height. It is reachable
+		// from a relayed SideChainPow transaction, that is, from any peer. The sibling
+		// below guards the same way (`len(a.CurrentArbitrators) != 0 && ...`). crcArbiters
+		// is bounds-checked separately because it is a different collection from the map
+		// supplying the modulus.
+		//
+		// Ungated: this turns a panic into a defined nil return. A panicking node accepts
+		// nothing, so no retained block can depend on the panic and no verdict changes.
+		index := 0
+		if len(a.CurrentCRCArbitersMap) != 0 {
+			index = a.DutyIndex % len(a.CurrentCRCArbitersMap)
+		}
+		if len(a.CurrentCRCArbitersMap) != 0 && index < len(crcArbiters) &&
+			crcArbiters[index].IsNormal {
 			arbiter = crcArbiters[index].NodePublicKey
 		} else {
 			arbiter = nil
@@ -1938,7 +2249,9 @@ func (a *Arbiters) IsSameWithNextArbitrators() bool {
 		return false
 	}
 	for index, v := range a.CurrentArbitrators {
-		if bytes.Equal(v.GetNodePublicKey(), a.nextArbitrators[index].GetNodePublicKey()) {
+		// A difference in any position means the sets are not the same. The sense of
+		// this comparison is easy to invert by accident: equal keys mean same.
+		if !bytes.Equal(v.GetNodePublicKey(), a.nextArbitrators[index].GetNodePublicKey()) {
 			return false
 		}
 	}
@@ -2262,14 +2575,21 @@ func (a *Arbiters) getCandidateIndexAtRandom(height uint32, unclaimedCount, vote
 	if !ok {
 		return 0, errors.New("invalid block hash")
 	}
-	rand.Seed(seed)
+	// Draw from a private, block-seeded Source instead of the process-global
+	// math/rand generator. rand.Seed() plus rand.Intn() shares one stream with
+	// every other global-rand consumer in the process (p2p, elanet), so a
+	// concurrent draw between the Seed and the Intn shifts the selected
+	// candidate. This is the same local-Source pattern used by
+	// getRandomDposV2Producers above, and for an undisturbed stream it yields
+	// the identical index (see TestF202SeededDrawEquivalence).
+	r := rand.New(rand.NewSource(seed))
 	normalCount := a.ChainParams.DPoSConfiguration.NormalArbitratorsCount - 1
 	count := votedProducersCount - unclaimedCount - normalCount
 	if count < 1 {
 		return 0, errors.New("producers is not enough")
 	}
 	candidatesCount := minInt(count, a.ChainParams.DPoSConfiguration.CandidatesCount+1)
-	return rand.Intn(candidatesCount), nil
+	return r.Intn(candidatesCount), nil
 }
 
 func (a *Arbiters) isDposV2Active() bool {
@@ -2298,11 +2618,13 @@ func (a *Arbiters) UpdateNextArbitrators(versionHeight, height uint32) error {
 	}
 
 	if a.DPoSV2ActiveHeight == math.MaxUint32 && a.isDposV2Active() {
-		oriHeight := height
 		a.History.Append(height, func() {
 			a.DPoSV2ActiveHeight = height + a.ChainParams.CRConfiguration.MemberCount + uint32(a.ChainParams.DPoSConfiguration.NormalArbitratorsCount)
 		}, func() {
-			a.DPoSV2ActiveHeight = oriHeight
+			// The guard above proved the prior value was MaxUint32; restore that on rollback,
+			// not `height`, so a reorg across activation does not pin DPoSV2ActiveHeight to a
+			// wrong (activated) height. Reorg revert-symmetry.
+			a.DPoSV2ActiveHeight = math.MaxUint32
 		})
 	}
 
@@ -2884,11 +3206,65 @@ func (a *Arbiters) dumpInfo(height uint32) {
 	printer(crInfo+nrInfo+ccInfo+ncInfo, append(append(append(crParams, nrParams...), ccParams...), ncParams...)...)
 }
 
-func (a *Arbiters) getBlockDPOSReward(block *types.Block) common.Fixed64 {
-	totalTxFx := common.Fixed64(0)
-	for _, tx := range block.Transactions {
-		totalTxFx += tx.Fee()
+// SumBlockTxFees is THE definition of a block's transaction-fee total for the DPoS
+// arbiter reward leg. It has exactly two consumers and they must never disagree:
+// blockchain.GetBlockDPOSReward (the validator's pre-RevisedDPoSRewardHeight coinbase
+// check) and Arbiters.getBlockDPOSReward (the reward STATE, whose output becomes
+// claimable ELA). It lives here because dpos/state cannot import blockchain.
+//
+// The validator takes the ELA-only fee basis at RevisedDPoSRewardHeight
+// (blockchain.GetBlockDPOSRewardStrict, fed by checkTxsContext's
+// GetTxFeeStrict(ELAAssetID) total), so the state must not sum the asset-blind tx.Fee().
+// The state is the side that mints: accumulateReward feeds a.accumulativeReward, and
+// clearingDPOSReward -> distributeDPOSReward feeds a.arbitersRoundReward. A validator
+// that rejects a bad coinbase while the state keeps crediting arbiters on the wider basis
+// leaves the two consumers disagreeing.
+//
+// This depends on tx.Fee() itself being the authoritative ELA-only value at and above
+// StrictMoneyRangeHeight, so "sum tx.Fee()" and "sum GetTxFeeStrict(ELAAssetID)" are the
+// same number by construction. The remaining shape here is identical to checkTxsContext's:
+// start at index 1 (the coinbase contributes nothing to a fee total;
+// blockchain.CalculateTxsFee skips it too), and refuse to let a non-positive fee move the
+// total. Overflow is rejected rather than wrapped.
+//
+// Gate: RevisedDPoSRewardHeight -- gate 2, the fresh future activation the core engineers
+// asked reward-rule changes to take, and the exact height at which the validator already
+// switches bases. Below it the legacy expression is returned verbatim (every transaction,
+// wrapping addition), so retained history and the window before activation are
+// byte-identical. No new gate and no new config literal.
+func SumBlockTxFees(txs []interfaces.Transaction, height, revisedGate uint32) common.Fixed64 {
+	if height < revisedGate {
+		// Legacy, verbatim: bug-compatible with every block validated to date.
+		totalTxFx := common.Fixed64(0)
+		for _, tx := range txs {
+			totalTxFx += tx.Fee()
+		}
+
+		return totalTxFx
 	}
+
+	totalTxFx := common.Fixed64(0)
+	for i := 1; i < len(txs); i++ {
+		fee := txs[i].Fee()
+		if fee <= 0 {
+			// Unreachable while GetTxFeeMapStrict rejects a negative per-asset
+			// fee; defence in depth, and it keeps this total identical to
+			// checkTxsContext's under every input.
+			continue
+		}
+		sum, err := common.AddFixed64(totalTxFx, fee)
+		if err != nil || !common.MoneyRange(sum) {
+			return totalTxFx
+		}
+		totalTxFx = sum
+	}
+
+	return totalTxFx
+}
+
+func (a *Arbiters) getBlockDPOSReward(block *types.Block) common.Fixed64 {
+	totalTxFx := SumBlockTxFees(block.Transactions, block.Height,
+		a.ChainParams.RevisedDPoSRewardHeight)
 
 	return common.Fixed64(math.Ceil(float64(totalTxFx+
 		a.ChainParams.GetBlockReward(block.Height)) * 0.35))
@@ -2913,6 +3289,10 @@ func (a *Arbiters) newCheckPoint(height uint32) *CheckPoint {
 		FinalRoundChange:            a.finalRoundChange,
 		ClearingHeight:              a.clearingHeight,
 		ForceChanged:                a.forceChanged,
+		DegradationState:            byte(a.degradation.state),
+		UnderstaffedSince:           a.degradation.understaffedSince,
+		InactivateHeight:            a.degradation.inactivateHeight,
+		InactiveTxs:                 make(map[common.Uint256]interface{}),
 		ArbitersRoundReward:         make(map[common.Uint168]common.Fixed64),
 		IllegalBlocksPayloadHashes:  make(map[common.Uint256]interface{}),
 		LastArbitrators:             a.LastArbitrators,
@@ -2936,6 +3316,10 @@ func (a *Arbiters) newCheckPoint(height uint32) *CheckPoint {
 	}
 	for k := range a.illegalBlocksPayloadHashes {
 		point.IllegalBlocksPayloadHashes[k] = nil
+	}
+	// Capture the processed-inactive-tx set into the checkpoint.
+	for k := range a.degradation.inactiveTxs {
+		point.InactiveTxs[k] = nil
 	}
 
 	return point
@@ -2984,6 +3368,11 @@ func (a *Arbiters) GetSnapshot(height uint32) []*CheckPoint {
 
 func (a *Arbiters) getSnapshot(height uint32) []*CheckPoint {
 	result := make([]*CheckPoint, 0)
+	// An empty snapshot ring has no valid snapshot answer; return the empty result
+	// instead of indexing SnapshotKeysDesc[-1].
+	if len(a.SnapshotKeysDesc) == 0 {
+		return result
+	}
 	if height >= a.SnapshotKeysDesc[len(a.SnapshotKeysDesc)-1] {
 		// if height is in range of SnapshotKeysDesc, get the key with the same
 		// election as height
@@ -3038,7 +3427,100 @@ func getArbitersInfoWithoutOnduty(title string,
 	return info, params
 }
 
+// initArbitrators is the only constructor the two checkpoint rebuild sites
+// (CheckPoint.OnReset and the deep CheckPoint.OnRollbackTo branch, both through
+// newBaselineArbiters) run over a hand-built &Arbiters{}. NewArbitrators, by
+// contrast, establishes a whole baseline in its composite literal and only then
+// calls in here, so any field that literal fills and initArbitrators does not is
+// left nil on a rebuild, and recoverFromCheckPoints plants a subset of them straight
+// onto the live Arbiters. That is the defect class the guarded block below closes:
+// a rebuild must equal a genesis-fresh NewArbitrators field for field, not merely
+// avoid whichever dereference happened to crash first.
+//
+// Every assignment is guarded on nil because the NewArbitrators literal runs first
+// and always leaves these non-nil. The guards are therefore provably never taken on
+// the NewArbitrators path, whose behaviour is bit-for-bit unchanged, and an already
+// populated field is never wiped. (CRCommittee, CkpManager and
+// BlockConfirmProposalSponsors are the literal's only fields that are genesis-time
+// inputs rather than functions of chainParams; newBaselineArbiters supplies those.)
+//
+// Fields left at their zero value are the ones a genesis-fresh NewArbitrators also
+// leaves at zero: CurrentCandidates (nil slice), nextCRCArbiters
+// (nil slice), arbitersRoundReward (explicitly nil in the literal, and only ever
+// wholesale-reassigned, never index-written), DutyIndex, crcChangedHeight,
+// accumulativeReward, finalRoundChange, clearingHeight, forceChanged, started,
+// pendingSpecialTx and the RegisterFunction closures. Filling those would DIVERGE
+// from genesis-fresh, not converge on it.
+//
+// Ungated: this only restores the genesis defaults the rebuild always meant to
+// produce, so no consensus behaviour moves.
 func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
+	// initFromArbitrators reads ar.degradation, so both rebuild sites must supply it or
+	// nil-panic: DSNormal, no understaffedSince / inactivateHeight, empty
+	// processed-inactive-tx set.
+	if a.degradation == nil {
+		a.degradation = &degradation{
+			inactiveTxs:       make(map[common.Uint256]interface{}),
+			inactivateHeight:  0,
+			understaffedSince: 0,
+			state:             DSNormal,
+		}
+	}
+
+	// Harmful when nil: initFromArbitrators aliases this map into the CheckPoint,
+	// recoverFromCheckPoints then plants it on the live Arbiters, and
+	// ProcessSpecialTxPayload index-writes it unguarded
+	// (a.illegalBlocksPayloadHashes[obj.Hash()] = nil) from the two DPoS-gossip entry
+	// points ProcessIllegalBlock and ProcessInactiveArbiter, panicking with
+	// "assignment to entry in nil map" in the window between a reset and the first
+	// ProcessBlock, which is what re-makes the map.
+	if a.illegalBlocksPayloadHashes == nil {
+		a.illegalBlocksPayloadHashes = make(map[common.Uint256]interface{})
+	}
+
+	// Also planted on the live Arbiters by recoverFromCheckPoints. Benign today: it is
+	// only read, and wholesale-reassigned through copyDPoSRewardMap, which maps nil to
+	// an empty map. This converges on genesis-fresh rather than fixing a live crash, and
+	// removes the standing trap.
+	if a.LastDPoSRewards == nil {
+		a.LastDPoSRewards = make(map[string]map[string]common.Fixed64)
+	}
+
+	// The CheckPoint carries no Snapshots field, so this ring is not planted from a
+	// checkpoint. That the live Arbiters keeps its own ring is not a safety argument:
+	// surviving the rebuild is precisely the defect, and recoverFromCheckPoints clears
+	// the ring for that reason. Independently, SnapshotByHeight index-writes
+	// a.Snapshots[height] unguarded, so a nil here is a crash one refactor away.
+	//
+	// This guard is not load-bearing. On both live rebuild paths it is belt-and-braces,
+	// not the thing that clears the ring: checkpoint.go OnReset and the
+	// OnRollbackTo(height < StartHeight) branch each run newBaselineArbiters ->
+	// initArbitrators (here) and then immediately RecoverFromCheckPoints, which
+	// unconditionally re-makes both fields. Whatever this guard leaves is replaced
+	// before any caller can read it. It earns its place only against a future
+	// constructor that reaches initArbitrators without a following
+	// recoverFromCheckPoints, and there is none today. The correctness property lives
+	// in recoverFromCheckPoints; do not weaken that one on the strength of this.
+	if a.Snapshots == nil {
+		a.Snapshots = make(map[uint32][]*CheckPoint)
+	}
+	if a.SnapshotKeysDesc == nil {
+		a.SnapshotKeysDesc = make([]uint32, 0)
+	}
+
+	// nil is len/append-safe, so this is purely the genesis-fresh baseline.
+	if a.nextCandidates == nil {
+		a.nextCandidates = make([]ArbiterMember, 0)
+	}
+
+	if a.History == nil {
+		a.History = utils.NewHistory(maxHistoryCapacity)
+	}
+
+	if a.ChainParams == nil {
+		a.ChainParams = chainParams
+	}
+
 	originArbiters := make([]ArbiterMember, len(chainParams.DPoSConfiguration.OriginArbiters))
 	for i, arbiter := range chainParams.DPoSConfiguration.OriginArbiters {
 		b, err := common.HexStringToBytes(arbiter)
@@ -3089,6 +3571,122 @@ func (a *Arbiters) initArbitrators(chainParams *config.Configuration) error {
 	return nil
 }
 
+// LoadBlockConfirmProposalSponsors reads the optional operator "sponsors" file into the
+// BlockConfirmProposalSponsors override map.
+//
+// This file is consensus-bearing: Arbiters.ProcessBlock substitutes its entry for the
+// sponsor handed to State.ProcessBlock -> countArbitratorsInactivity*, and the
+// pre-RecordSponsorStartHeight branch of accumulateReward credits rewards through it. A
+// bare relative path against the process working directory would let two nodes started
+// from different directories load different consensus inputs; a read failure swallowed
+// with a single log.Warn would leave the map silently empty; and a parser that indexes
+// field [1] without checking the field count panics the node during startup on one
+// malformed line.
+//
+// It cannot decide block validity at all: CheckRecordSponsorBinding, the map's only
+// validity site, is deleted, and blockchain/blockvalidator.go CheckBlockContext derives
+// nothing from it. The producer never consulted it (pow/service.go GenerateBlock reads
+// the confirm raw), so with the validity site gone producer and validator are symmetric
+// by construction: neither applies the override when deciding whether a block is
+// acceptable. What remains here is determinism hardening for the two upstream reward and
+// inactivity sites:
+//
+//  1. a relative path resolves against the configured data directory first, and only
+//     then against the working directory, so the CWD stops choosing the file;
+//  2. a file that EXISTS but cannot be read or parsed is a hard startup error rather
+//     than a warning followed by a silently empty map;
+//  3. the byte count, entry count and SHA-256 of the exact bytes loaded are logged, so a
+//     fleet can prove every node loaded the same overrides before a coordinated restart.
+//
+// A genuinely absent file remains a warning, not an error: mainnet ships no sponsors file
+// (none exists under the retained chain's data directory and the mainnet config sets no
+// path), so an empty map is the correct, and the overwhelmingly common, configuration.
+func LoadBlockConfirmProposalSponsors(chainParams *config.Configuration) (map[uint32][]byte, error) {
+	sponsors := make(map[uint32][]byte)
+
+	path, data, err := resolveSponsorsFile(chainParams)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		log.Warn("sponsors file not exist! block confirm proposal sponsors: 0 -- this node " +
+			"applies NO sponsor overrides; every node in the fleet must be configured alike")
+		return sponsors, nil
+	}
+
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("sponsors file %s line %d: want \"<height>,<sponsorHex>\", "+
+				"got %q", path, i+1, line)
+		}
+		height, err := strconv.ParseUint(strings.TrimSpace(fields[0]), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("sponsors file %s line %d: bad height %q: %v",
+				path, i+1, fields[0], err)
+		}
+		sponsorBytes, err := common.HexStringToBytes(strings.TrimSpace(fields[1]))
+		if err != nil {
+			return nil, fmt.Errorf("sponsors file %s line %d: bad sponsor %q: %v",
+				path, i+1, fields[1], err)
+		}
+		if prev, ok := sponsors[uint32(height)]; ok && !bytes.Equal(prev, sponsorBytes) {
+			return nil, fmt.Errorf("sponsors file %s line %d: height %d declared twice with "+
+				"different sponsors", path, i+1, height)
+		}
+		sponsors[uint32(height)] = sponsorBytes
+	}
+
+	digest := sha256.Sum256(data)
+	log.Infof("block confirm proposal sponsors: %d entries, %d bytes, loaded from %s "+
+		"(sha256 %s) -- every node in the fleet MUST report this same digest and count",
+		len(sponsors), len(data), path, hex.EncodeToString(digest[:]))
+	return sponsors, nil
+}
+
+// resolveSponsorsFile locates the sponsors file deterministically. A relative
+// SponsorsFilePath is tried against the configured data directory before the process
+// working directory, so nodes started from different directories with the same data
+// directory read the same bytes. A nil payload with a nil error means "no sponsors file
+// anywhere", which is the mainnet configuration; an existing-but-unreadable file is an
+// error, never a silent empty map.
+func resolveSponsorsFile(chainParams *config.Configuration) (string, []byte, error) {
+	configured := chainParams.DPoSConfiguration.SponsorsFilePath
+	if configured == "" {
+		return "", nil, nil
+	}
+
+	candidates := []string{configured}
+	if !filepath.IsAbs(configured) {
+		// Mirror main.go's own data-directory resolution exactly (cfg.DataDir when set,
+		// otherwise the config.DataDir default), so "the data directory" means the same
+		// thing here as it does everywhere else in the node.
+		dataDir := chainParams.DataDir
+		if dataDir == "" {
+			dataDir = config.DataDir
+		}
+		if dataDir != "" {
+			candidates = []string{filepath.Join(dataDir, configured), configured}
+		}
+	}
+
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return path, data, nil
+		}
+		if !os.IsNotExist(err) {
+			return path, nil, fmt.Errorf("sponsors file %s exists but cannot be read: %v",
+				path, err)
+		}
+	}
+	return "", nil, nil
+}
+
 func NewArbitrators(chainParams *config.Configuration, committee *state.Committee,
 	getProducerDepositAmount func(common.Uint168) (common.Fixed64, error),
 	tryUpdateCRMemberInactivity func(did common.Uint168, needReset bool, height uint32),
@@ -3099,30 +3697,9 @@ func NewArbitrators(chainParams *config.Configuration, committee *state.Committe
 	revertUpdateCRInactivePenalty func(cid common.Uint168, height uint32),
 	ckpManager *checkpoint.Manager) (*Arbiters, error) {
 
-	blockConfirmProposalSponsors := make(map[uint32][]byte)
-	sponsorsFilePath := chainParams.DPoSConfiguration.SponsorsFilePath
-	sponsors, err := os.ReadFile(sponsorsFilePath)
+	blockConfirmProposalSponsors, err := LoadBlockConfirmProposalSponsors(chainParams)
 	if err != nil {
-		log.Warn("sponsors file not exist!")
-	} else {
-		sponsorsStr := strings.Split(string(sponsors), "\n")
-		for _, sponsor := range sponsorsStr {
-			if len(sponsor) == 0 {
-				continue
-			}
-			sponsorInfo := strings.Split(sponsor, ",")
-			height, err := strconv.Atoi(sponsorInfo[0])
-			if err != nil {
-				return nil, err
-			}
-			sponsorBytes, err := common.HexStringToBytes(sponsorInfo[1])
-			if err != nil {
-				return nil, err
-
-			}
-			blockConfirmProposalSponsors[uint32(height)] = sponsorBytes
-		}
-		log.Info("block confirm proposal sponsors: ", len(blockConfirmProposalSponsors))
+		return nil, err
 	}
 
 	a := &Arbiters{

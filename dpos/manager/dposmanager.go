@@ -587,8 +587,18 @@ func (d *DPOSManager) OnBlockReceived(b *types.Block, confirmed bool) {
 	for _, tx := range b.Transactions {
 		if tx.IsInactiveArbitrators() {
 			p := tx.Payload().(*payload.InactiveArbitrators)
-			if err := d.arbitrators.ProcessSpecialTxPayload(p,
-				blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
+			// N-001: live gossip/consensus emergency, no connectBlock bracket.
+			// Commit each payload's savepoint UNCONDITIONALLY (also on the error
+			// early-return); committing inside the loop is correct because each
+			// payload's ForceChange is independently permanent, and it also closes
+			// the shared per-block savepoint before the next iteration.
+			// #4: hold specialTxMtx across the whole gossip bracket.
+			d.arbitrators.LockSpecialTx()
+			err := d.arbitrators.ProcessSpecialTxPayload(p,
+				blockchain.DefaultLedger.Blockchain.GetHeight())
+			d.arbitrators.CommitPendingSpecialTx()
+			d.arbitrators.UnlockSpecialTx()
+			if err != nil {
 				log.Errorf("process special tx payload err: %s", err.Error())
 				return
 			}
@@ -634,7 +644,9 @@ func (d *DPOSManager) OnIllegalBlocksTxReceived(i *payload.DPOSIllegalBlocks) {
 	if !d.isCurrentArbiter() {
 		return
 	}
-	if err := blockchain.CheckDPOSIllegalBlocks(i); err != nil {
+	strictActive := blockchain.DefaultLedger.Blockchain.IllegalEvidenceStrictActive(
+		blockchain.DefaultLedger.Blockchain.GetHeight())
+	if err := blockchain.CheckDPOSIllegalBlocks(i, strictActive); err != nil {
 		log.Info("[OnIllegalProposalReceived] received error evidence: ", err)
 		return
 	}
@@ -655,12 +667,22 @@ func (d *DPOSManager) OnInactiveArbitratorsAccepted(p *payload.InactiveArbitrato
 	if !d.isCurrentArbiter() {
 		return
 	}
+	// #4: hold specialTxMtx across the whole gossip bracket.
+	d.arbitrators.LockSpecialTx()
 	d.arbitrators.ProcessSpecialTxPayload(p, blockchain.DefaultLedger.Blockchain.GetHeight())
+	// N-001: live gossip/consensus emergency, no connectBlock bracket -- commit the
+	// savepoint so a later failing connectBlock or Arbiters.RollbackTo cannot reverse
+	// this ForceChange. (The return value is intentionally ignored, as before.)
+	d.arbitrators.CommitPendingSpecialTx()
+	d.arbitrators.UnlockSpecialTx()
 	d.clearInactiveData(p)
 }
 
 func (d *DPOSManager) clearRevertToDPOSData(p *payload.RevertToDPOS) {
 	d.dispatcher.RevertToDPOSTx = nil
+	// The signer set belongs to the transaction, so it is dropped with it. A
+	// set left behind would reject the same arbiters in the next round.
+	d.dispatcher.revertToDPOSRequests = nil
 	log.Info("clearRevertToDPOSData finished")
 
 }
@@ -669,6 +691,8 @@ func (d *DPOSManager) clearInactiveData(p *payload.InactiveArbitrators) {
 	d.illegalMonitor.AddEvidence(p)
 	d.illegalMonitor.SetInactiveArbitratorsTxHash(p.Hash())
 	d.dispatcher.currentInactiveArbitratorTx = nil
+	// The signer set belongs to the transaction, so it is dropped with it.
+	d.dispatcher.inactiveArbitratorsRequests = nil
 	if d.dispatcher.inactiveCountDown.SetEliminated(p.Hash()) {
 		d.dispatcher.eventAnalyzer.Clear()
 	}
@@ -701,7 +725,11 @@ func (d *DPOSManager) OnRevertToDPOSTxReceived(id dpeer.PID,
 	}
 	log.Info("### RevertToDPoS OnRevertToDPOSTxReceived  start 2")
 
-	if err := blockchain.CheckRevertToDPOSTransaction(tx); err != nil {
+	// Structure-only. The gossiped transaction carries the sponsor's single
+	// signature and the round exists to collect the rest, so a full M-of-N check
+	// here would drop every legitimate message and the chain could never leave
+	// PoW. The complete transaction is verified on the block connect path.
+	if err := blockchain.CheckRevertToDPOSTransactionGossip(tx); err != nil {
 		log.Info("[OnRevertToDPOSTxReceived] received error evidence: ", err)
 		return
 	}
@@ -715,7 +743,11 @@ func (d *DPOSManager) OnInactiveArbitratorsReceived(id dpeer.PID,
 	if !d.isCRCArbiter() {
 		return
 	}
-	if err := blockchain.CheckInactiveArbitrators(tx); err != nil {
+	// Structure-only. The gossiped transaction carries the sponsor's single
+	// signature and the round exists to collect the rest, so a full M-of-N check
+	// here would drop every legitimate message and emergency ForceChange could
+	// never fire. The complete transaction is verified on the block connect path.
+	if err := blockchain.CheckInactiveArbitratorsGossip(tx); err != nil {
 		log.Info("[OnIllegalProposalReceived] received error evidence: ", err)
 		return
 	}

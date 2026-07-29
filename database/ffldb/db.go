@@ -1725,6 +1725,18 @@ type db struct {
 	closed    bool         // Is the database closed?
 	store     *blockStore  // Handles read/writing blocks to flat files.
 	cache     *dbCache     // Cache layer which wraps underlying leveldb DB.
+
+	// readOnly is set only by the "ffldb-ro" driver (see readonly.go). It is
+	// the in-process half of the read-only guarantee: the leveldb below is
+	// already opened read-only, but the FLAT BLOCK FILES are not protected by
+	// that, so a writable transaction must be refused before it can reach
+	// blockStore.writeBlock.
+	readOnly bool
+
+	// pendingRepair records the unclean-shutdown flat-file rollback that a
+	// read-write open would have performed on this store, and that a read-only
+	// open deliberately did not. nil on every other path.
+	pendingRepair *UncleanShutdownRepair
 }
 
 // Enforce db implements the database.DB interface.
@@ -1745,6 +1757,17 @@ func (db *db) Type() string {
 // which is used by the managed transaction code while the database method
 // returns the interface.
 func (db *db) begin(writable bool) (*transaction, error) {
+	// A database opened read-only has no writable transaction at all. This is
+	// checked FIRST, before any lock is taken, so the refusal cannot itself
+	// change any state. leveldb would refuse the metadata commit on its own,
+	// but only at Commit time -- by which point StoreBlock has already appended
+	// bytes to a flat block file, because those writes do not go through
+	// leveldb. Refusing here is what makes "read-only" mean the files too.
+	if writable && db.readOnly {
+		return nil, makeDbErr(database.ErrTxNotWritable,
+			ErrReadOnlyDatabase.Error(), nil)
+	}
+
 	// Whenever a new writable transaction is started, grab the write lock
 	// to ensure only a single write transaction can be active at the same
 	// time.  This lock will not be released until the transaction is
@@ -1889,6 +1912,48 @@ func (db *db) Update(fn func(database.Tx) error) error {
 	}
 
 	return tx.Commit()
+}
+
+// FlushCache pushes every buffered write through to the underlying leveldb and
+// fsyncs the block flat file, so that what a subsequent read reports is what a
+// restarted process would find.
+//
+// WHAT IT GUARANTEES, precisely. dbCache.flush syncs the current block file
+// (blockStore.syncBlocks -> File.Sync) and then replays the cached metadata treaps
+// into leveldb inside one transaction; goleveldb writes and fsyncs the resulting
+// table file and fsyncs its manifest journal (openDB does not set opt.NoSync), so
+// on return the writes have been handed to the operating system with an fsync
+// behind them. That is what makes a rewind survive an abrupt process death.
+//
+// WHAT IT DOES NOT GUARANTEE: anything about hardware write caches, and anything
+// about writes made after it returned.
+//
+// Locking mirrors a write transaction: dbCache.flush must be called with the
+// database write lock held, which also serialises it against commitTx, and the
+// close read-lock makes Close wait rather than race. Consequently it must NOT be
+// called from inside an open transaction on the same database.
+//
+// This function is part of the database.DB interface implementation.
+func (db *db) FlushCache() error {
+	// Nothing can be buffered on a read-only database -- begin() refuses every
+	// writable transaction -- so the flush has nothing to publish, and taking
+	// the write path to discover that would be the one call on this database
+	// that touches leveldb's writer. Answering "already durable" is both true
+	// and the only non-writing answer.
+	if db.readOnly {
+		return nil
+	}
+
+	db.writeLock.Lock()
+	defer db.writeLock.Unlock()
+
+	db.closeLock.RLock()
+	defer db.closeLock.RUnlock()
+
+	if db.closed {
+		return makeDbErr(database.ErrDbNotOpen, errDbNotOpenStr, nil)
+	}
+	return db.cache.flush()
 }
 
 // Close cleanly shuts down the database and syncs all data.  It will block

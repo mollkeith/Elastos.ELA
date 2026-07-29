@@ -63,8 +63,19 @@ func CreateMultiSigRedeemScript(m int, pubkeys []*crypto.PublicKey) ([]byte, err
 			return nil, errors.New("public keys has nil public key")
 		}
 	}
+	// F-146: this returned (nil, nil), so CreateMultiSigContract handed back a
+	// Contract with a nil Code and no error. The DPoS caller
+	// (ProposalDispatcher.createArbitratorsRedeemScript) reaches this whenever
+	// the required signature count, computed from the configured CRC arbiter
+	// count, exceeds the number of arbiters that are currently IsNormal - it
+	// then built an InactiveArbitrators transaction with a nil program code.
+	// That transaction is rejected anyway (inactivearbitratorstransaction.go
+	// rejects a nil program.Code), so surfacing the error here turns a
+	// malformed special transaction into a clear failure without changing what
+	// the chain accepts.
 	if !(m >= 1 && m <= len(pubkeys) && len(pubkeys) <= 24) {
-		return nil, nil //TODO: add panic
+		return nil, errors.New("invalid multi-sign parameters: " +
+			"require 1 <= m <= len(pubkeys) <= 24")
 	}
 
 	sb := pg.NewProgramBuilder()

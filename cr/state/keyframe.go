@@ -750,6 +750,14 @@ func (kf *KeyFrame) Snapshot() *KeyFrame {
 	frame.AppropriationAmount = kf.AppropriationAmount
 	frame.CommitteeUsedAmount = kf.CommitteeUsedAmount
 	frame.Members = copyMembersMap(kf.Members)
+	// NextMembers, ClaimedDPoSKeys and NextClaimedDPoSKeys are part of the KeyFrame
+	// and are written by the disk Serialize path (serializeMembersMap /
+	// serializeClaimedDPoSKeysMap), so the in-memory snapshot must copy them too.
+	// Omitting them makes a snapshot silently drop the next-term committee and the
+	// claimed DPoS node keys, and compare equal to a state that has lost them.
+	frame.NextMembers = copyMembersMap(kf.NextMembers)
+	frame.ClaimedDPoSKeys = copyClaimedDPoSKeysMap(kf.ClaimedDPoSKeys)
+	frame.NextClaimedDPoSKeys = copyClaimedDPoSKeysMap(kf.NextClaimedDPoSKeys)
 	frame.HistoryMembers = copyHistoryMembersMap(kf.HistoryMembers)
 	frame.CRAssetsAddressUTXOCount = kf.CRAssetsAddressUTXOCount
 	frame.CurrentWithdrawFromSideChainIndex = kf.CurrentWithdrawFromSideChainIndex
@@ -810,9 +818,16 @@ func (kf *StateKeyFrame) SerializeProgramHashVotesInfoMap(vmap map[common.Uint16
 		if err = k.Serialize(w); err != nil {
 			return
 		}
-		common.WriteVarUint(w, uint64(len(v)))
+		// Both of these writes must check their error, as every neighbouring write in
+		// this file does. Discarding it lets a short or failing write truncate the
+		// keyframe while the caller is told the checkpoint serialized cleanly.
+		if err = common.WriteVarUint(w, uint64(len(v))); err != nil {
+			return
+		}
 		for _, votes := range v {
-			votes.Serialize(w, 0)
+			if err = votes.Serialize(w, 0); err != nil {
+				return
+			}
 		}
 	}
 	return
@@ -1954,6 +1969,12 @@ func (p *ProposalKeyFrame) deserializeWithdrawableTransactionsMap(r io.Reader) (
 		if err = withdrawInfo.Deserialize(r); err != nil {
 			return
 		}
+		// Store the deserialized entry. Reading hash and info off the wire without
+		// inserting them makes every CR checkpoint round-trip and restart return an
+		// empty map, which wipes the CRC RealWithdraw pending queue
+		// (WithdrawableTxInfo) and desyncs the node from its peers. Mirror the
+		// serialize side.
+		withdrawableTxsMap[hash] = withdrawInfo
 	}
 	return
 }

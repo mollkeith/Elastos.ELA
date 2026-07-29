@@ -1,0 +1,661 @@
+// Copyright (c) 2017-2020 The Elastos DAO
+// Use of this source code is governed by an MIT
+// license that can be found in the LICENSE file.
+//
+
+package blockchain
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/elastos/Elastos.ELA/common"
+	"github.com/elastos/Elastos.ELA/common/config"
+	"github.com/elastos/Elastos.ELA/common/log"
+	"github.com/elastos/Elastos.ELA/database"
+)
+
+// ForcedRollbackArmed reports whether this node holds the chain the forced
+// rollback targets.
+//
+// It requires BOTH that the local tip is above the rollback height AND that the
+// block immediately above that height hashes to the configured trigger. The hash
+// condition is what makes the operation safe:
+//
+//   - it fires only on a node that actually holds the bad chain,
+//   - it is idempotent, because after the rewind that block no longer exists,
+//   - it is a no-op for a freshly syncing node, which never accepts the block in
+//     the first place once strict validation is active above the rollback height.
+//
+// It is ALSO the resume predicate. Because the per-block rewind now removes a
+// block's header-index row LAST (see RollbackOneBlock), an interrupted rewind
+// leaves every not-yet-finished block still in b.Nodes, so this predicate is still
+// true on the next boot and the rewind picks up exactly where it stopped. Under
+// the shipped ordering the header row was removed FIRST, so each interruption
+// silently shrank b.Nodes by one block without rolling it back, and after
+// (tip-target) restarts this predicate went false with none of the discarded
+// blocks actually rolled back.
+func (b *BlockChain) ForcedRollbackArmed() (bool, error) {
+	target := b.chainParams.ForcedRollbackHeight
+	trigger := b.chainParams.ForcedRollbackTrigger
+	if trigger == "" || target == 0 {
+		return false, nil
+	}
+	if uint32(len(b.Nodes)-1) <= target {
+		return false, nil
+	}
+
+	// The config trigger is written in DISPLAY (explorer/RPC) byte order so an
+	// operator can verify it against a block explorer. Block hashes are stored
+	// internally in the reversed order, so parse the trigger reversed before
+	// comparing. Using the non-reversed parse here silently disarms the rollback
+	// (armed=false) and leaves the node on the corrupt chain.
+	triggerHash, err := common.Uint256FromReversedHexString(trigger)
+	if err != nil {
+		return false, fmt.Errorf("forced rollback: bad trigger hash %q: %w", trigger, err)
+	}
+	// Deliberately does not log: this is a pure predicate, and it runs before
+	// logging is guaranteed to be initialised. The caller reports the outcome.
+	return b.Nodes[target+1].Hash.IsEqual(*triggerHash), nil
+}
+
+// ForceRollback rewinds the chain to the configured ForcedRollbackHeight.
+//
+// Architecture (option "d"): it rewinds the block store to the target and stops.
+// It deliberately does NOT reprocess the rolled-back blocks (2260451..tip) through
+// the derived-state accumulation path. The caller's later InitCheckpoint restores a
+// checkpoint snapshot (which, by the save invariant, always lags the tip by
+// EffectivePeriod=720 and is therefore strictly below this target and pre-exploit)
+// and replays forward ONLY up to the rewound tip. Consequence, and the reason this
+// architecture is preferred over "build-forward-then-unwind": the attacker's
+// exploit-era transactions are never re-run through the unchecked vote/stake
+// accumulation path on any node at startup. This is unconditionally safe rather than
+// contingent on "no exploit-era stake/vote existed".
+//
+// Correctness is a theorem, not an accident of the current tip: default_snapshot <=
+// tip-720 (save invariant) and depth<720 (the guard below) => the restored baseline
+// is < target <= exploit_block on every conforming node; replay always re-derives to
+// the rewound tip. main.go asserts SafeHeight() < ForcedRollbackHeight after
+// InitCheckpoint, which fails the node loudly if an anomalous snapshot (e.g.
+// hand-edited) ever sat at/above the target.
+//
+// Derived-state content correctness after the rebuild is not established by this
+// reasoning. It is validated only by the testnet reproduction, which compares the
+// arbiter and CR set at the target against a node freshly synced to that height.
+// Treat that comparison as a hard gate before production.
+//
+// Caller must have verified ForcedRollbackArmed first.
+
+// ErrForcedRollbackExceedsCapacity is returned when this node's tip is more than
+// the incremental-rewind window (maxHistoryCapacity) past the rollback target, so
+// the auto-rollback cannot proceed without violating the pre-target-checkpoint
+// baseline.
+//
+// It is operator-actionable, and it is FATAL at the boot path. It used to be
+// swallowed there so a late upgrader was not bricked into a boot loop -- but the
+// node that kept booting kept booting ON THE EXPLOIT CHAIN. Measured in the 48-node
+// rehearsal: 48/48 declined here and then died further down on the checkpoint
+// baseline assertion (alive 0/48), and in the variant where the restored snapshot
+// lands below the target that assertion PASSES and the node comes up
+// un-rolled-back, becoming the straggler that stalls the recovered chain from an
+// on-duty arbiter seat. Declining the rewind and continuing is not a liveness
+// concession, it is a correctness failure.
+var ErrForcedRollbackExceedsCapacity = errors.New("forced rollback depth exceeds history capacity")
+
+// ErrForcedRollbackInterrupted is returned when the operator interrupts the rewind.
+// It is NOT a corruption report: the rewind is resumable by construction, so the
+// remedy is simply to restart the node and let it continue.
+var ErrForcedRollbackInterrupted = errors.New("forced rollback interrupted by operator")
+
+// forcedRollbackDisarmRemedy is the sentence a refusal ends with when it offers
+// "or just do not roll back" as a way out.
+//
+// On mainnet, unsetting --forcedrollbacktrigger does not let the node start, so the
+// remedy must not say it does: settings.enforceStrictMoneyAndRollbackHeights discards
+// both the flag and the config.json field and re-pins the coordinated values, so
+// `ela --forcedrollbacktrigger= --forcedrollbackheight=4294967295` still resolves to
+// target 2260450 and still arms. The predicate is config.IsMainNetActiveNet, the same
+// label set the pin switches on.
+func (b *BlockChain) forcedRollbackDisarmRemedy() string {
+	if config.IsMainNetActiveNet(b.chainParams.ActiveNet) {
+		return "There is NO disarm on mainnet: --forcedrollbacktrigger and " +
+			"--forcedrollbackheight are discarded and re-pinned to the coordinated " +
+			"values, so unsetting them does not let this node start"
+	}
+	return "Unsetting --forcedrollbacktrigger also lets this node start, but only " +
+		"as a node that deliberately stays on the removed chain"
+}
+
+// forcedRollbackMarkerKeyName is the ffldb metadata key holding the durable
+// "a forced rollback is in progress" marker.
+//
+// The marker is not what makes the rewind CORRECT. That rests on the per-block
+// ordering (a block's header-index row is deleted only after all of its destructive
+// work is durably committed) and on the phase probe, both of which work on a store
+// written by the SHIPPED binary, which never wrote a marker.
+//
+// It is, however, load-bearing for one thing, and that is why it is written and
+// FLUSHED before the first destructive step and retired only after the completed
+// rewind is on disk (see writeForcedRollbackMarker and ForceRollback): its survival
+// is the only durable evidence that a rewind was started and did not report
+// finishing. CheckAbandonedForcedRollback refuses to start a node on that evidence
+// when the operator has disarmed the trigger -- the boot on which every other check
+// here declines. Treating the marker as a pure diagnostic, as this comment once did,
+// is what left that boot unguarded.
+var forcedRollbackMarkerKeyName = []byte("forcedrollbackinprogress")
+
+// forcedRollbackMarkerVersion prefixes the marker so its layout can change.
+const forcedRollbackMarkerVersion byte = 1
+
+// forcedRollbackMarkerLen is version(1) + target(4) + start(4).
+const forcedRollbackMarkerLen = 9
+
+// ForcedRollbackMarker is the durable record of an in-progress forced rollback.
+type ForcedRollbackMarker struct {
+	// Target is the height the rewind is heading for.
+	Target uint32
+	// Start is the tip height the rewind began from, so progress can be reported
+	// across restarts.
+	Start uint32
+}
+
+// flushStore makes everything the rewind has written so far durable, so that the
+// next statement about the store, a store scan, a log line an operator acts on, or
+// the clearing of the in-progress marker, describes disk rather than the ffldb write
+// cache. `what` names the work being made durable, for the error message.
+//
+// It is explicit at each call site rather than hidden inside the write helpers: the
+// rewind commits many small transactions, and flushing every one would turn a
+// 145-block mainnet rewind into 145 leveldb table writes without buying any
+// correctness, because the per-block ordering already makes an interrupted rewind
+// resumable whatever has reached disk. What matters is that a flush has run before
+// anything claims the work is done.
+func (b *BlockChain) flushStore(what string) error {
+	if err := b.db.GetFFLDB().FlushCache(); err != nil {
+		return fmt.Errorf("forced rollback: flush %s to disk: %w", what, err)
+	}
+	return nil
+}
+
+// ReadForcedRollbackMarker returns the durable in-progress marker, or nil.
+func (b *BlockChain) ReadForcedRollbackMarker() (*ForcedRollbackMarker, error) {
+	var marker *ForcedRollbackMarker
+	err := b.db.GetFFLDB().View(func(dbTx database.Tx) error {
+		raw := dbTx.Metadata().Get(forcedRollbackMarkerKeyName)
+		if raw == nil {
+			return nil
+		}
+		// The length is reported on its own, and BEFORE anything indexes into the
+		// slice. ffldb returns a non-nil ZERO-LENGTH value for a key stored with an
+		// empty value (measured, both from the write cache and after a flush), so the
+		// combined condition below used to short-circuit correctly and then panic
+		// with index-out-of-range while FORMATTING its own diagnosis -- the node died
+		// on the one boot where it was trying to tell the operator that the marker is
+		// unreadable, and died with a runtime panic rather than the refusal.
+		if len(raw) != forcedRollbackMarkerLen {
+			return fmt.Errorf("forced rollback: unreadable in-progress marker "+
+				"(%d bytes, expected %d)", len(raw), forcedRollbackMarkerLen)
+		}
+		if raw[0] != forcedRollbackMarkerVersion {
+			return fmt.Errorf("forced rollback: unreadable in-progress marker "+
+				"(version %d, expected %d)", raw[0], forcedRollbackMarkerVersion)
+		}
+		marker = &ForcedRollbackMarker{
+			Target: byteOrder.Uint32(raw[1:5]),
+			Start:  byteOrder.Uint32(raw[5:9]),
+		}
+		return nil
+	})
+	return marker, err
+}
+
+// writeForcedRollbackMarker records that a rewind is under way, DURABLY.
+//
+// The flush is what makes the marker worth anything across a crash. A marker that is
+// only in the ffldb write cache disappears in exactly the crash it is meant to
+// describe, and a node whose rewind was lost with it then comes back looking like a
+// node that never started one -- which is what an operator who has disarmed the
+// trigger is left holding. Written and flushed before the first destructive step, it
+// is instead the durable fact CheckAbandonedForcedRollback refuses on.
+func (b *BlockChain) writeForcedRollbackMarker(target, start uint32) error {
+	raw := make([]byte, forcedRollbackMarkerLen)
+	raw[0] = forcedRollbackMarkerVersion
+	byteOrder.PutUint32(raw[1:5], target)
+	byteOrder.PutUint32(raw[5:9], start)
+	if err := b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
+		return dbTx.Metadata().Put(forcedRollbackMarkerKeyName, raw)
+	}); err != nil {
+		return err
+	}
+	return b.flushStore("the in-progress marker")
+}
+
+// ClearForcedRollbackMarker removes the in-progress marker. It is exported because
+// the boot path clears it once the PERSISTED store has been verified clean, which
+// is the only point at which "in progress" is provably false.
+func (b *BlockChain) ClearForcedRollbackMarker() error {
+	return b.db.GetFFLDB().Update(func(dbTx database.Tx) error {
+		return dbTx.Metadata().Delete(forcedRollbackMarkerKeyName)
+	})
+}
+
+// forcedRollbackProgressSteps is how many progress lines a full rewind emits. The
+// real mainnet rewind is 144 or 145 blocks over a 25GB store, depending on the
+// node: not every node accepted 2,260,595 onto its main chain. Two nodes measured
+// 2026-07-28 and 2026-07-29 reported main-chain-above 145 and 144 respectively,
+// the second holding 2,260,595 as a stored side block that the residue sweep
+// removes instead. Both are correct; the rewind counts what the node actually
+// has. The shipped code logged every 100th height, i.e. about two lines for the
+// whole operation -- the shape that invites an operator to assume the node has
+// hung and press Ctrl-C.
+const forcedRollbackProgressSteps = 20
+
+// blockRollbackPhase describes how much of one block's rewind is already durable,
+// read from the database itself rather than from any marker. It is what makes the
+// rewind exactly-once under repeated interruption: the shipped code re-ran every
+// step unconditionally, and re-running RollbackBlock re-applies the per-transaction
+// rollback processors, which are not idempotent.
+type blockRollbackPhase struct {
+	// onMainChain is true while the block still has a hash->height main-chain
+	// index entry, which RollbackBlock deletes in the SAME atomic transaction as
+	// the UTXO/state rollback processors. Its presence therefore proves the
+	// rollback transaction has not committed; its absence proves it has.
+	onMainChain bool
+	// inStore is true while the block is still fetchable by hash.
+	inStore bool
+}
+
+// forcedRollbackPhase probes the persisted store for one block's rewind phase.
+func (b *BlockChain) forcedRollbackPhase(hash *common.Uint256) (blockRollbackPhase, error) {
+	var phase blockRollbackPhase
+	err := b.db.GetFFLDB().View(func(dbTx database.Tx) error {
+		if _, herr := dbFetchHeightByHash(dbTx, hash); herr == nil {
+			phase.onMainChain = true
+		}
+		idx := dbTx.Metadata().Bucket(blockLocIndexBucketName)
+		if idx == nil {
+			return fmt.Errorf("forced rollback: bucket %q missing",
+				blockLocIndexBucketName)
+		}
+		phase.inStore = idx.Get(hash[:]) != nil
+		return nil
+	})
+	return phase, err
+}
+
+// RollbackOneBlock durably discards exactly one block from the tip.
+//
+// It is exported because it has two production callers, and they must not be two
+// implementations. ForceRollback drives it on the automatic boot path, and
+// `ela-cli rollback`, the offline remedy every forced-rollback refusal message
+// names, drives it too. A hand-copied three-transaction sequence in the manual
+// command carried the header-row-last ordering, so an interrupted run left the
+// block in the index and resumable, but it had none of the phase probe below, so
+// the resumed run re-fetched the block and re-ran RollbackBlock over a rollback
+// that had already committed, re-applying per-transaction rollback processors that
+// are not idempotent, or, once the raw entry was gone, failed on the fetch and
+// could never finish at all.
+//
+// The ordering is the load-bearing part. Three separate database transactions in
+// the order
+//
+//	T1 DBRemoveBlockNode  ->  T2 RollbackBlock  ->  T3 DBRemoveBlockFromStore
+//
+// cannot work, because T1 destroys the block-header-index row that b.Nodes is
+// rebuilt from at startup (chainio.go initChainState), while b.Nodes drives both
+// the arming predicate and the rewind loop's bound. An interruption or a T2 error
+// between T1 and T2 makes that block permanently un-rollbackable, and because
+// main.go exits on the error, each operator restart eats one more header row until
+// the node boots silently at exactly the target with none of the discarded blocks
+// rolled back; on mainnet that residue includes block 2,260,451, the exploit block.
+// This was reproduced on a live ffldb harness.
+//
+// The sequence is therefore
+//
+//	RollbackBlock  ->  DBRemoveBlockFromStore  ->  DBRemoveBlockNode
+//
+// so the header row survives until every destructive step for that block is
+// durably committed. It is therefore itself the durable resume marker: whatever
+// point an interruption lands on, the block is still in b.Nodes on the next boot,
+// the node is still armed, and the rewind re-attempts it.
+//
+// Re-attempting is exactly-once because each step is skipped when the store shows
+// it already committed. That matters most for RollbackBlock, which runs the
+// per-transaction rollback processors inside the same atomic transaction that
+// deletes the main-chain index entry, so "still main-chain indexed" is a sound,
+// self-describing proof that those processors have not run.
+//
+// Two constraints pin the middle step's position and must be preserved:
+// DBRemoveBlockFromStore cannot move before RollbackBlock, because
+// ChainStore.handleRollbackBlockTask re-fetches the block by hash as a
+// precondition; and it must happen at all, because RollbackBlock leaves the raw
+// by-hash entry behind and a rolled-back node would otherwise keep serving the
+// discarded blocks over P2P getdata / RPC getblock.
+func (b *BlockChain) RollbackOneBlock(node, prevNode *BlockNode) error {
+	fflDB := b.db.GetFFLDB()
+
+	phase, err := b.forcedRollbackPhase(node.Hash)
+	if err != nil {
+		return fmt.Errorf("forced rollback: probe phase at %d: %w", node.Height, err)
+	}
+
+	// STEP 1 -- the rollback transaction (block state, main-chain index and the
+	// per-transaction rollback processors, all atomically).
+	if phase.onMainChain {
+		if !phase.inStore {
+			// Unreachable through this function's own ordering (the store entry is
+			// removed only after the rollback commits, which clears onMainChain).
+			// It can only mean the raw entry was removed by something else, and
+			// without the block body the rollback processors cannot be built.
+			return fmt.Errorf("forced rollback: block %s at height %d is still "+
+				"main-chain indexed but no longer in the block store, so its "+
+				"rollback cannot be built; restore a pre-rollback backup or wipe "+
+				"and resync", node.Hash.String(), node.Height)
+		}
+		dposBlock, gerr := fflDB.GetBlock(*node.Hash)
+		if gerr != nil {
+			return fmt.Errorf("forced rollback: get block at %d: %w", node.Height, gerr)
+		}
+		if rerr := b.db.RollbackBlock(dposBlock.Block, node, dposBlock.Confirm,
+			CalcPastMedianTime(prevNode)); rerr != nil {
+			return fmt.Errorf("forced rollback: RollbackBlock %d: %w", node.Height, rerr)
+		}
+	} else {
+		log.Operatorf("FORCED ROLLBACK: resuming -- block %d was already rolled back by "+
+			"an earlier, interrupted run; skipping its rollback transaction",
+			node.Height)
+	}
+
+	// STEP 2 -- residue #2 purge. RollbackBlock clears the block-header index, the
+	// main-chain height indexes and the tx-index siblings, but leaves the raw
+	// by-hash block store (ffldb-blockidx) behind: a rolled-back node still
+	// deserialized and SERVED the discarded blocks by hash over P2P getdata / RPC
+	// getblock, and reported them present via HasBlock / IsBlockInStore.
+	if phase.inStore {
+		if perr := fflDB.Update(func(dbTx database.Tx) error {
+			return DBRemoveBlockFromStore(dbTx, node.Hash)
+		}); perr != nil {
+			return fmt.Errorf("forced rollback: purge block store at %d: %w",
+				node.Height, perr)
+		}
+		// A fetch above may have populated the in-RAM block LRU with this
+		// now-purged hash; evict it so an in-process serve cannot return it.
+		fflDB.EvictBlockCache(*node.Hash)
+	}
+
+	// STEP 3 -- and only now the header-index row, which is what makes every step
+	// above re-attemptable across an interruption. Keyed by hash+height directly
+	// rather than by a re-parsed header, because after step 2 the block body is no
+	// longer fetchable; blockIndexKey uses exactly these two values, and the
+	// BlockNode carries both. Unlike disconnectBlock2, the error is checked -- a
+	// swallowed failure on a one-shot consensus rewind is unacceptable.
+	if err := fflDB.Update(func(dbTx database.Tx) error {
+		return dbRemoveBlockNodeKey(dbTx, node.Hash, node.Height)
+	}); err != nil {
+		return fmt.Errorf("forced rollback: DBRemoveBlockNode at %d: %w",
+			node.Height, err)
+	}
+	return nil
+}
+
+// ForceRollback rewinds the chain store to the configured ForcedRollbackHeight.
+//
+// interrupt may be nil. When it is signalled the rewind stops at a block boundary
+// and returns ErrForcedRollbackInterrupted; because each block's rewind is
+// crash-atomic in effect (see RollbackOneBlock), restarting resumes it.
+func (b *BlockChain) ForceRollback(interrupt <-chan struct{}) error {
+	target := b.chainParams.ForcedRollbackHeight
+	if len(b.Nodes) == 0 {
+		return errors.New("forced rollback: the block index is empty")
+	}
+	start := uint32(len(b.Nodes) - 1)
+	if start <= target {
+		// Nothing to rewind. Guarded explicitly because `start - target` is unsigned
+		// and would otherwise wrap into an enormous depth.
+		return nil
+	}
+	depth := start - target
+
+	if forcedRollbackExceedsCapacity(start, target) {
+		// The remedy must print the --height form. The positional form
+		// `ela-cli rollback <N>` prints the subcommand help and exits 0 without touching
+		// the store, so a runbook step checking the exit status records success for an
+		// operation that never happened.
+		return fmt.Errorf("forced rollback depth %d exceeds history capacity %d; "+
+			"refusing to rewind incrementally, and refusing to start -- a node that "+
+			"cannot complete the rollback must not join the recovered network on the "+
+			"chain the recovery removes. Remedy: stop the node and, from the node's "+
+			"working directory, run `ela-cli rollback --height %d --datadir <your "+
+			"data dir>` (the --height FLAG is required; a bare positional height "+
+			"prints help and does nothing), then restart; "+
+			"or wipe the data directory and resync under this binary. %s: %w",
+			depth, maxHistoryCapacity, target, b.forcedRollbackDisarmRemedy(),
+			ErrForcedRollbackExceedsCapacity)
+	}
+
+	// The marker is written BEFORE anything destructive, so an interrupted run is
+	// self-describing on the next boot. A marker from an earlier, interrupted run
+	// is expected here; only a marker for a DIFFERENT target is a red flag.
+	if marker, merr := b.ReadForcedRollbackMarker(); merr != nil {
+		return merr
+	} else if marker != nil {
+		if marker.Target != target {
+			return fmt.Errorf("forced rollback: the store carries an in-progress "+
+				"marker for target %d (started at %d) but this node is configured "+
+				"for target %d; refusing to mix two rollbacks -- restore a backup "+
+				"or wipe and resync", marker.Target, marker.Start, target)
+		}
+		log.Operatorf("FORCED ROLLBACK: RESUMING an interrupted rewind -- original start "+
+			"height %d, target %d, %d block(s) still to discard",
+			marker.Start, marker.Target, depth)
+	} else if werr := b.writeForcedRollbackMarker(target, start); werr != nil {
+		return fmt.Errorf("forced rollback: write in-progress marker: %w", werr)
+	}
+
+	log.Operatorf("FORCED ROLLBACK: rewinding chain store from height %d to %d (%d blocks). "+
+		"This is a one-shot consensus rewind over the whole block store and may take "+
+		"a long time on a large database. It is RESUMABLE: if it is interrupted, "+
+		"restart the node and it continues from where it stopped.", start, target, depth)
+
+	b.UTXOCache.CleanCache()
+
+	logEvery := depth / forcedRollbackProgressSteps
+	if logEvery == 0 {
+		logEvery = 1
+	}
+	began := time.Now()
+
+	for uint32(len(b.Nodes)-1) > target {
+		// Interrupt at a BLOCK BOUNDARY only, so the store is never left mid-block
+		// by a deliberate stop.
+		select {
+		case <-interrupt:
+			done := start - uint32(len(b.Nodes)-1)
+			return fmt.Errorf("%w after %d of %d block(s); the rewind is resumable -- "+
+				"restart the node to continue (do NOT roll back or resync manually)",
+				ErrForcedRollbackInterrupted, done, depth)
+		default:
+		}
+
+		i := len(b.Nodes) - 1
+		node := b.Nodes[i]
+		prevNode := b.Nodes[i-1]
+
+		if err := b.RollbackOneBlock(node, prevNode); err != nil {
+			return err
+		}
+
+		// Reconcile the in-RAM index so no stale InMainChain=true node for a rewound
+		// hash survives for this process's lifetime (disconnectBlock2 omitted this).
+		b.index.RemoveNode(node)
+		b.Nodes = b.Nodes[:i]
+		b.BestChain = prevNode
+		b.SetTip(prevNode)
+		b.MedianTimePast = CalcPastMedianTime(prevNode)
+
+		done := start - uint32(i-1)
+		if done%uint32(logEvery) == 0 || uint32(i) == target+1 || done == 1 {
+			log.Operatorf("FORCED ROLLBACK: %d/%d blocks discarded (%d%%), store tip now %d, "+
+				"elapsed %s", done, depth, done*100/depth, i-1,
+				time.Since(began).Truncate(time.Second))
+		}
+	}
+
+	// The ChainStore's own height must describe the rewound tip before anything else
+	// reads it. It is lowered ONLY by the per-block rollback transaction
+	// (ChainStore.rollback: currentBlockHeight = b.Height-1), and a RESUMED rewind
+	// deliberately SKIPS that transaction for a block an earlier, interrupted run
+	// already committed. When the skipped block is the last one -- target+1, on
+	// mainnet 2,260,451 -- nothing lowers the height at all and it stays at the value
+	// initChainState derived from the surviving header row, i.e. target+1.
+	//
+	// On the ffldb harness, crashing after block target+1's rollback commits and then
+	// resuming leaves chain.GetHeight()=target while ChainStore.GetHeight()=target+1,
+	// and ChainStore.handlePersistBlockTask then rejects the recovered chain's
+	// replacement block at target+1 with "block height less than current block
+	// height". The node rolls back correctly, reports success, and can never accept
+	// the first block of the chain it was rolled back for. Setting it here is
+	// unconditional and idempotent: on a clean run it restates what the last rollback
+	// transaction already wrote.
+	b.db.SetHeight(uint32(len(b.Nodes) - 1))
+
+	// The per-iteration purge above walks only the accepted main chain (b.Nodes), so
+	// it reaches every discarded block that was ON the best chain -- including the
+	// exploit block. But a block can be StoreBlock'd above the target WITHOUT ever
+	// joining the main chain: an orphan / side block (e.g. a child of the discarded
+	// tip). Such blocks are absent from b.Nodes, so the loop structurally cannot reach
+	// them, yet they remain fetchable by hash (ffldb-blockidx) and would be served just
+	// like the main-chain residue. Sweep them with the SAME complete scan the offline
+	// cleaner uses, so the in-line purge reaches exact clean-forward-sync parity on the
+	// raw block store rather than being off by the orphan count. DeleteBlockFromStore
+	// also evicts the RAM cache, so this is safe on the running node.
+	if swept, serr := PurgeForcedRollbackResidue(b.db.GetFFLDB(), target); serr != nil {
+		return fmt.Errorf("forced rollback: sweep above-target orphan residue: %w", serr)
+	} else if swept > 0 {
+		log.Operatorf("FORCED ROLLBACK: swept %d above-target orphan/side block(s) that were "+
+			"stored but never on the main chain", swept)
+	}
+
+	// The rewind is complete only once the PERSISTED store agrees. This is the
+	// assertion main.go's height check could not make: chain.GetHeight() is
+	// len(b.Nodes)-1, so comparing it against the target restates the loop's own
+	// exit condition and can never fail.
+	if verr := b.VerifyForcedRollbackComplete(); verr != nil {
+		return verr
+	}
+	if cerr := b.ClearForcedRollbackMarker(); cerr != nil {
+		return fmt.Errorf("forced rollback: clear in-progress marker: %w", cerr)
+	}
+	// Nothing may announce completion until completion is on disk. The line below is
+	// the one an operator reads before deciding the rewind is done -- and, in the
+	// runbook, before unsetting --forcedrollbacktrigger. Printed over a rewind still
+	// buffered in the ffldb cache it is an invitation to a silent revert: an unclean
+	// exit inside the flush window discards every byte of the rewind AND the marker
+	// clear, and a node restarted disarmed then comes up on the pre-rollback chain,
+	// serving the discarded blocks, with nothing left to say so. After this flush the
+	// completion line means what it says, and if the flush fails the line is never
+	// printed and the node exits on the error instead.
+	if ferr := b.flushStore("the completed rewind"); ferr != nil {
+		return ferr
+	}
+
+	log.Operatorf("FORCED ROLLBACK: block store rewound to %d in %s; the rewind and the "+
+		"clearing of its in-progress marker are both on disk. Derived state will be "+
+		"rebuilt by InitCheckpoint from a pre-target snapshot (asserted < target)",
+		len(b.Nodes)-1, time.Since(began).Truncate(time.Second))
+	return nil
+}
+
+// VerifyForcedRollbackComplete asserts, against the PERSISTED store, that nothing
+// above the rollback target survives in any index: no main-chain entry, no
+// header-index row, no raw by-hash entry, and a best-chain state no higher than the
+// target. It is the post-rewind safety net.
+func (b *BlockChain) VerifyForcedRollbackComplete() error {
+	target := b.chainParams.ForcedRollbackHeight
+	scan, err := ScanForcedRollbackStore(b.db.GetFFLDB(), target)
+	if err != nil {
+		return fmt.Errorf("forced rollback: verify store: %w", err)
+	}
+	tip := uint32(len(b.Nodes) - 1)
+	if tip != target {
+		return fmt.Errorf("forced rollback: loaded chain tip is %d, expected exactly %d",
+			tip, target)
+	}
+	if !scan.Clean() {
+		return fmt.Errorf("%w: the rewind reported success but the persisted store "+
+			"still holds data above the target (%s). main-chain: %s | stored: %s | "+
+			"header rows: %s", ErrForcedRollbackStoreInconsistent, scan.Summary(),
+			refsString(scan.MainChainAbove), refsString(scan.StoredAbove),
+			refsString(scan.HeaderRowsAbove))
+	}
+	log.Operatorf("FORCED ROLLBACK: persisted store verified clean above target %d "+
+		"(best-state height %d)", target, scan.BestStateHeight)
+	return nil
+}
+
+// CheckForcedRollbackResidue is the safety net for the boot where the rollback is
+// NOT armed but the node sits at or below the target -- which is precisely the boot
+// a ratcheted node comes up on, and precisely the boot both shipped safety nets
+// skipped (one was tautological, the other was guarded by `if forcedRollbackFired`).
+//
+// It separates the two severities the store can show:
+//
+//   - main-chain records above the target, or a best-chain state above the target,
+//     while the loaded tip is not: an interrupted rollback whose UTXO/derived-state
+//     processors never ran. Unrepairable -> refuse to start.
+//   - raw-store entries or orphaned header rows only: retention residue, which is
+//     safely removable -> purge and continue. This is also the case for a node that
+//     rolled back correctly under a binary that did not purge the block store, which
+//     until now only the offline `ela-cli purgeresidue` command could reach.
+//
+// It must only be called when a forced rollback is configured for this network.
+func (b *BlockChain) CheckForcedRollbackResidue() error {
+	// The store scan and the classification live in DiagnoseForcedRollbackResidue, so
+	// that `ela-cli preflight` predicts this boot with the code that decides it
+	// rather than with a copy of its conditions.
+	d, err := b.DiagnoseForcedRollbackResidue()
+	if err != nil {
+		return err
+	}
+	if d.State == ResidueNotApplicable {
+		return nil
+	}
+	target, tip, scan := d.Target, d.Tip, d.Scan
+	if d.State == ResidueInterrupted {
+		return d.Err
+	}
+	if d.State == ResidueRetentionOnly {
+		log.Operatorf("FORCED ROLLBACK: node is at height %d (target %d) but the store still "+
+			"holds %d discarded block(s) and %d orphaned header row(s) above the target; "+
+			"purging (retention residue only -- the main chain is consistent)",
+			tip, target, len(scan.StoredAbove), len(scan.HeaderRowsAbove))
+		purged, perr := PurgeForcedRollbackResidue(b.db.GetFFLDB(), target)
+		if perr != nil {
+			return fmt.Errorf("forced rollback: purge residue at boot: %w", perr)
+		}
+		log.Operatorf("FORCED ROLLBACK: purged %d residual block(s) above target %d",
+			purged, target)
+		// The message below states the store is verified clean, and clearing the
+		// marker retires the only durable evidence that a rewind was ever under way.
+		// Both are claims about disk, so the purge has to BE on disk first.
+		if ferr := b.flushStore("the boot-time residue purge"); ferr != nil {
+			return ferr
+		}
+	}
+	if marker, merr := d.Marker, d.MarkerErr; merr == nil && marker != nil {
+		log.Operatorf("FORCED ROLLBACK: clearing a stale in-progress marker (target %d, "+
+			"start %d); the persisted store is verified clean above the target",
+			marker.Target, marker.Start)
+		if cerr := b.ClearForcedRollbackMarker(); cerr != nil {
+			return fmt.Errorf("forced rollback: clear stale marker: %w", cerr)
+		}
+		// A marker clear left in the write cache is resurrected by an unclean exit,
+		// and CheckAbandonedForcedRollback would then refuse to start a node whose
+		// store is provably clean. Make the retirement stick.
+		if ferr := b.flushStore("the stale-marker clear"); ferr != nil {
+			return ferr
+		}
+	}
+	return nil
+}

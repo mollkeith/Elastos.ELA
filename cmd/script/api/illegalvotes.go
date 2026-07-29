@@ -20,7 +20,7 @@ const (
 
 func RegisterIllegalVotesType(L *lua.LState) {
 	mt := L.NewTypeMetatable(luaIllegalVotesTypeName)
-	L.SetGlobal("illegal_votes", mt)
+	L.SetGlobal(luaIllegalVotesTypeName, mt)
 	// static attributes
 	L.SetField(mt, "new", L.NewFunction(newIllegalVotes))
 	// methods

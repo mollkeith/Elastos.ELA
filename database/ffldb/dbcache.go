@@ -358,6 +358,13 @@ func (snap *dbCacheSnapshot) NewIterator(slice *util.Range) *dbCacheIterator {
 // can commit transactions at will without incurring large performance hits due
 // to frequent disk syncs.
 type dbCache struct {
+	// readOnly marks a cache belonging to a database opened through the
+	// "ffldb-ro" driver. flush() and Close() must not write on that path: the
+	// cache is provably empty (no writable transaction can be started) but
+	// dbCache.flush would still fsync the block write file and hand leveldb a
+	// batch, and leveldb's own Close writes its LOG.
+	readOnly bool
+
 	// ldb is the underlying leveldb DB for metadata.
 	ldb *leveldb.DB
 
@@ -490,6 +497,13 @@ func (c *dbCache) commitTreaps(pendingKeys, pendingRemove TreapForEacher) error 
 //
 // This function MUST be called with the database write lock held.
 func (c *dbCache) flush() error {
+	// A read-only cache has nothing to flush and no right to try. Returning
+	// before syncBlocks also keeps Close() -- which calls flush unconditionally
+	// -- off every write path.
+	if c.readOnly {
+		return nil
+	}
+
 	c.lastFlush = time.Now()
 
 	// Sync the current write file associated with the block store.  This is

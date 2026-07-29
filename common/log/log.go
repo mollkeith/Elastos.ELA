@@ -116,6 +116,28 @@ func NewDefault(path string, level uint8, maxPerLogSizeMb, maxLogsSizeMb int64) 
 	return logger
 }
 
+// NewDiscardDefault installs a package logger that writes nowhere.
+//
+// The package-level helpers (Infof, Warnf, ...) dereference `logger` with no nil
+// check, so a command that calls into production code which logs MUST install one
+// before it does -- ScanForcedRollbackStore's Infof would otherwise panic. Every
+// other constructor opens a ROTATING FILE, which is the wrong answer for a
+// strictly read-only command: `ela-cli preflight` must not create a logs directory
+// as a side effect of predicting a boot, and cmd/purgeresidue's
+// log.NewDefault("logs/node", ...) does exactly that under whatever the current
+// directory happens to be.
+//
+// Operator-facing output is unaffected: Operatorf and OperatorError write to
+// os.Stderr directly and are already nil-logger safe.
+func NewDiscardDefault(level uint8) *Logger {
+	logger = &Logger{
+		level:  level,
+		writer: io.Discard,
+		logger: log.New(io.Discard, "", 0),
+	}
+	return logger
+}
+
 func (l *Logger) Writer() io.Writer {
 	return l.writer
 }
@@ -132,6 +154,17 @@ func (l *Logger) Outputf(level uint8, format string, v ...interface{}) {
 		v = append([]interface{}{levelName(level), "GID", common.Goid()}, v...)
 		l.logger.Output(calldepth, fmt.Sprintf("%s %s %s, "+format+"\n", v...))
 	}
+}
+
+// outputfAlways writes a record whatever the configured print level is.
+//
+// Logger.Outputf drops anything below l.level, which is right for ordinary logging
+// and wrong for the one-shot destructive operations Operatorf below serves: a node
+// run at PrintLevel 4 would keep no record at all that its chain was rewound. This
+// is the only path that bypasses the level, and only those operations use it.
+func (l *Logger) outputfAlways(level uint8, format string, v ...interface{}) {
+	v = append([]interface{}{levelName(level), "GID", common.Goid()}, v...)
+	l.logger.Output(calldepth, fmt.Sprintf("%s %s %s, "+format+"\n", v...))
 }
 
 func (l *Logger) Debug(a ...interface{}) {
@@ -248,6 +281,42 @@ func Errorf(format string, a ...interface{}) {
 
 func Fatalf(format string, a ...interface{}) {
 	logger.Fatalf(format, a...)
+}
+
+// Operatorf reports an operator-critical event: it writes to STDERR unconditionally
+// and records the line in the log unconditionally.
+//
+// It exists for the forced rollback, which is a one-shot, irreversible rewind of a
+// live chain. Every line describing it went through log.Warnf, and MEASURED on this
+// tree a full 719-block rewind on a node at PrintLevel 3 produced zero bytes of
+// output and zero log lines: the loudest event in the system was invisible on exactly
+// the nodes whose operators had turned the noise down. Stderr is not routed through
+// the logger at all, so writing there is level-independent by construction.
+//
+// It is deliberately NOT a general-purpose "important" logger. Ordinary warnings and
+// errors keep their level semantics; the cost of this one is that its lines appear on
+// both streams when the level would have printed them anyway, which is the right
+// trade only for events an operator must never miss.
+func Operatorf(format string, a ...interface{}) {
+	fmt.Fprintf(os.Stderr, "%s "+format+"\n",
+		append([]interface{}{levels[warnLog]}, a...)...)
+	if logger != nil {
+		logger.outputfAlways(warnLog, format, a...)
+	}
+}
+
+// OperatorError is Operatorf for a fatal error. main.go's printErrorAndExit used
+// log.Error, which the same filter drops at PrintLevel 4 and above -- so a node that
+// REFUSED TO START exited 255 with nothing written anywhere, which is the worst
+// possible failure mode on restart day.
+func OperatorError(err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s %s\n", levels[errorLog], err.Error())
+	if logger != nil {
+		logger.outputfAlways(errorLog, "%s", err.Error())
+	}
 }
 
 func SetPrintLevel(level uint8) {

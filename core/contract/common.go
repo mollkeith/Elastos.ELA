@@ -92,6 +92,10 @@ func IsMultiSig(code []byte) bool {
 	switch code[i] {
 	case 1:
 		i++
+		// F-203: bounds-check the variable-advance read before indexing.
+		if i >= len(code) {
+			return false
+		}
 		if n != int16(code[i]) {
 			return false
 		}
@@ -99,6 +103,10 @@ func IsMultiSig(code []byte) bool {
 		break
 	case 2:
 		i++
+		// F-203: the case-2 selector reads TWO bytes via BytesToInt16(code[i:]).
+		if i+2 > len(code) {
+			return false
+		}
 		if n != common.BytesToInt16(code[i:]) {
 			return false
 		}
@@ -112,6 +120,15 @@ func IsMultiSig(code []byte) bool {
 		break
 	}
 
+	// F-203: the parser's variable advances (m/n selectors + 34-byte pubkey stride) can
+	// push i to len(code); the only prior guard was a `len(code) < 37` ENTRY check, so
+	// this final read sliced OOB -> pre-auth remote panic (reachable via RunPrograms /
+	// ReturnDeposit before any signature check). Bound it. Ungated crash-harden: a
+	// well-formed multisig code ends exactly at i (the len(code) != i check below), so
+	// this never fires on a legitimate program.
+	if i >= len(code) {
+		return false
+	}
 	if code[i] != byte(vm.CHECKMULTISIG) {
 		return false
 	}

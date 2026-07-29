@@ -92,6 +92,18 @@ func (t *CRCProposalWithdrawTransaction) HeightVersionCheck() error {
 		return errors.New(fmt.Sprintf("not support %s transaction "+
 			"before CRCProposalWithdrawPayloadV1Height", t.TxType().Name()))
 	}
+	// The version dispatch above (and SpecialContextCheck) validates only v0
+	// (CRCProposalWithdrawDefault) and v1 (CRCProposalWithdrawVersion01), with no
+	// default case, so a v>=2 payload skips both the v0 recipient/CR-expenses-source
+	// binding and the v1 recipient/amount binding and reaches only the owner-signature
+	// check: an unconstrained-output withdrawal. Reject unknown versions at and above
+	// the coordinated-upgrade gate (StrictMoneyRangeHeight) so retained below-gate
+	// history replays byte-identically. Reuses gate 1; no third gate.
+	if blockHeight >= chainParams.StrictMoneyRangeHeight &&
+		t.PayloadVersion() > payload.CRCProposalWithdrawVersion01 {
+		return errors.New(fmt.Sprintf("unsupported %s transaction payload version %d",
+			t.TxType().Name(), t.PayloadVersion()))
+	}
 	return nil
 }
 

@@ -41,6 +41,54 @@ const (
 	// negotiateTimeout is the duration of inactivity before we timeout a
 	// peer that hasn't completed the initial version negotiation.
 	negotiateTimeout = 30 * time.Second
+
+	// queueMessageTimeout is the maximum duration QueueMessage waits for room
+	// in the output queue before it gives up on the peer.  See QueueMessage
+	// for why an unbounded wait is not acceptable (F-150).
+	queueMessageTimeout = 30 * time.Second
+
+	// maxPendingMsgs bounds queueHandler's pendingMsgs list.
+	//
+	// FV-17: outputQueue is bounded (outputBufferSize) but queueHandler drains
+	// it into pendingMsgs, a list.List with no cap whatsoever, and pendingMsgs
+	// is only drained when outHandler completes a socket write.  A peer that
+	// stops reading therefore accumulates every message we want to send it, in
+	// RAM, for as long as the write deadline allows -- which used to be
+	// p2p.WriteMessageTimeOut, ten minutes.  Both halves are fixed: this cap,
+	// and peerWriteTimeout below.
+	//
+	// A few hundred entries is far above any legitimate backlog: OnGetData
+	// already throttles itself to five in-flight messages per batch precisely
+	// so it does not "queue far more data than we can send", and every other
+	// producer (inv, addr, pong, reject) is small and infrequent.  A peer that
+	// exceeds it is not reading, so it is disconnected rather than served.
+	maxPendingMsgs = 256
+
+	// peerWriteTimeout bounds a single socket write to a peer.
+	//
+	// FV-17: p2p.WriteMessageTimeOut is ten minutes, which is how long a peer
+	// that completed a handshake and then stopped reading could pin this
+	// connection and everything queued behind it.  Sixty seconds still allows
+	// ~34 KB/s for a default 2 MB block, i.e. any link a peer could usefully
+	// serve blocks over; below that the peer is worthless to us anyway.  This
+	// is deliberately peer-scoped and does NOT change p2p.WriteMessageTimeOut
+	// itself, which the DPoS peer path and the hub also read.
+	peerWriteTimeout = 60 * time.Second
+
+	// pingResponseInterval is the minimum spacing between two pongs sent to the
+	// same peer, and pingResponseBurst the number of replies that may be spent
+	// back-to-back before that spacing applies.
+	//
+	// FV-17: ping is handled in this generic layer and never reaches elanet's
+	// ban scorer (a census of AddBanScore in elanet/server.go covers mempool,
+	// inv, notfound, getdata, getblocks and filterload -- not ping), it is a
+	// guaranteed 1:1 response, and it is tiny in both directions, so it is the
+	// cheapest possible way to make this node queue messages faster than it can
+	// send them.  Honest peers ping every pingInterval (30s), so a two-second
+	// floor with a burst of five leaves fifteen times more headroom than the
+	// protocol ever uses.
+	pingResponseInterval = 2 * time.Second
+	pingResponseBurst    = 5
 )
 
 // outMsg is used to house a message to be sent along with a channel to signal
@@ -194,6 +242,11 @@ type Peer struct {
 	height         uint32
 	lastPingTime   time.Time // Time we sent last ping.
 	lastPingMicros int64     // Time for last ping to return.
+	// pingTokens and pingRefilled are the ping response meter (FV-17). The
+	// zero value self-initialises to a full bucket on the first ping, so no
+	// constructor has to know about them.
+	pingTokens   int
+	pingRefilled time.Time
 
 	stallControl  chan StallControlMsg
 	outputQueue   chan outMsg
@@ -533,8 +586,51 @@ func (p *Peer) handlePingMsg(ping *msg.Ping) {
 	if p.height != newHeight {
 		p.height = newHeight
 	}
+	allowed := p.allowPingResponseLocked(time.Now())
 	p.statsMtx.Unlock()
+
+	// FV-17: ping is the one inbound message that does guaranteed 1:1 work with
+	// no ban score anywhere in the stack, so it is metered here, at the only
+	// place that sees it. Dropping the reply -- rather than disconnecting -- is
+	// deliberate: an honest peer pings once per pingInterval and can never reach
+	// the limiter, while a flooding peer simply stops being amplified. If it
+	// keeps flooding, queueHandler's maxPendingMsgs backstop disconnects it.
+	if !allowed {
+		log.Debugf("Peer %s exceeded the ping response rate -- pong dropped", p)
+		return
+	}
+
 	p.QueueMessage(msg.NewPong(p.cfg.BestHeight()), nil)
+}
+
+// allowPingResponseLocked reports whether a pong may be sent now, refilling the
+// per-peer token bucket first. The caller must hold statsMtx for writing.
+// (FV-17)
+func (p *Peer) allowPingResponseLocked(now time.Time) bool {
+	elapsed := now.Sub(p.pingRefilled)
+	switch {
+	case elapsed >= pingResponseBurst*pingResponseInterval:
+		// Also the zero-value case: a peer that has been quiet for a full burst
+		// window starts again with a full bucket.
+		p.pingTokens = pingResponseBurst
+		p.pingRefilled = now
+	case elapsed > 0:
+		if refill := int(elapsed / pingResponseInterval); refill > 0 {
+			p.pingTokens += refill
+			if p.pingTokens > pingResponseBurst {
+				p.pingTokens = pingResponseBurst
+			}
+			p.pingRefilled = p.pingRefilled.Add(
+				time.Duration(refill) * pingResponseInterval)
+		}
+	}
+
+	if p.pingTokens <= 0 {
+		return false
+	}
+	p.pingTokens--
+
+	return true
 }
 
 // handlePongMsg is invoked when a peer receives a pong message.
@@ -669,8 +765,9 @@ func (p *Peer) writeMessage(m p2p.Message) error {
 		return fmt.Sprintf("Sending %v%s to %s", m.CMD(), summary, p)
 	}))
 
-	// Write the message to the peer.
-	return p2p.WriteMessage(p.conn, p.cfg.Magic, m, p2p.WriteMessageTimeOut,
+	// Write the message to the peer. FV-17: peerWriteTimeout, not the ten
+	// minute p2p.WriteMessageTimeOut -- see the constant.
+	return p2p.WriteMessage(p.conn, p.cfg.Magic, m, peerWriteTimeout,
 		func(message p2p.Message) (*types.DposBlock, bool) {
 			msgBlock, ok := message.(*msg.Block)
 			if !ok {
@@ -862,9 +959,27 @@ func (p *Peer) queueHandler() {
 	queuePacket := func(msg outMsg, list *list.List, waiting bool) bool {
 		if !waiting {
 			p.sendQueue <- msg
-		} else {
-			list.PushBack(msg)
+			// we are always waiting now.
+			return true
 		}
+
+		// FV-17: pendingMsgs is drained only when outHandler completes a socket
+		// write, so a peer that has stopped reading grows this list without any
+		// ceiling.  Refuse to grow past maxPendingMsgs and drop the peer: a peer
+		// with a full backlog is by definition not consuming what we already
+		// sent, and dropping a message queued for such a peer is exactly the
+		// semantics QueueMessage's own timeout path already chose (F-150).
+		if list.Len() >= maxPendingMsgs {
+			log.Warnf("Peer %s pending message backlog reached %d -- "+
+				"disconnecting", p, list.Len())
+			// Signal the waiter before disconnecting: the cleanup loops below
+			// only drain what is IN the list, and this message never gets there.
+			p.signalDone(msg.doneChan)
+			p.Disconnect()
+			return true
+		}
+
+		list.PushBack(msg)
 		// we are always waiting now.
 		return true
 	}
@@ -1008,14 +1123,55 @@ func (p *Peer) QueueMessage(msg p2p.Message, doneChan chan<- struct{}) {
 	// we will be sending to hangs around until it knows for a fact that
 	// it is marked as disconnected and *then* it drains the channels.
 	if !p.Connected() {
-		if doneChan != nil {
-			go func() {
-				doneChan <- struct{}{}
-			}()
-		}
+		p.signalDone(doneChan)
 		return
 	}
-	p.outputQueue <- outMsg{msg: msg, doneChan: doneChan}
+
+	// Fast path, there is room in the output queue.
+	select {
+	case p.outputQueue <- outMsg{msg: msg, doneChan: doneChan}:
+		return
+	default:
+	}
+
+	// F-150/F-116: the output queue is full, so never wait on it forever.
+	// AssociateConnection marks the peer connected and the server registers it
+	// (OnVersion -> AddPeer) before start() launches queueHandler, so there is
+	// a window in which nothing drains outputQueue at all; and once the peer
+	// is disconnected queueHandler never runs again to drain it either.  An
+	// unguarded send therefore blocks the caller forever - and the caller is
+	// frequently the single peerHandler goroutine (handleBroadcastMsg) or the
+	// relay handler, so one peer that stops reading takes down peer management
+	// server wide.  Give up on the peer instead: dropping a queued message to
+	// a peer whose queue is already full is always safe, it is exactly what
+	// the not connected branch above already does.
+	timer := time.NewTimer(queueMessageTimeout)
+	defer timer.Stop()
+
+	select {
+	case p.outputQueue <- outMsg{msg: msg, doneChan: doneChan}:
+
+	case <-p.quit:
+		p.signalDone(doneChan)
+
+	case <-timer.C:
+		log.Warnf("Peer %s output queue full for %v -- disconnecting", p,
+			queueMessageTimeout)
+		p.Disconnect()
+		p.signalDone(doneChan)
+	}
+}
+
+// signalDone notifies the given done channel without blocking the caller, it
+// is used when a message will not be delivered so whoever waits on the channel
+// is not left hanging.
+func (p *Peer) signalDone(doneChan chan<- struct{}) {
+	if doneChan == nil {
+		return
+	}
+	go func() {
+		doneChan <- struct{}{}
+	}()
 }
 
 // Connected returns whether or not the peer is currently connected.
@@ -1110,9 +1266,20 @@ func (p *Peer) localVersionMsg() (*msg.Version, error) {
 	// Generate a unique nonce for this peer so self connections can be
 	// detected.  This is accomplished by adding it to a size-limited map of
 	// recently seen nonces.
-
-	var nonce [8]byte
-	rand.Read(nonce[:])
+	//
+	// F-154: the nonce must come from the configured provider when there is
+	// one, because that is what records it in the caller's sent nonce cache.
+	// Generating a private nonce here left that cache permanently empty, so
+	// IsSelfConnection could never return true and self connection detection
+	// was entirely inert.
+	var versionNonce uint64
+	if p.cfg.GetVersionNonce != nil {
+		versionNonce = p.cfg.GetVersionNonce()
+	} else {
+		var nonce [8]byte
+		rand.Read(nonce[:])
+		versionNonce = binary.BigEndian.Uint64(nonce[:])
+	}
 
 	var m *msg.Version
 	bestHeight := p.cfg.BestHeight()
@@ -1121,11 +1288,13 @@ func (p *Peer) localVersionMsg() (*msg.Version, error) {
 	if bestHeight >= p.cfg.NewVersionHeight {
 		nodeVersion = p.cfg.NodeVersion
 		ver = pact.CRProposalVersion
-		p.cfg.ProtocolVersion = ver
+		// F-157: do not write the negotiated version back into the config.
+		// ver is used locally below and the assignment is a side effect on
+		// state that other goroutines read.
 	}
 	// Version message.
 	m = msg.NewVersion(ver, p.cfg.DefaultPort,
-		p.cfg.Services, binary.BigEndian.Uint64(nonce[:]), bestHeight, p.cfg.DisableRelayTx, nodeVersion)
+		p.cfg.Services, versionNonce, bestHeight, p.cfg.DisableRelayTx, nodeVersion)
 
 	return m, nil
 }

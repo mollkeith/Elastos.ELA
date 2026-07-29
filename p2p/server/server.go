@@ -35,6 +35,13 @@ const (
 	// retries when connecting to persistent peers.  It is adjusted by the
 	// number of retries such that there is a retry backoff.
 	connectionRetryInterval = time.Second * 5
+
+	// maxKnownAddressesPerPeer is the maximum number of addresses tracked as
+	// known to a single peer.  Only the address count of one addr message is
+	// bounded by the protocol, not the number of addr messages a peer may
+	// send, so this set needs its own limit (F-155).  Evicting an entry only
+	// means the address may be advertised to that peer again.
+	maxKnownAddressesPerPeer = 5000
 )
 
 // simpleAddr implements the net.Addr interface with two struct fields
@@ -141,7 +148,7 @@ type serverPeer struct {
 	persistent     bool
 	sentAddrs      bool
 	isWhitelisted  bool
-	knownAddresses map[string]struct{}
+	knownAddresses *mruAddrSet
 	banScore       connmgr.DynamicBanScore
 }
 
@@ -151,7 +158,7 @@ func newServerPeer(s *server, isPersistent bool) *serverPeer {
 	return &serverPeer{
 		server:         s,
 		persistent:     isPersistent,
-		knownAddresses: make(map[string]struct{}),
+		knownAddresses: newMruAddrSet(maxKnownAddressesPerPeer),
 	}
 }
 
@@ -159,14 +166,13 @@ func newServerPeer(s *server, isPersistent bool) *serverPeer {
 // the peer to prevent sending duplicate addresses.
 func (sp *serverPeer) addKnownAddresses(addresses []*p2p.NetAddress) {
 	for _, na := range addresses {
-		sp.knownAddresses[addrmgr.NetAddressKey(na)] = struct{}{}
+		sp.knownAddresses.Add(addrmgr.NetAddressKey(na))
 	}
 }
 
 // addressKnown true if the given address is already known to the peer.
 func (sp *serverPeer) addressKnown(na *p2p.NetAddress) bool {
-	_, exists := sp.knownAddresses[addrmgr.NetAddressKey(na)]
-	return exists
+	return sp.knownAddresses.Exists(addrmgr.NetAddressKey(na))
 }
 
 // pushAddrMsg sends an addr message to the connected peer using the provided
@@ -391,7 +397,11 @@ func (s *server) checkAddr(addr string) error {
 	if bestHeight >= s.cfg.NewVersionHeight {
 		nodeVersion = s.cfg.NodeVersion
 		ver = pact.CRProposalVersion
-		s.cfg.ProtocolVersion = ver
+		// F-157: do not write the probe's protocol version back into the
+		// shared server config.  checkAddr runs on the address manager's
+		// expirePeers goroutine while newPeerConfig reads cfg.ProtocolVersion
+		// for every new peer, so the assignment was both a data race and a
+		// global side effect.  ver is only needed locally.
 	}
 	// Version message.
 	versionMsg = msg.NewVersion(ver, s.cfg.DefaultPort,
@@ -498,6 +508,28 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 		delete(state.banned, host)
 	}
 
+	// F-213: limit the number of inbound peers so inbound connections can
+	// never occupy every slot.  Without the sub cap a peer that fills all
+	// MaxPeers slots with inbound connections locks the connection manager
+	// out of making any outbound connection at all - the server refuses the
+	// newcomer (there is no eviction for non persistent peers) and never
+	// recovers, which is a cheap eclipse.
+	if sp.Inbound() {
+		maxInbound := s.maxInboundPeers()
+		if len(state.inboundPeers) >= maxInbound {
+			// Drop peers that are already gone before refusing a newcomer.
+			if cleared := clearDisconnected(state); cleared > 0 {
+				log.Debugf("Clear %d peers from state", cleared)
+			}
+		}
+		if len(state.inboundPeers) >= maxInbound {
+			log.Infof("Max inbound peers reached [%d] - disconnecting peer %s",
+				maxInbound, sp)
+			sp.Disconnect()
+			return false
+		}
+	}
+
 	// Limit max number of total peers.
 	if state.Count() >= s.cfg.MaxPeers {
 		cleared := clearDisconnected(state)
@@ -545,6 +577,26 @@ func (s *server) handleAddPeerMsg(state *peerState, sp *serverPeer) bool {
 	}
 
 	return true
+}
+
+// maxInboundPeers returns the maximum number of inbound peers the server keeps
+// at once.  Slots are reserved for the connection manager's outbound
+// connections so that inbound peers can never lock this node out of the
+// network (F-213).  A floor of half of MaxPeers keeps small deployments, where
+// MaxPeers may be lower than the outbound target, working as before.
+func (s *server) maxInboundPeers() int {
+	reserved := s.cfg.TargetOutbound
+	if reserved <= 0 {
+		reserved = defaultTargetOutbound
+	}
+	maxInbound := s.cfg.MaxPeers - reserved
+	if floor := s.cfg.MaxPeers / 2; maxInbound < floor {
+		maxInbound = floor
+	}
+	if maxInbound < 1 {
+		maxInbound = 1
+	}
+	return maxInbound
 }
 
 // handleDonePeerMsg deals with peers that have signalled they are done.  It is
@@ -855,6 +907,9 @@ func (s *server) outboundPeerConnected(c *connmgr.ConnReq, conn net.Conn) {
 	if err != nil {
 		log.Debugf("Cannot create outbound peer %s: %v", c.Addr, err)
 		s.connManager.Disconnect(c.ID())
+		// F-153: p is nil on error; without this return the code falls through to
+		// sp.AssociateConnection(nil) and panics. Bail out on the failed dial.
+		return
 	}
 	sp.Peer = p
 	sp.connReq = c

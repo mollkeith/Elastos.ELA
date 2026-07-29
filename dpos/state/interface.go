@@ -16,6 +16,16 @@ type Arbitrators interface {
 	Start()
 	CheckDPOSIllegalTx(block *types.Block) error
 	ProcessSpecialTxPayload(p interfaces.Payload, height uint32) error
+	// CommitPendingSpecialTx / UndoPendingSpecialTx (F-093) bracket the emergency
+	// ForceChange that PreProcessSpecialTx applies before a block is validated and
+	// stored, so a block that fails to connect cannot leave the node rotated onto a
+	// rejected arbiter set.
+	CommitPendingSpecialTx()
+	UndoPendingSpecialTx()
+	// LockSpecialTx / UnlockSpecialTx (#4) serialize the whole special-tx bracket
+	// against every other one; the bracket boundaries hold them, not RollbackTo.
+	LockSpecialTx()
+	UnlockSpecialTx()
 	CheckCRCAppropriationTx(block *types.Block) error
 	CheckNextTurnDPOSInfoTx(block *types.Block) error
 	CheckCustomIDResultsTx(block *types.Block) error
@@ -59,7 +69,6 @@ type Arbitrators interface {
 	IsDisabledProducer(pk []byte) bool
 	IsNeedNextTurnDPOSInfo() bool
 	IsDPoSV2Run(blockHeight uint32) bool
-
 	GetOnDutyArbitrator() []byte
 	GetNextOnDutyArbitrator(offset uint32) []byte
 

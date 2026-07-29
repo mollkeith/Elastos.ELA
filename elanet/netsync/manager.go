@@ -41,7 +41,51 @@ const (
 	// syncTimeout is the maximum allowable interval when the sync peer does not
 	// receive the block.
 	syncTimeout = time.Minute * 10
+
+	// stallCheckInterval is how often the sync peer is examined for a stall.
+	// F-035: the syncTimeout check ran only inside handleInvMsg, so it needed
+	// inbound inv traffic to fire -- yet a peer holding the sync slot makes the
+	// manager discard every other peer's invs (current() is false while a sync
+	// peer is set), which is exactly the traffic needed to time it out. Drive
+	// the check from a ticker so it no longer depends on peer traffic.
+	stallCheckInterval = time.Minute
+
+	// maxSyncAhead bounds how far above our own tip an unverified, peer-supplied
+	// header height may push syncHeight. F-114: an orphan block's header height
+	// is attacker-chosen and unbounded, and the sync peer is released only once
+	// the chain reaches syncHeight -- claiming 0xffffffff pinned the sync slot
+	// to the sender for the life of the process.
+	maxSyncAhead = 5000
+
+	// confirmInvLookupWindow is how far below our tip a main-chain block may be
+	// and still be worth a flat-file store read to discover whether we already
+	// hold its confirm. F-054.
+	confirmInvLookupWindow = 2 * pact.MaxBlocksPerMsg
 )
+
+// boundedSyncHeight clamps an unverified, peer-supplied block height before it
+// is used as the sync target. A claim at or below our own tip releases the sync
+// peer on the next connected block, and a claim far above it is capped so the
+// slot is released after a bounded amount of progress instead of never. (F-114)
+func boundedSyncHeight(claimed, best uint32) uint32 {
+	if claimed <= best {
+		return best + 1
+	}
+	if claimed-best > maxSyncAhead {
+		return best + maxSyncAhead
+	}
+	return claimed
+}
+
+// confirmInvNeedsStoreLookup reports whether an InvTypeConfirmedBlock
+// announcement for a main-chain block at blockHeight is close enough to the tip
+// to justify reading the block back off the flat-file store. (F-054)
+func confirmInvNeedsStoreLookup(blockHeight, bestHeight uint32) bool {
+	if blockHeight >= bestHeight {
+		return true
+	}
+	return bestHeight-blockHeight <= confirmInvLookupWindow
+}
 
 // zeroHash is the zero value hash (all zeros).  It is defined as a convenience.
 var zeroHash common.Uint256
@@ -417,6 +461,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	// handling, etc.
 	log.Debugf("Receive block %s at height %d", blockHash,
 		bmsg.block.Block.Height)
+	heightBefore := sm.chain.BestChain.Height
 	_, isOrphan, err := sm.blockMemPool.AddDposBlock(bmsg.block)
 	if err != nil {
 		log.Warn("add block error:", err)
@@ -427,7 +472,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		return
 	}
 
-	if peer == sm.syncPeer {
+	// F-035/F-114: only count the sync peer as making progress when our own tip
+	// actually advanced. Resetting the stall timer on ANY block delivered by the
+	// sync peer let a peer that had taken the slot hold it indefinitely by
+	// dripping unconnectable (orphan) blocks just inside syncTimeout.
+	if peer == sm.syncPeer && sm.chain.BestChain.Height > heightBefore {
 		sm.syncStartTime = time.Now()
 	}
 
@@ -448,7 +497,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		} else {
 			if sm.syncPeer == nil {
 				sm.syncPeer = peer
-				sm.syncHeight = bmsg.block.Block.Height
+				// F-114: the orphan's header height is unverified and
+				// unbounded; clamp it so the sync slot is released after
+				// bounded progress instead of never.
+				sm.syncHeight = boundedSyncHeight(bmsg.block.Block.Height,
+					sm.chain.BestChain.Height)
 				sm.syncStartTime = time.Now()
 				log.Debug("Syncing blocks locator:", locator)
 				log.Info("PushGetBlocksMsgSyncing blocks locator:", locator, "height:", bmsg.block.Height)
@@ -481,6 +534,23 @@ func (sm *SyncManager) haveInventory(invVect *msg.InvVect) (bool, error) {
 		// known to it in (blockMemPool, main chain)
 		if !sm.chain.BlockExists(&invVect.Hash) {
 			return false, nil
+		}
+
+		// F-054: everything below reads a FULL block off the flat-file store and
+		// deserializes it just to read one bool -- and the store's block cache is
+		// two entries wide -- so a 33-byte inv entry bought an unbounded disk and
+		// CPU read. Answer from memory whenever that is possible.
+		if _, ok := sm.blockMemPool.GetConfirm(invVect.Hash); ok {
+			return true, nil
+		}
+		if node, ok := sm.chain.LookupNodeInIndex(&invVect.Hash); ok &&
+			!confirmInvNeedsStoreLookup(node.Height, sm.chain.GetHeight()) {
+			// A main-chain block buried far below the tip: its confirm is of no
+			// use to us even if we hold none (the block pool discards confirms
+			// within cachedCount heights), so report it as known instead of
+			// paying a store read. This suppresses a getdata for a block we
+			// already have; it changes no block or transaction acceptance.
+			return true, nil
 		}
 
 		block, _ := sm.chain.GetDposBlockByHash(invVect.Hash)
@@ -517,12 +587,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 	// not be one.
 	invVects := imsg.inv.InvList
 
-	if sm.syncPeer != nil && time.Now().After(sm.syncStartTime.Add(syncTimeout)) {
-		log.Warnf("sync peer %s has not received block for more than %d "+
-			"seconds, -- disconnecting", sm.syncPeer, syncTimeout)
-		sm.syncPeer.Disconnect()
-		sm.syncPeer = nil
-	}
+	sm.dropStalledSyncPeer(time.Now())
 
 	// Ignore invs from peers that aren't the sync if we are not current.
 	// Helps prevent fetching a mass of orphans.
@@ -592,8 +657,16 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 					continue
 				}
 				if sm.syncPeer == nil {
+					// F-114: the orphan's header height is unverified and
+					// unbounded; clamp it before it becomes the sync target
+					// (and do not fault if the orphan was evicted meanwhile).
+					var orphanHeight uint32
+					if orphan := sm.chain.GetOrphan(&iv.Hash); orphan != nil {
+						orphanHeight = orphan.Block.Height
+					}
 					sm.syncPeer = peer
-					sm.syncHeight = sm.chain.GetOrphan(&iv.Hash).Block.Height
+					sm.syncHeight = boundedSyncHeight(orphanHeight,
+						sm.chain.GetHeight())
 					sm.syncStartTime = time.Now()
 				}
 				if sm.syncPeer == peer {
@@ -642,6 +715,13 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				sm.requestedTxns[iv.Hash] = struct{}{}
 				sm.limitMap(sm.requestedTxns, maxRequestedTxns)
 				state.requestedTxns[iv.Hash] = struct{}{}
+				// F-077: also bound the per-peer tx map so a peer that floods
+				// distinct inv hashes without ever delivering cannot grow it
+				// unbounded (OOM). Safe for txns: handleTxMsg only deletes on
+				// delivery, so an evicted entry just triggers a harmless
+				// re-request (unlike the block maps, whose delivery is
+				// authorized against this set).
+				sm.limitMap(state.requestedTxns, maxRequestedTxns)
 				gdmsg.AddInvVect(iv)
 				numRequested++
 			}
@@ -664,6 +744,32 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 			log.Info("PushGetBlocksMsg error:", err)
 		}
 	}
+}
+
+// syncStalled reports whether the current sync peer has failed to advance our
+// chain within syncTimeout. (F-035)
+func (sm *SyncManager) syncStalled(now time.Time) bool {
+	return sm.syncPeer != nil && now.After(sm.syncStartTime.Add(syncTimeout))
+}
+
+// dropStalledSyncPeer disconnects and releases a sync peer that has not
+// advanced our chain within syncTimeout, then looks for another candidate.
+// F-035: this used to be inline in handleInvMsg, so it could only fire while
+// invs were arriving; it is now also driven by a ticker in blockHandler.
+func (sm *SyncManager) dropStalledSyncPeer(now time.Time) {
+	if !sm.syncStalled(now) {
+		return
+	}
+
+	log.Warnf("sync peer %s has not advanced the chain for %v "+
+		"-- disconnecting", sm.syncPeer, syncTimeout)
+	sm.syncPeer.Disconnect()
+	sm.syncPeer = nil
+
+	// Without this the node simply stops syncing after a stall: handleDonePeerMsg
+	// only restarts the search when the departing peer is still the sync peer,
+	// and it has just been cleared here.
+	sm.startSync()
 }
 
 // limitMap is a helper function for maps that require a maximum limit by
@@ -691,9 +797,17 @@ func (sm *SyncManager) limitMap(m map[common.Uint256]struct{}, limit int) {
 // important because the sync manager controls which blocks are needed and how
 // the fetching should proceed.
 func (sm *SyncManager) blockHandler() {
+	// F-035: release a stalled sync peer on wall-clock time rather than only
+	// when an inv happens to arrive.
+	stallTicker := time.NewTicker(stallCheckInterval)
+	defer stallTicker.Stop()
+
 out:
 	for {
 		select {
+		case now := <-stallTicker.C:
+			sm.dropStalledSyncPeer(now)
+
 		case m := <-sm.msgChan:
 			switch msg := m.(type) {
 			case *newPeerMsg:

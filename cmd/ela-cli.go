@@ -13,17 +13,22 @@ import (
 	cmdcom "github.com/elastos/Elastos.ELA/cmd/common"
 	"github.com/elastos/Elastos.ELA/cmd/info"
 	"github.com/elastos/Elastos.ELA/cmd/mine"
+	"github.com/elastos/Elastos.ELA/cmd/preflight"
+	"github.com/elastos/Elastos.ELA/cmd/purgeresidue"
 	"github.com/elastos/Elastos.ELA/cmd/rollback"
 	"github.com/elastos/Elastos.ELA/cmd/script"
 	"github.com/elastos/Elastos.ELA/cmd/wallet"
 	"github.com/elastos/Elastos.ELA/common/config"
 	transaction2 "github.com/elastos/Elastos.ELA/core/transaction"
 	"github.com/elastos/Elastos.ELA/core/types/functions"
+	"github.com/elastos/Elastos.ELA/utils/version"
 
 	"github.com/urfave/cli"
 )
 
-var Version string
+// Version is reported by `ela-cli --version`. Same source of truth as the
+// node: the constant in utils/version, overridable by -ldflags for dev builds.
+var Version = version.Version
 
 func main() {
 	initFunctions()
@@ -57,6 +62,8 @@ func main() {
 		*mine.NewCommand(),
 		*script.NewCommand(),
 		*rollback.NewCommand(),
+		*purgeresidue.NewCommand(),
+		*preflight.NewCommand(),
 	}
 
 	//sort.Sort(cli.CommandsByName(app.Commands))

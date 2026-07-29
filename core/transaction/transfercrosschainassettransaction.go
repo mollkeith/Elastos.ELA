@@ -152,7 +152,36 @@ func (t *TransferCrossChainAssetTransaction) checkTransferCrossChainAssetTransac
 				return errors.New("invalid cross chain output payload")
 			}
 
-			if output.Value < t.parameters.Config.MinCrossChainTxFee+p.TargetAmount {
+			// Two separate defects live on this line, and both are gated so that
+			// retained history validates byte-identically.
+			//
+			// 1. TargetAmount was unbounded above. A cross-chain redemption is
+			//    honored by the side chain and is not undone by a main-chain
+			//    rollback, so an over-large amount is an irreversible over-mint.
+			// 2. `MinCrossChainTxFee + p.TargetAmount` is an unchecked int64
+			//    addition. On mainnet, blocks 2,208,257 and 2,208,265 (2026-05-08)
+			//    each declared TargetAmount = int64max - 9999, which plus the 10000
+			//    fee is exactly 2^63 and wraps negative, so the comparison became
+			//    `199980000 < -9223372036854775808` -> false -> accepted.
+			//    92,233,720,368.54765808 ELA declared against 1.9998 ELA locked. The
+			//    9999 offset was chosen for the fee.
+			//
+			// Both blocks are below the forced-rollback target 2,260,450, so they
+			// stay on the canonical chain and must keep validating. Below the gate
+			// the original expression is preserved exactly, wrap and all.
+			if params.BlockHeight >= params.Config.StrictMoneyRangeHeight {
+				if !common.MoneyRange(p.TargetAmount) {
+					return errors.New("cross chain target amount out of money range")
+				}
+				required, err := common.AddFixed64(
+					params.Config.MinCrossChainTxFee, p.TargetAmount)
+				if err != nil {
+					return errors.New("cross chain output amount overflow")
+				}
+				if output.Value < required {
+					return errors.New("invalid cross chain output amount")
+				}
+			} else if output.Value < params.Config.MinCrossChainTxFee+p.TargetAmount {
 				return errors.New("invalid cross chain output amount")
 			}
 

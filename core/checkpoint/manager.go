@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/elastos/Elastos.ELA/common"
@@ -24,7 +25,6 @@ import (
 	"github.com/elastos/Elastos.ELA/utils"
 )
 
-// todo remove this
 const (
 	txpoolCheckpointKey = "cp_txPool"
 	dposCheckpointKey   = "cp_dpos"
@@ -32,6 +32,70 @@ const (
 
 	MaxCheckPointFilesCount int = 36
 )
+
+// registeredCheckpointKeys is the complete set of keys a node registers with a
+// Manager. There are exactly three registration sites and all three are
+// unconditional constructor calls: mempool.NewTxPool (mempool/txpool.go:735)
+// registers cp_txPool, state.NewArbitrators (dpos/state/arbitrators.go:3659)
+// registers cp_dpos and state.NewCommittee (cr/state/committee.go:2176) registers
+// cp_cr. wallet.CoinsCheckPoint ("utxo") and indexers.Checkpoint ("utx") also
+// implement ICheckPoint but nothing ever registers them, so nothing ever restores
+// them either.
+//
+// Why this belongs here rather than in the caller: Restore walks the REGISTERED
+// checkpoints and builds each path from the checkpoint's own Key()
+// (getCheckpointDirectory, below). It never lists the checkpoints directory. So a
+// directory under <dataDir>/checkpoints whose name is not one of these keys is
+// never opened by a start, whatever height its files carry.
+//
+// blockchain.PredictRestoredCheckpointMaxHeight predicts MaxHeight() from that
+// on-disk layout, and it used to hold its own copy of the "cp_txPool" literal and
+// treat every OTHER directory as a real checkpoint. An operator backup named
+// cp_txPool.bak is not equal to "cp_txPool", so the prediction counted it, and the
+// tx-pool snapshot tracks the chain tip. The two sets now read this one table.
+//
+// Registering a new ICheckPoint means adding its key here.
+var registeredCheckpointKeys = map[string]struct{}{
+	crCheckpointKey:     {},
+	dposCheckpointKey:   {},
+	txpoolCheckpointKey: {},
+}
+
+// IsRegisteredCheckpointKey reports whether key names a checkpoint a node actually
+// registers, and therefore whether a directory of that name under the checkpoints
+// root is one a start will read.
+func IsRegisteredCheckpointKey(key string) bool {
+	_, ok := registeredCheckpointKeys[key]
+	return ok
+}
+
+// RegisteredCheckpointKeys returns the registered keys in sorted order.
+func RegisteredCheckpointKeys() []string {
+	keys := make([]string, 0, len(registeredCheckpointKeys))
+	for k := range registeredCheckpointKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// excludedFromMaxHeight is MaxHeight's skip rule, stated once. The tx-pool
+// checkpoint follows the chain tip rather than settled derived state, so it is
+// never a baseline for anything.
+func excludedFromMaxHeight(key string) bool {
+	return key == txpoolCheckpointKey
+}
+
+// CountedInMaxHeight reports whether a checkpoint DIRECTORY named key contributes to
+// MaxHeight(). It is the conjunction of the two facts that loop depends on: a
+// checkpoint has to be registered to be in m.checkpoints at all, and it must not be
+// the one key the loop skips.
+//
+// MaxHeight itself deliberately does not consult registeredCheckpointKeys -- see the
+// comment on the loop.
+func CountedInMaxHeight(key string) bool {
+	return IsRegisteredCheckpointKey(key) && !excludedFromMaxHeight(key)
+}
 
 type Priority byte
 type RollBackStatus byte
@@ -226,18 +290,30 @@ func (m *Manager) Restore() (err error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
+	var failures []string
 	sortedPoints := m.getOrderedCheckpoints()
 	for _, v := range sortedPoints {
 		// fixme: Skip 'dpos' and 'cr' checkpoint temporary
 		//if v.Key() == "dpos" || v.Key() == "cr" {
 		//	continue
 		//}
-		if err = m.loadDefaultCheckpoint(v); err != nil {
+		// A failed load must not be erased by a later successful one. Putting the
+		// failure in the named return lets the next iteration's success overwrite it
+		// with nil, so a manager that restored only some of its checkpoints reports
+		// success. Keep loading the remaining checkpoints, since a missing default
+		// file is normal on a fresh node and the others must still come up, but
+		// report every failure to the caller.
+		if e := m.loadDefaultCheckpoint(v); e != nil {
+			failures = append(failures, fmt.Sprintf("%s: %s", v.Key(), e.Error()))
 			continue
 		}
 		v.OnInit()
 	}
-	return
+	if len(failures) != 0 {
+		return errors.New("checkpoint restore incomplete -> " +
+			strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // RestoreTo will load all data of specific height in each checkpoints file and store in
@@ -271,7 +347,7 @@ func (m *Manager) SafeHeight() uint32 {
 
 	height := uint32(math.MaxUint32)
 	for _, v := range m.checkpoints {
-		if v.Key() == "cp_txPool" {
+		if v.Key() == txpoolCheckpointKey {
 			continue
 		}
 		var recordHeight uint32
@@ -287,6 +363,92 @@ func (m *Manager) SafeHeight() uint32 {
 		}
 	}
 	return height
+}
+
+// MaxHeight returns the highest embedded checkpoint height across the consensus
+// checkpoints (skipping cp_txPool). After InitCheckpoint's init replay this equals
+// the highest RESTORED snapshot-file height, because init replay advances state but
+// skips SetHeight. A forced rollback uses this to verify no restored snapshot sits
+// at or above the rewound target -- the case a min-based SafeHeight cannot detect.
+//
+// The skip rule is excludedFromMaxHeight so that this loop and
+// CountedInMaxHeight, which blockchain.PredictRestoredCheckpointMaxHeight uses to
+// predict this number from the on-disk layout, cannot disagree about it.
+func (m *Manager) MaxHeight() uint32 {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	var height uint32
+	for _, v := range m.checkpoints {
+		// Not CountedInMaxHeight: everything in m.checkpoints is registered by
+		// definition, and filtering on registeredCheckpointKeys here would make a
+		// checkpoint added later but not listed there drop OUT of this gate. That
+		// is the unsafe direction -- it would let a node start on derived state
+		// this was supposed to refuse. Counting whatever is registered is the
+		// fail-safe reading and it is what shipped.
+		if excludedFromMaxHeight(v.Key()) {
+			continue
+		}
+		if v.GetHeight() > height {
+			height = v.GetHeight()
+		}
+	}
+	return height
+}
+
+// DiscardStaleCheckpoints throws away every checkpoint whose height is ABOVE
+// bestHeight and rebuilds it from the genesis defaults, so the caller's replay can
+// derive it again from the retained chain.
+//
+// A checkpoint's Height is never lowered. Manager.OnRollbackTo forwards to each
+// ICheckPoint.OnRollbackTo and never calls SetHeight; no OnReset implementation
+// zeroes it either (dpos/state and cr/state rebuild through
+// initFromArbitrators/initFromCommittee, neither of which touches Height); and
+// loadCheckpointFile writes the file's height straight into the live object. So
+// after reorganizeChain's deep-reset branch restores a default snapshot that was
+// written on an abandoned branch, the live checkpoint can carry a height above the
+// post-detach best height. onBlockSaved then skips every block with
+// `block.Height <= v.GetHeight()`, which makes both the InitCheckpoint replay and
+// the subsequent attach loop complete no-ops for that checkpoint: derived DPoS and
+// CR state freezes at the abandoned-branch snapshot while the UTXO and block store
+// follow the canonical chain, and stays frozen until the new chain climbs back
+// above the restored height. That is a durable local consensus divergence,
+// recoverable only by a full resync.
+//
+// Conditioning on `GetHeight() > bestHeight` is deliberate: an unconditional
+// SetHeight(0) would force a replay from StartHeight (about 2M blocks on mainnet,
+// hours, under the chain lock) on every deep reorg. This pays that cost only for a
+// checkpoint that is provably ahead of the chain it is supposed to describe.
+//
+// No height gate: the only caller is the reorg deep-reset path; linear replay of
+// retained history never reaches it, so historical derivation is unchanged.
+func (m *Manager) DiscardStaleCheckpoints(bestHeight uint32) error {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	var failures []string
+	for _, v := range m.getOrderedCheckpoints() {
+		staleHeight := v.GetHeight()
+		if staleHeight <= bestHeight {
+			continue
+		}
+		log.Warnf("checkpoint %s restored at height %d is ABOVE the best height %d "+
+			"(abandoned-branch snapshot); discarding it and rebuilding from height %d",
+			v.Key(), staleHeight, bestHeight, v.StartHeight())
+		if err := v.OnReset(); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %s", v.Key(), err.Error()))
+			continue
+		}
+		// After the reset the checkpoint describes the genesis baseline, so its height
+		// must say so -- otherwise onBlockSaved keeps skipping the very blocks that
+		// would rebuild it.
+		v.SetHeight(0)
+	}
+	if len(failures) != 0 {
+		return errors.New("discarding stale checkpoints failed -> " +
+			strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // Close will clean all related resources.
@@ -391,24 +553,41 @@ func (m *Manager) findHistoryCheckpoint(current ICheckPoint,
 
 func (m *Manager) loadDefaultCheckpoint(current ICheckPoint) (err error) {
 	path := getDefaultPath(m.cfg.CheckPointConfiguration.DataPath, current)
-	data, err := m.readFileBuffer(path)
-	if err != nil {
-		return err
-	}
-	buf := new(bytes.Buffer)
-	buf.Write(data)
-	return current.Deserialize(buf)
+	return m.loadCheckpointFile(current, path)
 }
 
 func (m *Manager) loadSpecificHeightCheckpoint(current ICheckPoint, height int) (err error) {
 	path := getSpecificHeightPath(m.cfg.CheckPointConfiguration.DataPath, current, height)
+	return m.loadCheckpointFile(current, path)
+}
+
+// loadCheckpointFile deserializes a checkpoint file into the LIVE checkpoint
+// object registered with the manager.
+//
+// ICheckPoint.Deserialize writes straight into that live object, so a truncated
+// or corrupt file leaves it half-populated, and because Height is the first field
+// every implementation reads, it leaves the live checkpoint carrying the height of
+// a state it does not actually hold. Restore() then skips OnInit(), so the
+// consensus state is never recovered, while SafeHeight() keeps reporting the
+// height read out of the bad file; InitCheckpoint's replay therefore starts above
+// the blocks that would have rebuilt the state and the node runs at full block
+// height with empty CR and DPoS state. Putting the pre-load height back on failure
+// returns the checkpoint to the full-replay path, which is the correct recovery.
+// Nothing changes on the success path.
+func (m *Manager) loadCheckpointFile(current ICheckPoint, path string) (err error) {
 	data, err := m.readFileBuffer(path)
 	if err != nil {
 		return err
 	}
 	buf := new(bytes.Buffer)
 	buf.Write(data)
-	return current.Deserialize(buf)
+
+	heightBefore := current.GetHeight()
+	if err = current.Deserialize(buf); err != nil {
+		current.SetHeight(heightBefore)
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) readFileBuffer(path string) (buf []byte, err error) {

@@ -137,6 +137,27 @@ func Subscribe(callback EventCallback) {
 
 // Notify sends a notification with the passed type and data if the caller
 // requested notifications by providing a callback function in the call to New.
+//
+// LOCK-ORDER INVARIANT (G1). Notify runs EVERY registered callback inline while
+// holding events.mtx, so events.mtx is effectively a process-wide dispatch lock.
+// Two rules follow, and breaking either one deadlocks the whole node:
+//
+//  1. A subscriber must never block on a lock that a Notify caller can hold.
+//     Concretely it must not acquire Arbiters.specialTxMtx, Arbiters.mtx,
+//     State.mtx, checkpoint.Manager.mtx, Committee.mtx or BlockChain.mutex; if it
+//     needs any of those, it must hand the work to its own goroutine, as
+//     dpos/arbitrator.go handleEvent does on every arm that can reach one.
+//  2. A publisher that must hold a state lock across the publish has to publish
+//     asynchronously ("go events.Notify(...)"), which is what dpos/state and
+//     mempool do, or release the lock first, which is what cr/state/committee.go
+//     does before it notifies ETCRCChangeCommittee.
+//
+// Two publishers legitimately hold Arbiters.specialTxMtx across a synchronous
+// Notify -- blockchain.saveBlockCheckpoints and blockchain.replayCheckpointBlock,
+// through checkpoint.Manager.OnBlockSaved -> cr/state Checkpoint.OnBlockSaved ->
+// Committee.ProcessBlock -- because the N-001/R2 special-tx bracket has to stay
+// atomic across exactly that mutation. They are safe only because rule 1 holds on
+// the subscriber side.
 func Notify(typ EventType, data interface{}) {
 	// Detect recursive notifies to prevent deadlock.
 	mutex.Lock()

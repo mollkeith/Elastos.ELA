@@ -669,6 +669,18 @@ func TestSchnorr(t *testing.T) {
 
 }
 
+// DEAD SIBLING. DO NOT MISTAKE THIS FOR PRODUCTION CODE.
+//
+// This is a test-local copy of blockchain.checkSchnorrSignatures frozen at the
+// released c61c9e61 shape: no Parameter length check and no height gate. It is
+// reachable only from TestSchnorr above, which feeds it a well-formed 64-byte
+// Parameter it just built, so it is left alone deliberately.
+//
+// It proves NOTHING about the production function. That one lives in
+// blockchain/validation.go and now takes (blockHeight, strictMoneyHeight) so the
+// F-050 over-long-Parameter rejection can be gated at StrictMoneyRangeHeight
+// while the short-Parameter rejection stays ungated. If you are changing the
+// Schnorr length rules, change validation.go. A patch applied here is a no-op.
 func checkSchnorrSignatures(program program.Program, data [32]byte) (bool, error) {
 	publicKey := [33]byte{}
 	copy(publicKey[:], program.Code[2:])

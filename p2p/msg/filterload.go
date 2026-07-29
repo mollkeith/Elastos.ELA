@@ -100,6 +100,14 @@ func (msg *FilterLoad) Deserialize(r io.Reader) error {
 		return common.FuncError("FilterLoad.Deserialize", str)
 	}
 
+	// F-034: an empty filter with a nonzero hash-func count is malformed and
+	// would cause a modulo-by-zero panic on the match path (len(Filter)<<3 == 0).
+	// Reject it so the peer is disconnected rather than crashing the node.
+	if len(msg.Filter) == 0 && msg.HashFuncs > 0 {
+		str := "empty filter with nonzero hash functions"
+		return common.FuncError("FilterLoad.Deserialize", str)
+	}
+
 	// deserialize flags
 	err = common.ReadElements(r, &msg.Flags)
 	if err != nil {
@@ -119,7 +127,12 @@ func (msg *FilterLoad) Deserialize(r io.Reader) error {
 		var txType byte
 		err = common.ReadElement(r, &txType)
 		if err != nil {
-			return nil
+			// F-184: this returned nil, so a peer that declared N tx types and
+			// then truncated the list got a silently shortened filter installed
+			// instead of a decode failure. The io.EOF tolerance above is the
+			// intended back-compat for peers that omit the TxTypes field
+			// entirely; a short read mid-list is simply malformed.
+			return err
 		}
 		msg.TxTypes = append(msg.TxTypes, common2.TxType(txType))
 	}

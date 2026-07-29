@@ -80,6 +80,15 @@ type IFFLDBChainStore interface {
 	// return true.
 	IsBlockInStore(hash *Uint256) bool
 
+	// EvictBlockCache drops a hash from the in-RAM block LRU so a block whose
+	// raw-store entry was purged is not still served from cache in-process.
+	EvictBlockCache(hash Uint256)
+
+	// DeleteBlockFromStore purges a block's raw-store location entry (ffldb-blockidx)
+	// and evicts it from the RAM cache, so it is no longer fetchable/serveable by
+	// hash. Used by the offline forced-rollback residue cleaner.
+	DeleteBlockFromStore(hash Uint256) error
+
 	// Get a transaction by transaction hash.
 	GetTransaction(txID Uint256) (interfaces.Transaction, uint32, error)
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 The Elastos Foundation
+// Copyright (c) 2017-2020 The Elastos DAO
 // Use of this source code is governed by an MIT
 // license that can be found in the LICENSE file.
 //
@@ -43,6 +43,7 @@ import (
 	"github.com/elastos/Elastos.ELA/utils"
 	"github.com/elastos/Elastos.ELA/utils/elalog"
 	"github.com/elastos/Elastos.ELA/utils/signal"
+	"github.com/elastos/Elastos.ELA/utils/version"
 )
 
 const (
@@ -60,8 +61,15 @@ const (
 )
 
 var (
-	// Version generated when build program.
-	Version string
+	// Version is the node version reported by `ela --version`, the startup
+	// banner, the P2P user agent (nodePrefix+Version) and the RPC "compile"
+	// field. The authoritative value is the compiled-in constant in
+	// utils/version, so a binary built from an exported tarball reports the
+	// same version as one built from the repository and the release build is
+	// not a function of the builder's git metadata. The Makefile's `dev`
+	// target still overrides it with -ldflags -X main.Version=<branch>-<sha>
+	// so a development build is self-identifying.
+	Version = version.Version
 
 	// GoVersion version at build.
 	GoVersion string
@@ -75,7 +83,7 @@ func main() {
 	// Setting config
 	setting := settings.NewSettings()
 	config := setting.SetupConfig(true, "Copyright (c) 2017-"+
-		fmt.Sprint(time.Now().Year())+" The Elastos Foundation", nodePrefix+Version+" "+GoVersion)
+		fmt.Sprint(time.Now().Year())+" The Elastos DAO", nodePrefix+Version+" "+GoVersion)
 
 	// Use all processor cores.
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -169,6 +177,145 @@ func startNode(cfg *config.Configuration) {
 	if err != nil {
 		printErrorAndExit(err)
 	}
+	// BEFORE anything else, and on every boot regardless of configuration: refuse to
+	// start a node whose store still records a forced rollback as started-and-
+	// unfinished while this node is not configured to finish it. Every other check
+	// below is gated on the trigger being set, which is precisely what an operator
+	// removes after reading the completion line -- and if the process died inside the
+	// ffldb flush window, that line described a rewind that had not reached disk.
+	// Disarming there used to bring the node back up on the pre-rollback chain,
+	// serving the discarded blocks, silently. The marker outlives that crash by
+	// construction (it is flushed before the first destructive step), so this check
+	// sees it.
+	if e := chain.CheckAbandonedForcedRollback(); e != nil {
+		printErrorAndExit(e)
+	}
+	// Forced rollback runs BEFORE chain.Init so that checkpoint restoration and
+	// derived-state rebuild happen against the already-rewound chain rather than
+	// against state from a height that no longer exists. blockchain.New has
+	// populated chain.Nodes by this point, which is all the rewind needs.
+	//
+	// This replaces the manual `ela-cli rollback` step: operators update the
+	// binary and restart, nothing else. The rollback is armed only when this node
+	// actually holds the targeted block, so it is idempotent and a no-op for
+	// fresh nodes.
+	//
+	// ARMED IS NOT APPLIED. The variable below says only "this node holds the chain
+	// the rollback targets". It is deliberately no longer used as a stand-in for
+	// "the rollback happened": that conflation is what made 48/48 rehearsal nodes
+	// decline a capacity-exceeded rewind here and then refuse to start further down,
+	// and -- in the silent variant, when the restored checkpoint happens to land
+	// below the target -- what let a node come up UN-ROLLED-BACK on the exploit
+	// chain. Whether the rollback was applied is established below by
+	// VerifyForcedRollbackApplied, against the persisted store.
+	forcedRollbackArmed, e := chain.ForcedRollbackArmed()
+	if e != nil {
+		printErrorAndExit(e)
+	}
+	if cfg.ForcedRollbackTrigger != "" && chain.GetHeight() > cfg.ForcedRollbackHeight {
+		// Loud diagnostic: a mis-encoded (e.g. reversed/explorer byte order)
+		// trigger silently disarms the rollback and leaves the node on the
+		// corrupt chain. Print configured vs actual so operators can catch it.
+		if actual, herr := chain.GetBlockHash(cfg.ForcedRollbackHeight + 1); herr == nil {
+			log.Operatorf("forced rollback trigger check: configured=%s actual(block %d)=%s armed=%v",
+				cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight+1, actual.ReversedString(), forcedRollbackArmed)
+		}
+	}
+	forcedRollbackApplied := false
+	if forcedRollbackArmed {
+		log.Operatorf("FORCED ROLLBACK: ARMED -- this node holds block %s at height %d, "+
+			"which is the block the recovery removes, so it is about to rewind to %d. "+
+			"This is expected on the coordinated restart. AFTER the restart it means "+
+			"this data directory was rolled back to a state that still contains that "+
+			"block -- almost always a restored pre-rollback backup or an old copy of "+
+			"the data directory -- and rewinding it again is correct.",
+			cfg.ForcedRollbackTrigger, cfg.ForcedRollbackHeight+1,
+			cfg.ForcedRollbackHeight)
+		// PRE-FLIGHT (B5). The armed path used to go straight into the rewind, so a
+		// store already damaged by an earlier interrupted rollback was discovered
+		// mid-rewind. MEASURED: it aborts on an internal transaction-index assertion
+		// that names two raw hashes, carries no sentinel and offers no remedy --
+		// "fails closed but opaquely", at the point in restart day where that costs
+		// the most. The scan runs BEFORE anything destructive, classifies the damage
+		// and names a remedy for it.
+		if e := chain.PreflightForcedRollback(); e != nil {
+			printErrorAndExit(e)
+		}
+		if e := chain.ForceRollback(interrupt.C); e != nil {
+			// EVERY failure is fatal, including ErrForcedRollbackExceedsCapacity.
+			// That sentinel used to be swallowed here so a late upgrader was not
+			// bricked into a boot loop -- but "not bricked" meant booting on the
+			// EXPLOIT chain, which is strictly worse: such a node joins the recovered
+			// network on the removed chain and, holding an on-duty arbiter seat,
+			// stalls it (rehearsal finding 3). A node that cannot complete the
+			// rollback must not join the recovered network. The remedies are in the
+			// error text and are operator-actionable; refusing to start is the loud,
+			// unambiguous outcome.
+			//
+			// ErrForcedRollbackInterrupted is fatal for a different reason: it is NOT
+			// a corruption report. The rewind stops at a block boundary and continues
+			// on the next start, because a block's header-index row -- the row
+			// b.Nodes is rebuilt from, and therefore the row both the arming predicate
+			// and the rewind bound depend on -- is now deleted only after all of that
+			// block's destructive work is durably committed.
+			printErrorAndExit(e)
+		}
+		// Purge the mempool checkpoint written from ABOVE the rollback target.
+		//
+		// MEASURED on a real mainnet node (2026-07-28, tip 2,260,595 -> 2,260,450):
+		// cp_txPool/2260595.txpcp SURVIVES the rewind. Nothing in ForceRollback
+		// removes it, and both forced-rollback baseline gates skip cp_txPool BY NAME
+		// (blockchain/preflightcheckpoint.go, core/checkpoint/manager.go) because
+		// Manager.MaxHeight excludes it -- so no existing check can see it either.
+		//
+		// Why it matters: cp_txPool has SavePeriod == EffectivePeriod == 1, so it is
+		// rewritten every block and on a frozen node it describes the mempool from
+		// INSIDE the discarded range. txPoolCheckpoint.Deserialize calls
+		// txPool.appendToTxPool -- the same function the live pool uses -- so it
+		// restores straight into the LIVE pool, and pow.GenerateBlock then assembles
+		// the first block of the recovered chain from exactly that pool.
+		// Per-transaction re-validation does run, gate 1 included, so a harmful entry
+		// is unlikely to survive; this removes the question rather than reasoning
+		// about it.
+		//
+		// On the node measured the file was 14 bytes (an EMPTY pool), so this is a
+		// hygiene fix rather than a live hazard -- but a node halted mid-activity
+		// carries a populated one, and the runbook must not depend on operators
+		// deleting a file by hand.
+		if e := blockchain.PurgeTxPoolCheckpointAboveTarget(
+			filepath.Join(dataDir, checkpointPath), cfg.ForcedRollbackHeight); e != nil {
+			printErrorAndExit(e)
+		}
+		forcedRollbackApplied = true
+	} else if cfg.ForcedRollbackTrigger != "" && cfg.ForcedRollbackHeight != 0 &&
+		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight {
+		// The boot a RATCHETED node comes up on. Under the shipped ordering each
+		// interrupted rewind destroyed one block-header-index row before its rollback
+		// transaction committed, so after (tip-target) restarts the arming predicate
+		// went false at exactly the target while every discarded block -- including
+		// block 2,260,451 -- was still main-chain indexed, still in the raw store and
+		// still served by hash, with none of its UTXO/derived-state rollback applied.
+		// Neither shipped safety net could see it: the height assertion was
+		// tautological and the checkpoint assertion was guarded by the armed flag,
+		// which is false on precisely this boot.
+		if e := chain.CheckForcedRollbackResidue(); e != nil {
+			printErrorAndExit(e)
+		}
+	}
+	// THE post-condition, and it runs on EVERY boot of a configured node -- armed or
+	// not, rewound in this process or in an earlier one. The check it replaces
+	// compared chain.GetHeight() against the target; GetHeight() is len(b.Nodes)-1
+	// and the rewind loop's exit condition is exactly len(b.Nodes)-1 <= target, so it
+	// restated the loop and could not fail for any store contents whatsoever. This
+	// one asserts BYTES ON DISK: the targeted block must be absent from the
+	// main-chain index, the block-header index and the raw block store. It is three
+	// point lookups on the common path, and it is the check that makes it impossible
+	// for a configured node to reach the network above the target still holding the
+	// block the recovery removes.
+	if e := chain.VerifyForcedRollbackApplied(); e != nil {
+		printErrorAndExit(e)
+	}
+
 	if err = chain.Init(interrupt.C); err != nil {
 		printErrorAndExit(err)
 	}
@@ -177,6 +324,45 @@ func startNode(cfg *config.Configuration) {
 		printErrorAndExit(err)
 	}
 	pgBar.Stop()
+
+	// OPEN-1: refuse here, BEFORE arbitrator.Start() puts this node on the DPoS
+	// gossip mesh.
+	//
+	// The authoritative baseline check lives after InitCheckpoint and uses the real
+	// restored CkpManager.MaxHeight(). But arbitrator.Start() runs BEFORE that, so a
+	// node whose snapshot is not strictly pre-target would join the mesh with
+	// exploit-era derived state, gossip on it, and only then exit. Reordering
+	// arbitrator.Start() past InitCheckpoint deadlocks the boot: InitCheckpoint
+	// publishes ETDirectPeersChanged synchronously, Arbitrator.handleEvent handles
+	// that arm synchronously by documented invariant, and server.ConnectPeers blocks
+	// on an unbuffered reply channel only peerHandler writes -- the node would hang
+	// holding the process-wide event mutex. So this is an ADDITIONAL early gate, not
+	// a reordering: nothing about the event machinery changes.
+	//
+	// The height comes from each checkpoint file's own header (Height is the FIRST
+	// serialised field of every consensus checkpoint), so no restore is needed and
+	// no chain state is touched. That value is an UPPER BOUND on what MaxHeight()
+	// will report, because a file that fails to restore is skipped later but counted
+	// here. The asymmetry is deliberate and is the safe direction: refusing a node
+	// that would have been fine costs a stopped node an operator can investigate,
+	// while admitting one costs a mesh member running exploit-era state.
+	//
+	// Scoped to the forced-rollback case only: a node with no rollback configured
+	// never evaluates this.
+	if cfg.ForcedRollbackTrigger != "" &&
+		cfg.ForcedRollbackHeight != 0 &&
+		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight &&
+		chain.GetHeight() <= cfg.ForcedRollbackHeight {
+		if mh, detail := blockchain.PredictRestoredCheckpointMaxHeight(dataDir); mh >= cfg.ForcedRollbackHeight {
+			printErrorAndExit(fmt.Errorf(
+				"forced rollback: checkpoint on disk carries height %d, which is >= the rewound "+
+					"target %d, so the derived state it would restore is not strictly pre-target "+
+					"and may be exploit-era. Refusing to start BEFORE joining the DPoS network. "+
+					"Checkpoints read: %v. Remove or replace the offending checkpoint, or restore "+
+					"a pre-target backup, then start again",
+				mh, cfg.ForcedRollbackHeight, detail))
+		}
+	}
 
 	ledger.Blockchain = chain // fixme
 	blockMemPool.Chain = chain
@@ -288,6 +474,45 @@ func startNode(cfg *config.Configuration) {
 	}
 	pgBar.Stop()
 
+	// Safety net for the forced rollback. InitCheckpoint restored the checkpoint
+	// snapshots and replayed derived state forward to the rewound tip. init replay
+	// skips SetHeight, so each checkpoint's GetHeight() still equals its RESTORED
+	// file height here. The load-bearing property is that every restored snapshot is
+	// STRICTLY BELOW the rewound target -- only then is the baseline provably
+	// pre-exploit. MaxHeight() checks the highest restored height directly (SafeHeight
+	// is a min-of-(GetHeight-720) and could not detect a single tampered snapshot
+	// sitting at/above the target). If any restored snapshot is at/above the target,
+	// derived state may carry exploit-era arbiters: refuse to start.
+	//
+	// NOTE: this asserts the replay BASELINE, not the rebuilt CONTENT. A byte-level
+	// comparison of the derived arbiter/CR set at the target against a freshly-synced
+	// reference is the definitive check and is gated on the testnet reproduction.
+	//
+	// The condition is deliberately NOT the ARMED flag. Armed means only that this
+	// node held the targeted chain when it booted; on the capacity-declined path it
+	// was true while the node sat, un-rewound, thousands of blocks ABOVE the target,
+	// where this assertion is not merely useless but actively misleading -- it fires
+	// on the exploit-era checkpoint of a node whose real defect is that it never
+	// rolled back. The first disjunct is now the APPLIED fact (the rewind ran in this
+	// process and the persisted store was verified), and the second covers the boot
+	// on which an already-rewound node comes up -- the rewind having happened in an
+	// earlier process -- so a snapshot that drifted to/above the target between runs
+	// is still caught.
+	if forcedRollbackApplied || (cfg.ForcedRollbackTrigger != "" &&
+		cfg.ForcedRollbackHeight != 0 &&
+		cfg.ForcedRollbackHeight != config.DisabledForcedRollbackHeight &&
+		chain.GetHeight() <= cfg.ForcedRollbackHeight) {
+		mh := chain.CkpManager.MaxHeight()
+		if mh >= cfg.ForcedRollbackHeight {
+			printErrorAndExit(fmt.Errorf(
+				"forced rollback: a restored checkpoint height %d is >= rewound target %d; the "+
+					"snapshot is not strictly pre-target, derived state may be exploit-era -- "+
+					"refusing to start", mh, cfg.ForcedRollbackHeight))
+		}
+		log.Operatorf("forced rollback: post-rebuild baseline OK (max restored checkpoint %d < target %d, tip %d)",
+			mh, cfg.ForcedRollbackHeight, chain.GetHeight())
+	}
+
 	// todo remove me
 	if chain.GetHeight() > cfg.DPoSV2StartHeight {
 		msg2.SetPayloadVersion(msg2.DPoSV2Version)
@@ -335,8 +560,17 @@ func startNode(cfg *config.Configuration) {
 	<-interrupt.C
 }
 
+// printErrorAndExit is the node's only fatal path, and every forced-rollback refusal
+// leaves through it.
+//
+// MEASURED: log.Error is level-filtered (Logger.Error keeps a record only while
+// l.level <= errorLog), so at PrintLevel 4 or above a node that REFUSED TO START
+// exited 255 having written nothing to stdout, nothing to stderr and nothing to the
+// log file. On restart day that is a node an operator cannot diagnose at all.
+// log.OperatorError writes to stderr, which no print level filters, and records the
+// line unconditionally.
 func printErrorAndExit(err error) {
-	log.Error(err)
+	log.OperatorError(err)
 	os.Exit(-1)
 }
 

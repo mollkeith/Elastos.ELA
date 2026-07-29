@@ -82,14 +82,26 @@ func (l *Ledger) GetLocalBlockChainHeight() uint32 {
 	return l.Blockchain.GetHeight()
 }
 
+// ErrDposBlockRecoveryUnimplemented is returned by the DPoS block-recovery entry
+// points below. Both are unimplemented; returning a nil error instead would tell
+// every caller the recovery had succeeded while nothing at all had happened. The
+// protocol they belong to is inert end to end (the only GetBlocks sender is
+// commented out at dpos/manager/dposmanager.go:816 and
+// DPOSHandlerSwitch.ResponseGetBlocks has a fully commented-out body), so failing
+// loudly changes no live behaviour, it only stops the silent success. Reviving a
+// dormant consensus-recovery path is an owner and core-engineer decision, so the
+// entry points are not implemented here.
+var ErrDposBlockRecoveryUnimplemented = errors.New(
+	"[Ledger] DPoS block recovery is not implemented")
+
 // Get blocks and confirms by given height range, if end equals zero will be treat as current highest block height
 func (l *Ledger) GetDposBlocks(start, end uint32) ([]*DposBlock, error) {
 	//todo complete me
-	return nil, nil
+	return nil, ErrDposBlockRecoveryUnimplemented
 }
 
 // Append blocks and confirms directly
 func (l *Ledger) AppendDposBlocks(confirms []*DposBlock) error {
 	//todo complete me
-	return nil
+	return ErrDposBlockRecoveryUnimplemented
 }

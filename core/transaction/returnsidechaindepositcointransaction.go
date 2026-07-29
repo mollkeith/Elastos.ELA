@@ -130,13 +130,44 @@ func (t *ReturnSideChainDepositCoinTransaction) SpecialContextCheck() (result el
 		if err != nil {
 			return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid deposit tx:"+py.DepositTransactionHash.String())), true
 		}
-		refTx, _, err := t.parameters.BlockChain.GetDB().GetTransaction(tx.Inputs()[0].Previous.TxID)
+		// Fail closed instead of panicking. py.DepositTransactionHash is an
+		// attacker-controlled output-payload field: ReturnSideChainDeposit.Validate
+		// checks only the payload version and a non-empty GenesisBlockAddress, so the
+		// hash may name any transaction in the (unconditionally enabled) tx index,
+		// including ELA's zero-input transaction family. The genesis RegisterAsset
+		// transaction is built with []*common.Input{} (core/manager.go:43-61) and its
+		// hash is the compiled-in constant core.ELAAssetID, so
+		// GetTransaction(core.ELAAssetID) resolves to a zero-input transaction on every
+		// node with no chain lookup at all. Indexing Inputs()[0] then panics at step 10
+		// of ContextCheck, before CheckTransactionFee, checkTransactionSignature and
+		// checkInvalidUTXO, and on the P2P leg (OnTx -> handleTxMsg -> AppendToTxPool)
+		// that panic runs on the bare netsync blockHandler goroutine, which has no
+		// recover(), so it terminates the process. (The JSON-RPC leg survives only
+		// because net/http recovers.)
+		//
+		// Ungated, deliberately: a panic is not an acceptance decision, so converting it
+		// to a rejection is byte-identical for every block the chain has ever accepted.
+		// Any retained transaction that reached these two lines necessarily had an input
+		// and an in-range index, or replaying it would kill the node. Gating behind
+		// StrictMoneyRangeHeight would instead leave the kill live on testnet/regnet
+		// (gate = MaxUint32 there) and on any node syncing below the gate, while the
+		// delivery works at any height >= ReturnCrossChainCoinStartHeight (1032840).
+		// A legitimate ReturnSideChainDepositCoin names a real TransferCrossChainAsset
+		// deposit, which by construction has inputs and an in-range index.
+		if len(tx.Inputs()) == 0 {
+			return elaerr.Simple(elaerr.ErrTxPayload, errors.New("deposit tx has no inputs")), true
+		}
+		prev := tx.Inputs()[0].Previous
+		refTx, _, err := t.parameters.BlockChain.GetDB().GetTransaction(prev.TxID)
 		if err != nil {
 			return elaerr.Simple(elaerr.ErrTxPayload, err), true
 		}
+		if int(prev.Index) >= len(refTx.Outputs()) {
+			return elaerr.Simple(elaerr.ErrTxPayload, errors.New("deposit tx input index out of range")), true
+		}
 
 		// need to return the deposit coin to first input address
-		refOutput := refTx.Outputs()[tx.Inputs()[0].Previous.Index]
+		refOutput := refTx.Outputs()[prev.Index]
 		if o.ProgramHash != refOutput.ProgramHash {
 			return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid output address")), true
 		}

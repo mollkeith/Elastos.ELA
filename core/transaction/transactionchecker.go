@@ -58,6 +58,15 @@ func (t *DefaultChecker) SanityCheck(params interfaces.Parameters) elaerr.ELAErr
 		return elaerr.Simple(elaerr.ErrTxInvalidOutput, err)
 	}
 
+	// Strict monetary validation is height-gated: below StrictMoneyRangeHeight
+	// the historical (wrapping) rules are preserved so existing blocks replay.
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		if err := checkTransactionMoneyRange(t.parameters.Transaction); err != nil {
+			log.Warn("[CheckTransactionMoneyRange],", err)
+			return elaerr.Simple(elaerr.ErrTxInvalidOutput, err)
+		}
+	}
+
 	if err := checkAssetPrecision(t.parameters.Transaction); err != nil {
 		log.Warn("[CheckAssetPrecesion],", err)
 		return elaerr.Simple(elaerr.ErrTxAssetPrecision, err)
@@ -105,6 +114,13 @@ func (t *DefaultChecker) ContextCheck(params interfaces.Parameters) (
 		return nil, elaerr.Simple(elaerr.ErrTxUnknownReferredTx, nil)
 	}
 	t.references = references
+	if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight {
+		if _, err := blockchain.GetTxFeeStrict(t.parameters.Transaction,
+			core.ELAAssetID, references); err != nil {
+			log.Warn("[CheckTransactionAmount],", err)
+			return nil, elaerr.Simple(elaerr.ErrTxBalance, err)
+		}
+	}
 
 	if err := checkTransactionCrossChainUTXO(
 		t.parameters.Transaction,
@@ -173,7 +189,8 @@ func (t *DefaultChecker) ContextCheck(params interfaces.Parameters) (
 		return nil, elaerr.Simple(elaerr.ErrTxInvalidInput, err)
 	}
 
-	if err := checkTransactionSignature(t.parameters.Transaction, references); err != nil {
+	if err := checkTransactionSignature(t.parameters.Transaction, references,
+		t.parameters.BlockHeight, t.parameters.Config.StrictMoneyRangeHeight); err != nil {
 		log.Warn("[checkTransactionSignature],", err)
 		return nil, elaerr.Simple(elaerr.ErrTxSignature, err)
 	}
@@ -596,6 +613,22 @@ func (t *DefaultChecker) checkInvalidUTXO(txn interfaces.Transaction) error {
 			return err
 		}
 		if referTxn.IsCoinBaseTx() {
+			// Defence in depth: the maturity window is computed on uint32, so a
+			// coinbase whose LockTime is above the spending height underflows to ~4e9 and
+			// reads as mature. Treat that as not mature instead of letting it wrap.
+			//
+			// Gated at StrictMoneyRangeHeight rather than shipped ungated: no retained coinbase
+			// in the 2,260,597-block chain has a LockTime differing from its own block height,
+			// so no retained spend can reach this branch and the two forms are
+			// indistinguishable over retained history, but this is an acceptance decision, and
+			// acceptance-changing behaviour sits behind gate 1. It reuses gate 1, the same gate
+			// as the relocated pin (blockchain.checkCoinbaseLockTimePin), so no third gate is
+			// introduced and below-gate replay is byte-identical by construction rather than by
+			// measurement. Unreachable once that pin is live.
+			if t.parameters.BlockHeight >= t.parameters.Config.StrictMoneyRangeHeight &&
+				referTxn.LockTime() > currentHeight {
+				return errors.New("the utxo of coinbase is locking")
+			}
 			if currentHeight-referTxn.LockTime() < t.parameters.Config.PowConfiguration.CoinbaseMaturity {
 				return errors.New("the utxo of coinbase is locking")
 			}
@@ -607,7 +640,8 @@ func (t *DefaultChecker) checkInvalidUTXO(txn interfaces.Transaction) error {
 	return nil
 }
 
-func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output) error {
+func checkTransactionSignature(tx interfaces.Transaction, references map[*common2.Input]common2.Output,
+	blockHeight, strictMoneyHeight uint32) error {
 	programHashes, err := blockchain.GetTxProgramHashes(tx, references)
 	if (tx.IsCRCProposalWithdrawTx() && tx.PayloadVersion() == payload.CRCProposalWithdrawDefault) ||
 		tx.IsCRAssetsRectifyTx() || tx.IsCRCProposalRealWithdrawTx() || tx.IsNextTurnDPOSInfoTx() ||
@@ -625,7 +659,7 @@ func checkTransactionSignature(tx interfaces.Transaction, references map[*common
 	// sort the program hashes of owner and programs of the transaction
 	common.SortProgramHashByCodeHash(programHashes)
 	blockchain.SortPrograms(tx.Programs())
-	return blockchain.RunPrograms(buf.Bytes(), programHashes, tx.Programs())
+	return blockchain.RunPrograms(buf.Bytes(), programHashes, tx.Programs(), blockHeight, strictMoneyHeight)
 }
 
 func checkTransactionDepositOutputs(bc *blockchain.BlockChain, txn interfaces.Transaction) error {
@@ -729,6 +763,30 @@ func checkDestructionAddress(references map[*common2.Input]common2.Output) error
 // checkFrozenAddresses freezes configured addresses after each entry's
 // DisableStartHeight: no spends from them and no sends to them. Historical
 // transactions before each start height remain syncable.
+// checkTransactionMoneyRange rejects any individual output amount, and any
+// running aggregate of output amounts, that falls outside the permitted money
+// range. The aggregate bound is what stops the signed 64-bit output-sum wrap
+// exploited in block 2260451: each crafted output fit int64 individually while
+// their sum did not.
+func checkTransactionMoneyRange(txn interfaces.Transaction) error {
+	var total common.Fixed64
+	for _, output := range txn.Outputs() {
+		if !common.MoneyRange(output.Value) {
+			return fmt.Errorf("transaction output amount: %w", common.ErrMoneyRange)
+		}
+		var err error
+		total, err = common.AddFixed64(total, output.Value)
+		if err != nil {
+			return fmt.Errorf("transaction output total: %w", err)
+		}
+		if !common.MoneyRange(total) {
+			return fmt.Errorf("transaction output total: %w", common.ErrMoneyRange)
+		}
+	}
+
+	return nil
+}
+
 func checkFrozenAddresses(txn interfaces.Transaction,
 	references map[*common2.Input]common2.Output, blockHeight uint32,
 	frozenAddresses []config.FrozenAddress) error {
@@ -753,12 +811,39 @@ func checkFrozenAddresses(txn interfaces.Transaction,
 	return nil
 }
 
-// tx interfaces.Transaction,
+// CheckTransactionFee gates the minimum fee and stores the fee on the transaction.
+//
+// Both used to come from getTransactionFee (core/transaction/crcproposalwithdraw.go),
+// an asset-blind aggregate: it sums every input Value and every output Value with no
+// regard to AssetID, while ContextCheck computed the authoritative per-asset
+// blockchain.GetTxFeeStrict(ELAAssetID) result two steps earlier and threw it away
+// (`if _, err := ...`). Two different fee numbers were therefore live for the same
+// transaction. The stored one is the damaging one: txn.SetFee is what
+// interfaces.Transaction.Fee() returns, and dpos/state/arbitrators.go getBlockDPOSReward
+// sums exactly that into a.accumulativeReward -> distributeDPOSReward -> arbitersRoundReward,
+// the pool that becomes claimable, spendable ELA. A non-ELA input therefore raised the
+// arbiter reward without any ELA backing it. The block-validation site (checkTxsContext)
+// carries the matching correction; this is its transaction-level twin.
+//
+// At and above StrictMoneyRangeHeight the minimum-fee gate and the stored fee both use
+// the same authoritative GetTxFeeStrict(ELAAssetID) value that block validation uses. Below
+// the gate the original asset-blind expression is preserved exactly, so retained history
+// replays unchanged.
+//
+// Note the ordering dependency with the per-asset output non-negativity rule: the
+// asset-blind aggregate was, by accident, the only bound on how much foreign-asset value
+// a transaction could emit (a large fabricated output made the aggregate fee negative and
+// tripped the minimum-fee gate). Switching this gate to the ELA-only fee without that
+// per-asset rule would remove that accidental bound. The two changes must ship together.
 func (t *DefaultChecker) CheckTransactionFee(references map[*common2.Input]common2.Output) error {
 	log.Debug("DefaultChecker checkTransactionFee begin")
 	txn := t.parameters.Transaction
-	//blockHeight := t.parameters.BlockHeight
-	fee := getTransactionFee(txn, references)
+	fee, err := t.authoritativeFee(references)
+	if err != nil {
+		log.Warn("[CheckTransactionFee],", err)
+
+		return err
+	}
 	if t.isSmallThanMinTransactionFee(fee) {
 		log.Debug("DefaultChecker checkTransactionFee fee too small end")
 
@@ -772,6 +857,19 @@ func (t *DefaultChecker) CheckTransactionFee(references map[*common2.Input]commo
 	log.Debug("DefaultChecker checkTransactionFee end")
 
 	return nil
+}
+
+// authoritativeFee returns the fee for this transaction: the strict, per-asset,
+// ELA-only result at and above StrictMoneyRangeHeight, and the legacy asset-blind
+// aggregate below it. See CheckTransactionFee.
+func (t *DefaultChecker) authoritativeFee(
+	references map[*common2.Input]common2.Output) (common.Fixed64, error) {
+	if t.parameters.BlockHeight < t.parameters.Config.StrictMoneyRangeHeight {
+		return getTransactionFee(t.parameters.Transaction, references), nil
+	}
+
+	return blockchain.GetTxFeeStrict(t.parameters.Transaction,
+		core.ELAAssetID, references)
 }
 
 func checkOutputProgramHash(height uint32, programHash common.Uint168) error {

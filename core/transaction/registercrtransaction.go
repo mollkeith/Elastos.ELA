@@ -12,6 +12,7 @@ import (
 	"github.com/elastos/Elastos.ELA/blockchain"
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/core/contract"
+	"github.com/elastos/Elastos.ELA/core/contract/program"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	crstate "github.com/elastos/Elastos.ELA/cr/state"
 	elaerr "github.com/elastos/Elastos.ELA/errors"
@@ -111,6 +112,23 @@ func (t *RegisterCRTransaction) SpecialContextCheck() (elaerr.ELAError, bool) {
 	ct, err := contract.CreateCRIDContractByCode(code)
 	if err != nil {
 		return elaerr.Simple(elaerr.ErrTxPayload, err), true
+	}
+	// info.Code is a payload field, so it is not covered by the program code size
+	// check; the slices below (code[len(code)-1], code[1:len(code)-1], code[2:]) need
+	// at least MinProgramCodeSize bytes and panic on a short-but-nonzero code, for
+	// example a 1-byte [0xAC] with a CID crafted to match it. (len==0 is already
+	// caught above by CreateCRIDContractByCode's "code is nil".)
+	//
+	// This runs inside SpecialContextCheck, before signature verification, so a short
+	// code is reachable without authentication in any CR voting period. That is why
+	// the guard is ungated: it must hold on every net and at every height.
+	//
+	// Ungating it is safe against retained history because a legitimate CR code is a
+	// 35-byte or >=71-byte redeem script, so this rejection cannot refuse a retained
+	// block. An ungated new rejection has to carry that proof: an ungated money bound
+	// without one rejected real mainnet block 2,208,265.
+	if len(code) < program.MinProgramCodeSize {
+		return elaerr.Simple(elaerr.ErrTxPayload, errors.New("invalid code length")), true
 	}
 	programHash := ct.ToProgramHash()
 

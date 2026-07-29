@@ -133,7 +133,8 @@ func (bm *BlockPool) CheckConfirmedBlockOnFork(height uint32, block *types.Block
 			illegalBlocks.CompareEvidence = *evidence
 		}
 
-		if err := blockchain.CheckDPOSIllegalBlocks(illegalBlocks); err != nil {
+		strictActive := bm.Chain.IllegalEvidenceStrictActive(bm.Chain.GetHeight())
+		if err := blockchain.CheckDPOSIllegalBlocks(illegalBlocks, strictActive); err != nil {
 			return err
 		}
 
