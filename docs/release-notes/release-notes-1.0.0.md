@@ -67,10 +67,18 @@ only then enable it:
 
        ela-cli info getcurrentheight
 
-3. `<datadir>/data/checkpoints/cp_txPool/` no longer contains a checkpoint above
-   the rewind target. This release removes it during the rewind; earlier
-   releases leave it in place, so its absence is a positive signal that the
-   rewind ran under this binary.
+3. `<datadir>/data/checkpoints/cp_txPool/` contains no HEIGHT-NAMED checkpoint
+   above the rewind target, for example no `2260595.txpcp`. This release removes
+   those during the rewind; earlier releases leave them in place.
+
+   Expect `default.txpcp` to still be there. It is normal and it is not a
+   failure. That file carries no height in its name, so the purge leaves it
+   alone by construction, and the checkpoint manager rewrites it from live state
+   on the next save. MEASURED on the frozen mainnet store: `default.txpcp` is
+   278 bytes and its header height is 2,260,594, above the rewind target, and it
+   is the only file left in the directory after a correct rewind. Do not treat
+   an empty `cp_txPool/` as the success signal and do not delete `default.txpcp`
+   by hand. Use the store tip in step 2 as the check that the rewind ran.
 
 If a node has already joined without rewinding: stop that node only. Do not stop
 the correct nodes, do not delete chaindata, and do not remove any other

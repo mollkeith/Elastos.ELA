@@ -241,7 +241,10 @@ func (b *BlockChain) ClearForcedRollbackMarker() error {
 }
 
 // forcedRollbackProgressSteps is how many progress lines a full rewind emits. The
-// real mainnet rewind is 145 blocks over a 25GB store and the shipped code logged
+// real mainnet rewind is 144 blocks over a 25GB store, plus one stored side block
+// at 2,260,595 that was never on the main chain and is removed by the residue
+// sweep rather than the rewind. MEASURED: best-state-height 2,260,594,
+// live-above 144, main-chain-above 144, stored-above 145. The shipped code logged
 // every 100th height, i.e. about two lines for the whole operation -- the shape
 // that invites an operator to assume the node has hung and press Ctrl-C.
 const forcedRollbackProgressSteps = 20
