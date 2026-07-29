@@ -13,12 +13,15 @@ import (
 	common2 "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/functions"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
+	elaerr "github.com/elastos/Elastos.ELA/errors"
 )
 
 const CheckRevertToPOWInterval = time.Minute
 
 func (pow *Service) ListenForRevert() {
 	go func() {
+		// Reported once, not once a minute. See the duplicate branch below.
+		revertToPOWPooled := false
 		for {
 			time.Sleep(CheckRevertToPOWInterval)
 			currentHeight := pow.chain.BestChain.Height
@@ -61,8 +64,27 @@ func (pow *Service) ListenForRevert() {
 
 			err := pow.txMemPool.AppendToTxPoolWithoutEvent(tx)
 			if err != nil {
-				log.Error("failed to append revertToPOW transaction to " +
-					"transaction pool, err:" + err.Error())
+				// The ticker re-offers the same transaction every round for as
+				// long as the chain has produced no block, so once the first
+				// offer succeeds every later one is refused as a duplicate.
+				// That is the steady state, not a fault. MEASURED on a
+				// five-node rehearsal at the real restart height: one accept
+				// followed by an "already exist" refusal every 60 seconds
+				// indefinitely, logged at ERR. Restart day is exactly when an
+				// operator can least afford a recurring red line that means
+				// nothing, so the duplicate is reported once at info and any
+				// other failure keeps its ERR.
+				if err.Code() == elaerr.ErrTxDuplicate {
+					if !revertToPOWPooled {
+						revertToPOWPooled = true
+						log.Info("revertToPOW transaction is already in the " +
+							"transaction pool; further offers are duplicates " +
+							"and will not be reported again")
+					}
+				} else {
+					log.Error("failed to append revertToPOW transaction to " +
+						"transaction pool, err:" + err.Error())
+				}
 			}
 		}
 	}()
