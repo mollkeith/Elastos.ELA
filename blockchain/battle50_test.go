@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 The Elastos Foundation
+// Copyright (c) 2017-2021 The Elastos DAO
 // Use of this source code is governed by an MIT license.
 //
 // Extended battle-test suite (blockchain_test): table-driven breach guards and

@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 The Elastos Foundation
+// Copyright (c) 2017-2021 The Elastos DAO
 // Use of this source code is governed by an MIT license.
 //
 // Battle-test suite for the v0.9.9.7 money-overflow fix. Drives 10 distinct

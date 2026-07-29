@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The Elastos Foundation
+// Copyright (c) 2026 The Elastos DAO
 // Use of this source code is governed by an MIT
 // license that can be found in the LICENSE file.
 //
