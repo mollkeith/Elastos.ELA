@@ -720,8 +720,11 @@ func (d *DPOSManager) OnRevertToDPOSTxReceived(id dpeer.PID,
 	}
 	log.Info("### RevertToDPoS OnRevertToDPOSTxReceived  start 2")
 
-	if err := blockchain.CheckRevertToDPOSTransaction(tx,
-		blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
+	// Structure-only. The gossiped transaction carries the sponsor's single
+	// signature and the round exists to collect the rest, so a full M-of-N check
+	// here would drop every legitimate message and the chain could never leave
+	// PoW. The complete transaction is verified on the block connect path.
+	if err := blockchain.CheckRevertToDPOSTransactionGossip(tx); err != nil {
 		log.Info("[OnRevertToDPOSTxReceived] received error evidence: ", err)
 		return
 	}
@@ -735,8 +738,11 @@ func (d *DPOSManager) OnInactiveArbitratorsReceived(id dpeer.PID,
 	if !d.isCRCArbiter() {
 		return
 	}
-	if err := blockchain.CheckInactiveArbitrators(tx,
-		blockchain.DefaultLedger.Blockchain.GetHeight()); err != nil {
+	// Structure-only. The gossiped transaction carries the sponsor's single
+	// signature and the round exists to collect the rest, so a full M-of-N check
+	// here would drop every legitimate message and emergency ForceChange could
+	// never fire. The complete transaction is verified on the block connect path.
+	if err := blockchain.CheckInactiveArbitratorsGossip(tx); err != nil {
 		log.Info("[OnIllegalProposalReceived] received error evidence: ", err)
 		return
 	}

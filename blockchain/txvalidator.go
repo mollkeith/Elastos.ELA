@@ -907,8 +907,26 @@ func CheckPayloadSignature(info *payload.CRInfo, payloadVersion byte) error {
 	return CheckCRTransactionSignature(info.Signature, info.Code, signedBuf.Bytes())
 }
 
+// CheckRevertToDPOSTransaction validates a RevertToDPOS transaction that is
+// expected to be COMPLETE: the multisig code must list authorized arbiters and,
+// at or above the gate, the program parameter must carry valid M-of-N signatures
+// over the unsigned digest. blockHeight is the height of the block carrying the
+// transaction.
 func CheckRevertToDPOSTransaction(txn interfaces.Transaction, blockHeight uint32) error {
-	return checkArbitratorsSignatures(txn, blockHeight)
+	if err := checkArbitratorsMultisigStructure(txn); err != nil {
+		return err
+	}
+	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
+}
+
+// CheckRevertToDPOSTransactionGossip validates a RevertToDPOS transaction
+// received over the DPoS gossip network. Such a transaction carries the
+// sponsor's single signature; collecting the remaining co-signatures is the
+// purpose of the gossip round, so only the multisig code structure is checked
+// here. Full M-of-N verification runs where the transaction is complete, in
+// RevertToDPOSTransaction.SpecialContextCheck on the block connect path.
+func CheckRevertToDPOSTransactionGossip(txn interfaces.Transaction) error {
+	return checkArbitratorsMultisigStructure(txn)
 }
 
 func CheckSidechainIllegalEvidence(p *payload.SidechainIllegalData) error {
@@ -946,7 +964,28 @@ func CheckSidechainIllegalEvidence(p *payload.SidechainIllegalData) error {
 	return nil
 }
 
+// CheckInactiveArbitrators validates an InactiveArbitrators transaction that is
+// expected to be COMPLETE: the payload targets, the multisig code and, at or
+// above the gate, valid M-of-N signatures over the unsigned digest. blockHeight
+// is the height of the block carrying the transaction.
 func CheckInactiveArbitrators(txn interfaces.Transaction, blockHeight uint32) error {
+	if err := checkInactiveArbitratorsStructure(txn); err != nil {
+		return err
+	}
+	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
+}
+
+// CheckInactiveArbitratorsGossip validates an InactiveArbitrators transaction
+// received over the DPoS gossip network. Such a transaction carries the
+// sponsor's single signature; collecting the remaining co-signatures is the
+// purpose of the gossip round, so only the payload targets and the multisig code
+// structure are checked here. Full M-of-N verification runs where the
+// transaction is complete, in PreProcessSpecialTx on the block connect path.
+func CheckInactiveArbitratorsGossip(txn interfaces.Transaction) error {
+	return checkInactiveArbitratorsStructure(txn)
+}
+
+func checkInactiveArbitratorsStructure(txn interfaces.Transaction) error {
 	p, ok := txn.Payload().(*payload.InactiveArbitrators)
 	if !ok {
 		return errors.New("invalid payload")
@@ -967,16 +1006,20 @@ func CheckInactiveArbitrators(txn interfaces.Transaction, blockHeight uint32) er
 		}
 	}
 
-	if err := checkCRCArbitratorsSignatures(txn, blockHeight); err != nil {
+	if err := checkCRCArbitratorsMultisigStructure(txn); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func checkArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint32) error {
-	// Reachable pre-auth via the DPoS gossip handler (CheckRevertToDPOSTransaction /
-	// CheckInactiveArbitrators reach here with no SanityCheck and no CheckAttributeProgram),
+// checkArbitratorsMultisigStructure checks the shape of the arbiter multisig
+// code only: the M and N parameters against the current arbiter set and the
+// majority ratio, and that every listed public key is an arbiter. It proves the
+// code lists authorized signers, not that anybody signed.
+func checkArbitratorsMultisigStructure(txn interfaces.Transaction) error {
+	// Reachable pre-auth via the DPoS gossip handler (CheckRevertToDPOSTransactionGossip /
+	// CheckInactiveArbitratorsGossip reach here with no SanityCheck and no CheckAttributeProgram),
 	// so an empty Programs() or a code shorter than 2 bytes would panic the receiving CRC
 	// arbiter on the code[len-2] / code[0] index. Guard both. The bound is len(code) < 2, the
 	// pure panic guard, not MinMultiSignCodeLength, which would preempt
@@ -1017,7 +1060,7 @@ func checkArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint32) 
 		}
 	}
 
-	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
+	return nil
 }
 
 // arbitratorsMultisigActive reports whether strict multisig signature
@@ -1038,11 +1081,12 @@ func arbitratorsMultisigActive(blockHeight uint32) bool {
 
 // verifyArbitratorsMultisigSignatures verifies that the program Parameter
 // actually carries valid M-of-N arbiter signatures over the tx's unsigned
-// digest. The structure and pubkey checks above only prove the code lists
-// authorized arbiters; without this the connect/gossip path would apply an
-// emergency ForceChange or RevertToDPOS on an unsigned, permissionlessly-forged
-// special tx. Height-gated for replay-safety; the digest matches the honest
-// signer path (tx.SerializeUnsigned).
+// digest. The structure and pubkey checks only prove the code lists authorized
+// arbiters; without this the connect path would apply an emergency ForceChange
+// or RevertToDPOS on an unsigned, permissionlessly-forged special tx. Callable
+// only where the transaction is expected to be COMPLETE, never on the gossip
+// path, where a single sponsor signature is the designed state. Height-gated for
+// replay-safety; the digest matches the honest signer path (tx.SerializeUnsigned).
 func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction, blockHeight uint32) error {
 	if !arbitratorsMultisigActive(blockHeight) {
 		return nil
@@ -1054,10 +1098,14 @@ func verifyArbitratorsMultisigSignatures(txn interfaces.Transaction, blockHeight
 	return crypto.CheckMultiSigSignatures(*txn.Programs()[0], buf.Bytes())
 }
 
-func checkCRCArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint32) error {
+// checkCRCArbitratorsMultisigStructure checks the shape of the CRC arbiter
+// multisig code only: the M and N parameters against the CRC arbiter count and
+// the majority ratio, and that every listed public key is a CRC arbiter. It
+// proves the code lists authorized signers, not that anybody signed.
+func checkCRCArbitratorsMultisigStructure(txn interfaces.Transaction) error {
 
-	// Reachable pre-auth via the DPoS gossip handler (CheckRevertToDPOSTransaction /
-	// CheckInactiveArbitrators reach here with no SanityCheck and no CheckAttributeProgram),
+	// Reachable pre-auth via the DPoS gossip handler (CheckRevertToDPOSTransactionGossip /
+	// CheckInactiveArbitratorsGossip reach here with no SanityCheck and no CheckAttributeProgram),
 	// so an empty Programs() or a code shorter than 2 bytes would panic the receiving CRC
 	// arbiter on the code[len-2] / code[0] index. Guard both. The bound is len(code) < 2, the
 	// pure panic guard, not MinMultiSignCodeLength, which would preempt
@@ -1092,7 +1140,7 @@ func checkCRCArbitratorsSignatures(txn interfaces.Transaction, blockHeight uint3
 			return errors.New("invalid multi sign public key")
 		}
 	}
-	return verifyArbitratorsMultisigSignatures(txn, blockHeight)
+	return nil
 }
 
 func CheckDPOSIllegalProposals(d *payload.DPOSIllegalProposals) error {
