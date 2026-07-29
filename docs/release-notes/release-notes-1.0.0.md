@@ -142,5 +142,5 @@ Notable changes
 Change log
 ==========
 
-See `CHANGELOG.md` for the per-area summary and `docs/v1.0.0-review.html` for
-the per-commit catalogue.
+See `CHANGELOG.md` for the per-area summary. For the per-commit history use
+`git log --reverse c61c9e61..HEAD`.

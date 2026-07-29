@@ -18,7 +18,9 @@ Do not use `git cat-file -e`, which succeeds for any object present in the
 repository whether or not it is reachable from this branch.
 
 The thematic sections below were written earlier in the effort and do not describe
-every later commit. `docs/v1.0.0-review.html` is the fuller per-commit catalogue.
+every later commit. For the full per-commit history use
+`git log --reverse c61c9e61..HEAD`; each commit message states what changed, why,
+and how it was verified.
 
 ---
 
